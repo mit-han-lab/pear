@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [ray, trainer, rollout] feat: node labels for the training
+ and the standalone rollout resource pools
+
+ResourcePoolManager takes accelerator_type and hands it to its RayResourcePools, whose bundles then require that Ray
+custom resource. trainer.node_label sets it for the training pools and rollout.custom.node_label for the pools of
+the standalone rollout replicas, so that each is placed on the nodes that carry its label.
+---
+ verl/single_controller/ray/base.py  | 2 ++
+ verl/trainer/ppo/v1/trainer_base.py | 7 ++++++-
+ verl/workers/rollout/replica.py     | 2 ++
+ 3 files changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/verl/single_controller/ray/base.py b/verl/single_controller/ray/base.py
+index b2f1859b9a865f9cfa9f2b566da6b03371e3eadb..ec226f46da9a2efb270e663546d0ff638a248013 100644
+--- a/verl/single_controller/ray/base.py
++++ b/verl/single_controller/ray/base.py
+@@ -194,6 +194,7 @@ class ResourcePoolManager:
+     resource_pool_spec: dict[str, list[int]]
+     mapping: dict[int, str]
+     max_colocate_count: int = 3
++    accelerator_type: Optional[str] = None  # a Ray custom resource every bundle requires, e.g. a node role label
+     resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict)
+ 
+     def __post_init__(self):
+@@ -219,6 +220,7 @@ class ResourcePoolManager:
+                 use_gpu=True,
+                 max_colocate_count=self.max_colocate_count,
+                 name_prefix=resource_pool_name,
++                accelerator_type=self.accelerator_type,
+             )
+             self.resource_pool_dict[resource_pool_name] = resource_pool
+ 
+diff --git a/verl/trainer/ppo/v1/trainer_base.py b/verl/trainer/ppo/v1/trainer_base.py
+index 28b6b6bb751336812eb07035dac78061484c73ee..1eed28b6e08957bf49f29d19d5882e2673efd637 100644
+--- a/verl/trainer/ppo/v1/trainer_base.py
++++ b/verl/trainer/ppo/v1/trainer_base.py
+@@ -847,7 +847,12 @@ class PPOTrainer(ABC):
+             resource_pool_spec["teacher_pool"] = teacher_pool
+             self.mapping[Role.TeacherModel] = "teacher_pool"
+ 
+-        self.resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
++        # trainer.node_label: the Ray node resource the training pools require
++        self.resource_pool_manager = ResourcePoolManager(
++            resource_pool_spec=resource_pool_spec,
++            mapping=self.mapping,
++            accelerator_type=config.trainer.get("node_label"),
++        )
+ 
+     def _load_checkpoint(self):
+         self.global_steps = 0
+diff --git a/verl/workers/rollout/replica.py b/verl/workers/rollout/replica.py
+index 1b7c8c767ff04ece456db31a5844b1aa5ecbc8fc..a48a3e7eff295d33ba0a209e5a83ec9f9ae8f815 100644
+--- a/verl/workers/rollout/replica.py
++++ b/verl/workers/rollout/replica.py
+@@ -199,10 +199,12 @@ class RolloutReplica(ABC):
+         resource_pool_spec = {
+             resource_pool_name: [self.gpus_per_replica_node] * self.nnodes,
+         }
++        custom = self.config.get("custom") or {}  # custom.node_label: the Ray node resource the replicas require
+         resource_pool_manager = ResourcePoolManager(
+             resource_pool_spec=resource_pool_spec,
+             mapping=None,
+             max_colocate_count=2,
++            accelerator_type=custom.get("node_label"),  # see trainer.node_label
+         )
+         resource_pool_manager.create_resource_pool()
+         self.resource_pool = resource_pool_manager.resource_pool_dict[resource_pool_name]

@@ -1,0 +1,2 @@
+# robosuite's wheel ships macros.py with CRLF line endings, which each family's patch of it keeps byte for byte
+*/robosuite_file_log.patch -text

@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [vllm] feat: _postprocess_compilation_config, a server hook
+ on the compilation config before it is serialized
+
+A no-op method beside the server's other hooks, called in launch_server once the compilation config holds
+rollout.cudagraph_capture_sizes: a subclass that extends the capture sizes does it there, since
+_preprocess_engine_kwargs runs before the server writes that key.
+---
+ verl/workers/rollout/vllm_rollout/vllm_async_server.py | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+index 961c4594765be6754bc396f694307c0bb46de6ea..3169e2761ccfe21f8d72e46f294f45ef4f2c1142 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -321,6 +321,7 @@ class vLLMHttpServer:
+             compilation_config["cudagraph_mode"] = "PIECEWISE"
+         if self.config.cudagraph_capture_sizes:
+             compilation_config["cudagraph_capture_sizes"] = self.config.cudagraph_capture_sizes
++        self._postprocess_compilation_config(compilation_config)
+ 
+         compilation_config = json.dumps(compilation_config)
+         args = {
+@@ -1208,6 +1209,9 @@ class vLLMHttpServer:
+                 )
+             engine_kwargs["weight_transfer_config"] = {"backend": VERL_DELTA_WEIGHT_TRANSFER_BACKEND}
+ 
++    def _postprocess_compilation_config(self, compilation_config: dict) -> None:
++        """Mutate the compilation config in-place before it is serialized into the CLI args."""
++
+     def _get_override_generation_config(self) -> dict:
+         """Return the override_generation_config dict."""
+         # Override default generation config from hugging face model config,

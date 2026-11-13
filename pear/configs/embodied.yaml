@@ -1,0 +1,31 @@
+# The config of `python -m pear.eval.embodied`: what every PEAR run sets (pear/configs/base.yaml) with the
+# evaluation's values. An evaluation's recipe sets its run's own values as overrides.
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+    # the model families: a recipe composes its family's own config as +<family>=config
+    - pkg://pear.models
+
+defaults:
+  - base
+  - _self_
+
+data:
+  train_batch_size: 1  # the episodes go through the training rollout's dataloader, one a batch
+
+trainer:
+  eval_step: ???  # an integer, the step of the evaluated checkpoint: in the names of the records
+  # one pass over the episodes
+  total_training_steps: 1
+  total_epochs: 1
+
+actor_rollout_ref:
+  rollout:
+    temperature: 1.0
+    top_p: 0.95
+    top_k: -1
+
+transfer_queue:
+  backend:
+    SimpleStorage:
+      required_node_resource: rollout  # the storage units go to the GPU machines, all rollout machines here

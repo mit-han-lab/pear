@@ -1,0 +1,6 @@
+{
+  "answer": "```json\n{\"left_arm\": {\"x\": 0.0, \"y\": 0.0, \"z\": -0.3, \"roll\": 0.0, \"pitch\": 0.0, \"yaw\": 0.0}, \"right_arm\": {\"x\": 0.0, \"y\": 0.0, \"z\": -0.3, \"roll\": 0.0, \"pitch\": 0.0, \"yaw\": 0.0}, \"left_gripper\": {\"width\": 0.0}, \"right_gripper\": {\"width\": 0.0}}\n```",
+  "reasoning": "",
+  "reasoning_kind": "none",
+  "usage": {}
+}

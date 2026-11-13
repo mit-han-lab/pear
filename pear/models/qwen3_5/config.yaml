@@ -1,0 +1,41 @@
+# @package _global_
+# What a run of a Qwen3.5 model sets on top of pear/configs/base.yaml, whatever its experiment and its
+# hardware. A model's file of examples/models composes it with the override +qwen3_5=config.
+data:
+  image_patch_size: 16  # the vision tower's patch, in pixels
+  # the vision tower casts pixel_values to bf16 at its patch embedding: stored in bf16 they are the same values in half
+  # the bytes, in TransferQueue and in its checkpoints
+  pixel_dtype: bf16
+
+actor_rollout_ref:
+  model:
+    use_fused_kernels: true  # the fused forward, through which the family's fp32 head returns its log-probs
+    liger_kwargs:
+      rms_norm: false  # the family installs its own precise RMSNorm: Liger leaves the norms alone
+  actor:
+    fsdp_config:
+      # the vision tower gathered and computed in fp32 on TF32, the residual stream in fp32
+      mixed_precision:
+        fp32_modules: [model.visual]
+        fp32_modules_tf32: true
+        fp32_residual: true
+      # the family's training kernels: on any GPU a batched vision attention, the residual stream and the head's
+      # logits in fp32, precise RMSNorms
+      kernels: pear.models.qwen3_5.trainer.training_kernels.Qwen3_5TrainingKernels
+      # with the backend of the machine's GPU generation, Blackwell or Hopper: the fused training step
+      use_gpu_backend: true
+  rollout:
+    dtype: bfloat16  # the replicas' weights, but for those kept in fp32
+    # the weights the replicas keep in fp32: the vision tower, and the Gated DeltaNet's A_log, which vLLM itself keeps
+    # in fp32 for this architecture
+    fp32_modules: [visual, A_log]
+    # the family's vLLM classes and patches for its replicas at TP2 on Blackwell, TP4 on Hopper; null: vLLM's own model
+    kernels: pear.models.qwen3_5.rollout.rollout_kernels.Qwen3_5RolloutKernels
+    multi_turn:
+      format: qwen3_8  # the family's answer parser (pear/models/qwen3_5/tool_parser.py), which a recipe has verl import
+    engine_kwargs:
+      vllm:
+        mamba_cache_mode: align  # prefix caching of the Gated DeltaNet's state, kept at the block boundaries
+        mm_encoder_attn_backend: TORCH_SDPA  # FlashAttention takes no fp32 inputs: the vision tower's attention is SDPA
+        hf_overrides:
+          head_dtype: float32  # the lm_head accumulates its logits into fp32

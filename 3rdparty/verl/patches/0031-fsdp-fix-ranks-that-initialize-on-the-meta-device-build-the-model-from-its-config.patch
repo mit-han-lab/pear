@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [fsdp] fix: ranks that initialize on the meta device build
+ the model from its config
+
+A rank under init_empty_weights receives its weights and buffers from the source rank's broadcast after sharding,
+so it calls from_config; from_pretrained would read and convert the whole checkpoint on that rank too.
+---
+ ...est_fsdp_build_module_meta_ranks_on_cpu.py | 70 +++++++++++++++++++
+ verl/workers/engine/fsdp/transformer_impl.py  | 24 +++++--
+ 2 files changed, 88 insertions(+), 6 deletions(-)
+ create mode 100644 tests/workers/test_fsdp_build_module_meta_ranks_on_cpu.py
+
+diff --git a/tests/workers/test_fsdp_build_module_meta_ranks_on_cpu.py b/tests/workers/test_fsdp_build_module_meta_ranks_on_cpu.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b65e3f0d1240ba996173e05929c103ee4e8e6b84
+--- /dev/null
++++ b/tests/workers/test_fsdp_build_module_meta_ranks_on_cpu.py
+@@ -0,0 +1,70 @@
++from types import SimpleNamespace
++
++import pytest
++import torch
++from transformers import AutoModelForCausalLM, LlamaConfig
++
++from verl.workers.engine.fsdp.transformer_impl import FSDPEngine
++
++
++@pytest.fixture(scope="module")
++def checkpoint(tmp_path_factory):
++    """A tiny untied causal LM saved to disk, as the engine's model path."""
++    config = LlamaConfig(
++        vocab_size=64,
++        hidden_size=16,
++        intermediate_size=32,
++        num_hidden_layers=2,
++        num_attention_heads=2,
++        num_key_value_heads=2,
++        tie_word_embeddings=False,
++    )
++    path = tmp_path_factory.mktemp("tiny_llama")
++    torch.manual_seed(0)
++    AutoModelForCausalLM.from_config(config).save_pretrained(path)
++    return config, str(path)
++
++
++def _engine(checkpoint):
++    config, path = checkpoint
++    engine = object.__new__(FSDPEngine)
++    engine.engine_config = SimpleNamespace(
++        model_dtype=None, forward_only=False, mixed_precision=None
++    )
++    engine.model_config = SimpleNamespace(
++        hf_config=config,
++        model_type="language_model",
++        local_path=path,
++        trust_remote_code=False,
++        use_liger=False,
++        fused_kernel_options=None,
++        use_fused_kernels=False,
++        enable_gradient_checkpointing=False,
++    )
++    engine.device_mesh = None
++    engine.use_remove_padding = False
++    engine.ulysses_sequence_parallel_size = 1
++    return engine
++
++
++def test_a_rank_that_receives_its_weights_does_not_read_the_checkpoint(checkpoint, monkeypatch):
++    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
++
++    def from_pretrained(*args, **kwargs):
++        raise AssertionError("a rank on the meta device read the checkpoint")
++
++    monkeypatch.setattr(AutoModelForCausalLM, "from_pretrained", from_pretrained)
++    module = _engine(checkpoint)._build_module()
++
++    assert all(param.is_meta for param in module.parameters())
++    assert all(param.dtype == torch.float32 for param in module.parameters())
++
++
++def test_the_source_rank_loads_the_checkpoint(checkpoint, monkeypatch):
++    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
++    module = _engine(checkpoint)._build_module()
++    saved = AutoModelForCausalLM.from_pretrained(checkpoint[1], torch_dtype=torch.float32)
++
++    loaded = dict(module.named_parameters())
++    for name, param in saved.named_parameters():
++        assert torch.equal(loaded[name], param), name
+diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
+index 04293829823a827d224c6e7b4e80e50554991c25..a970643713008c0217fb31e5a34db92161facb4d 100644
+--- a/verl/workers/engine/fsdp/transformer_impl.py
++++ b/verl/workers/engine/fsdp/transformer_impl.py
+@@ -252,6 +252,8 @@ class FSDPEngine(BaseEngine):
+         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
+ 
+     def _build_module(self):
++        from accelerate import init_empty_weights
++
+         from verl.utils.model import get_hf_auto_model_class
+         from verl.utils.torch_dtypes import PrecisionType
+ 
+@@ -273,12 +275,22 @@ class FSDPEngine(BaseEngine):
+             if self.model_config.model_type == "language_model":
+                 auto_class = get_hf_auto_model_class(hf_config=self.model_config.hf_config)
+ 
+-                module = auto_class.from_pretrained(
+-                    pretrained_model_name_or_path=self.model_config.local_path,
+-                    torch_dtype=torch_dtype,
+-                    config=self.model_config.hf_config,
+-                    trust_remote_code=self.model_config.trust_remote_code,
+-                )
++                if init_context is init_empty_weights:
++                    # this rank's weights and buffers come from the source rank's broadcast after sharding;
++                    # from_pretrained would read and convert the whole checkpoint here too (transformers 5 loads it
++                    # on every rank)
++                    module = auto_class.from_config(
++                        self.model_config.hf_config,
++                        torch_dtype=torch_dtype,
++                        trust_remote_code=self.model_config.trust_remote_code,
++                    )
++                else:
++                    module = auto_class.from_pretrained(
++                        pretrained_model_name_or_path=self.model_config.local_path,
++                        torch_dtype=torch_dtype,
++                        config=self.model_config.hf_config,
++                        trust_remote_code=self.model_config.trust_remote_code,
++                    )
+ 
+                 # Strip sub-modules listed in _verl_strip_modules (e.g.
+                 # talker / code2wav for Qwen3-Omni Thinker-only training).

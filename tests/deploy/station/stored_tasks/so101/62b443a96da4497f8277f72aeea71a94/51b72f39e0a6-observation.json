@@ -1,0 +1,25 @@
+{
+  "turn_id": "51b72f39e0a6",
+  "observation_id": "a4debea9-c468-49b1-8371-ecb8d02153f7",
+  "captured_monotonic_s": 149592.839660734,
+  "state": {
+    "arm": {
+      "x": 39.1,
+      "y": 0.0,
+      "z": 22.6,
+      "pitch": 0.0,
+      "roll": -0.05
+    },
+    "gripper": {
+      "width": 6.0
+    }
+  },
+  "text": "{\"arm\": {\"x\": 39.1, \"y\": 0.0, \"z\": 22.6, \"pitch\": 0.0, \"roll\": -0.05}, \"gripper\": {\"width\": 6.0}}\n\nThe current camera frame follows. End your response with one json block containing the next action.",
+  "images": {
+    "wrist": "records/62b443a96da4497f8277f72aeea71a94/51b72f39e0a6-wrist.jpg"
+  },
+  "image_uuids": {
+    "wrist": "705b47c2-1eb8-47f5-beb3-7a7117cba359"
+  },
+  "previous_result": null
+}

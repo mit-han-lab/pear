@@ -1,0 +1,117 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pear"
+version = "0.1.0"
+description = "PEAR: Post-training Engine for Agentic Robotics"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"  # the LIBERO simulators' Python; the trainer's is 3.12
+# PEAR runs in the environments scripts/install.sh builds, each from the extra of its name below at the versions of
+# its directory under scripts/install: none of them is a requirement of the package itself
+dependencies = []
+
+[project.optional-dependencies]
+# the training and rollout environment, next to the requirements.txt of the patched verl checkout: the GPU stack, cupy
+# (verl's NCCL weight sync), flash-linear-attention (Ulysses on Qwen3.5), aiohttp (the LMCache clear hook),
+# qwen-vl-utils (the agent loop's images) and the tests
+verl = [
+    "torch", "torchvision", "torchaudio", "vllm", "cupy-cuda13x", "flash-linear-attention", "aiohttp", "qwen-vl-utils",
+    "pytest", "pytest-asyncio",
+]
+# what a GPU machine adds to it: the CUDA compiler with its headers, FlashInfer's precompiled kernels, and the tools
+# of the source builds (without ninja a build compiles one file at a time)
+verl_gpu = [
+    "nvidia-cuda-nvcc", "nvidia-cuda-crt", "nvidia-nvvm", "nvidia-cuda-cccl", "nvidia-cuda-profiler-api",
+    "flashinfer-cubin", "ninja", "wheel",
+]
+# a LIBERO family's simulator environment, next to the family's fork of LIBERO
+libero = [
+    "numpy", "pyyaml", "tqdm", "psutil", "requests", "Pillow", "imageio", "imageio-ffmpeg", "torch", "torchvision",
+    "pyarrow", "robosuite", "termcolor", "mujoco", "bddl", "future", "easydict", "cloudpickle", "matplotlib",
+    "opencv-python", "gym",
+]
+# LIBERO-plus's env wrapper imports its sensor-noise stack too: Wand (ImageMagick's MagickWand) and scikit-image
+libero_plus = [
+    "numpy", "pyyaml", "tqdm", "psutil", "requests", "Pillow", "imageio", "imageio-ffmpeg", "torch", "torchvision",
+    "pyarrow", "robosuite", "termcolor", "mujoco", "bddl", "future", "easydict", "cloudpickle", "matplotlib",
+    "opencv-python", "gym", "Wand", "scikit-image", "scipy",
+]
+libero_pro = [
+    "numpy", "pyyaml", "tqdm", "psutil", "requests", "Pillow", "imageio", "imageio-ffmpeg", "torch", "torchvision",
+    "pyarrow", "robosuite", "termcolor", "mujoco", "bddl", "future", "easydict", "cloudpickle", "matplotlib",
+    "opencv-python", "gym",
+]
+# the Ray of a RoboDojo simulator machine, at the training environment's versions
+robodojo = ["ray", "numpy"]
+# the general evaluation; emoji and syllapy: IFBench's scorer imports them and no extra of evalscope installs them
+evalscope = ["evalscope", "emoji", "syllapy"]
+# the robot station (pear/deploy/station): its control and its configurations, the GUI service, the model clients, the
+# YAM's cameras, the SO-101's bus and kinematics through lerobot, whose torch nothing runs, its gravity model through
+# pinocchio (pin), and the tests; the YAM's SDK comes from its commit (scripts/install/versions.env)
+station = [
+    "numpy", "pyyaml", "pydantic", "omegaconf", "ruckig", "aiohttp", "pillow", "imageio-ffmpeg", "openai",
+    "pyrealsense2", "lerobot[feetech,kinematics]", "pin", "torch", "torchvision", "pytest", "pytest-xdist", "playwright",
+]
+# the model server (pear/deploy/server): vLLM with the torch and FlashInfer it brings, Hydra and uvloop, and what the
+# model families' kernels compile with at the server's first start (the CUDA compiler with its headers, and ninja) next
+# to FlashInfer's precompiled kernels; installed at the training environment's versions
+server = [
+    "vllm", "torch", "flashinfer-python", "numpy", "hydra-core", "omegaconf", "uvloop", "nvidia-cuda-nvcc",
+    "nvidia-cuda-crt", "nvidia-nvvm", "nvidia-cuda-cccl", "nvidia-cuda-profiler-api", "flashinfer-cubin", "ninja",
+]
+
+# the robot station's command, in the station's environment
+[project.scripts]
+pear-station = "pear.deploy.station.cli:main"
+
+# vLLM loads these first in each of its processes: the model of the rollout kernels rollout.kernels names, registered
+# before vLLM resolves it
+[project.entry-points."vllm.general_plugins"]
+pear_qwen3_5_kernels = "pear.models.qwen3_5.rollout.rollout_kernels:Qwen3_5RolloutKernels.register"
+
+[tool.setuptools.packages.find]
+include = ["pear*"]
+exclude = ["pear.deploy.station.gui.page*"]  # the page's sources and what npm installs beside them: no Python
+
+[tool.setuptools.package-data]
+# the prompts, the families' tool configs and episodes, the agent loop's registry entry, RoboDojo's Isaac Python wrapper
+# and inotify shim, the rollout's and the server's kernels' CUDA sources and utils/sitecustomize/ (no package: examples/
+# put it on the path); of the robot station, the page's bundle, the video's fonts and the SO-101's description
+pear = [
+    "**/*.md", "**/*.yaml", "**/*.json", "**/*.sh", "**/*.c", "**/*.cu", "**/*.cuh",
+    "utils/sitecustomize/sitecustomize.py", "deploy/station/gui/static/**", "deploy/station/records/video/fonts/*",
+    "deploy/station/control/robots/so101/description/*",
+]
+
+[tool.setuptools.exclude-package-data]
+# the page's sources, which its bundle is built from: an installed station serves the bundle
+pear = ["deploy/station/gui/page/**"]
+
+[tool.ruff]
+line-length = 120  # verl's, so that code moved between the two keeps its formatting
+# tests/ and its directories with a helper module too: test files import their helpers by name, as pytest runs them
+src = [".", "tests", "tests/sim", "tests/deploy/station"]
+
+[tool.ruff.lint]
+# verl's imports sort with pear's: PEAR extends verl's classes
+isort = {known-first-party = ["pear", "verl"]}
+select = [
+    "E",   # pycodestyle
+    "F",   # Pyflakes
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "I",   # isort
+    "G",   # flake8-logging-format
+]
+ignore = [
+    "E501",  # line too long: the formatter wraps code; comments and strings are not rewrapped
+    "B905",  # zip() without strict=
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers"
+faulthandler_timeout = 300  # seconds: a test still running then gets every thread's stack written to the output
+markers = ["integration: starts Ray and simulator server processes, so it takes minutes: CI runs these apart"]

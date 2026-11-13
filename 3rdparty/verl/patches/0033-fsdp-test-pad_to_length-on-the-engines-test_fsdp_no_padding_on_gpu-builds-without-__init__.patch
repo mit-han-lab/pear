@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [fsdp] test: pad_to_length on the engines
+ test_fsdp_no_padding_on_gpu builds without __init__
+
+prepare_model_inputs reads self.pad_to_length, which FSDPEngine.__init__ copies from the engine config; the
+three tests that build their engine with __new__ set it to False.
+---
+ tests/models/test_fsdp_no_padding_on_gpu.py | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/tests/models/test_fsdp_no_padding_on_gpu.py b/tests/models/test_fsdp_no_padding_on_gpu.py
+index c27f39ca356f74c8727fb705598f592600fe4f71..1dd7e8c601b3978a53a419d317e35ae5840aaddb 100644
+--- a/tests/models/test_fsdp_no_padding_on_gpu.py
++++ b/tests/models/test_fsdp_no_padding_on_gpu.py
+@@ -102,6 +102,7 @@ def test_prepare_model_inputs_uses_full_sequence_attention_mask_on_gpu():
+     device = "cuda"
+     FSDPEngineWithLMHead = _fsdp_engine_with_lm_head_cls()
+     engine = FSDPEngineWithLMHead.__new__(FSDPEngineWithLMHead)
++    engine.pad_to_length = False  # FSDPEngine.__init__'s copy of engine_config.pad_to_length
+     micro_batch = _make_micro_batch(device)
+ 
+     model_inputs, output_args = engine.prepare_model_inputs(micro_batch)
+@@ -144,6 +145,7 @@ def test_prepare_model_inputs_passes_declared_packed_sequence_boundaries_on_gpu(
+     device = "cuda"
+     FSDPEngineWithLMHead = _fsdp_engine_with_lm_head_cls()
+     engine = FSDPEngineWithLMHead.__new__(FSDPEngineWithLMHead)
++    engine.pad_to_length = False  # FSDPEngine.__init__'s copy of engine_config.pad_to_length
+     engine.use_ulysses_sp = False
+     engine.pass_packed_cu_seqlens = True
+     micro_batch = _make_micro_batch(device)
+@@ -174,6 +176,7 @@ def test_prepare_model_outputs_can_be_sliced_back_to_response_shape_on_gpu():
+     device = "cuda"
+     FSDPEngineWithLMHead = _fsdp_engine_with_lm_head_cls()
+     engine = FSDPEngineWithLMHead.__new__(FSDPEngineWithLMHead)
++    engine.pad_to_length = False  # FSDPEngine.__init__'s copy of engine_config.pad_to_length
+     micro_batch = _make_micro_batch(device)
+     _, output_args = engine.prepare_model_inputs(micro_batch)
+ 

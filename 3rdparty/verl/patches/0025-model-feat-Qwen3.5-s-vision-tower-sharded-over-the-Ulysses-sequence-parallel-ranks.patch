@@ -1,0 +1,145 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [model] feat: Qwen3.5's vision tower sharded over the Ulysses
+ sequence-parallel ranks
+
+Under Ulysses sequence parallelism each rank encodes a share of the whole images and the ranks all-gather the
+features; the backward all-reduces the gradients in fp32. Fewer images than ranks, extra forward arguments or an
+unexpected token count take the stock forward.
+---
+ .../test_qwen3_5_vision_sharding_on_cpu.py    | 44 +++++++++++++++++
+ verl/models/transformers/monkey_patch.py      |  3 ++
+ verl/models/transformers/qwen3_5.py           | 47 +++++++++++++++++++
+ 3 files changed, 94 insertions(+)
+ create mode 100644 tests/models/test_qwen3_5_vision_sharding_on_cpu.py
+
+diff --git a/tests/models/test_qwen3_5_vision_sharding_on_cpu.py b/tests/models/test_qwen3_5_vision_sharding_on_cpu.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..22ab0029c4071ad4a317b4d203e326ae7391eff3
+--- /dev/null
++++ b/tests/models/test_qwen3_5_vision_sharding_on_cpu.py
+@@ -0,0 +1,44 @@
++from types import SimpleNamespace
++
++import torch
++import torch.distributed as dist
++import torch.multiprocessing as mp
++
++from verl.models.transformers.qwen3_5 import patch_vision_model_for_ulysses_sharding
++from verl.utils.ulysses import set_ulysses_sequence_parallel_group
++
++WORLD = 2
++MERGE = 4  # the stub tower's spatial_merge_unit: tokens pooled into one feature
++GRID_THW = [[1, 2, 4], [1, 4, 4], [1, 2, 2]]  # three images of 8, 16 and 4 tokens: rank 0 encodes one, rank 1 two
++FEATURES = 3
++
++
++class TowerStub:
++    """A vision tower whose features depend on each token alone, pooled over MERGE tokens."""
++
++    spatial_merge_unit = MERGE
++
++    def forward(self, hidden_states, grid_thw):
++        tokens = hidden_states * 2 + 1
++        return SimpleNamespace(last_hidden_state=tokens, pooler_output=tokens.view(-1, MERGE, FEATURES).sum(1))
++
++
++def sharded_forward_on_rank(rank, store):
++    dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=WORLD)
++    set_ulysses_sequence_parallel_group(dist.group.WORLD)
++    grid_thw = torch.tensor(GRID_THW)
++    hidden = torch.arange(int(grid_thw.prod(dim=1).sum()) * FEATURES, dtype=torch.float32).view(-1, FEATURES)
++    expected = TowerStub().forward(hidden, grid_thw)
++
++    class ShardedTower(TowerStub):
++        pass
++
++    patch_vision_model_for_ulysses_sharding(ShardedTower)
++    output = ShardedTower().forward(hidden, grid_thw)
++    assert torch.equal(output.last_hidden_state, expected.last_hidden_state)
++    assert torch.equal(output.pooler_output, expected.pooler_output)
++    dist.destroy_process_group()
++
++
++def test_sharded_vision_tower_gathers_the_unsharded_features(tmp_path):
++    mp.spawn(sharded_forward_on_rank, args=(str(tmp_path / "store"),), nprocs=WORLD, join=True)
+diff --git a/verl/models/transformers/monkey_patch.py b/verl/models/transformers/monkey_patch.py
+index daabf951f91111b8e4d7b65286445ee99ddf775b..35e02c11fefdd3b6214ef83f32fdb30a1174bab1 100644
+--- a/verl/models/transformers/monkey_patch.py
++++ b/verl/models/transformers/monkey_patch.py
+@@ -520,6 +520,7 @@ def apply_monkey_patch(
+             drop_conv_autotune_length_key,
+             fast_pos_embed_interpolate,
+             forward_with_normal_backend,
++            patch_vision_model_for_ulysses_sharding,
+             qwen3_5_base_forward,
+             qwen3_5_decoder_layer_forward,
+             qwen3_5_gated_delta_net_forward,
+@@ -541,6 +542,8 @@ def apply_monkey_patch(
+         if ulysses_sp_size > 1:
+             patch_vlm_for_ulysses_input_slicing(Qwen3_5TextModel)
+             patch_vlm_for_ulysses_input_slicing(Qwen3_5MoeTextModel)
++            patch_vision_model_for_ulysses_sharding(Qwen3_5VisionModel)
++            patch_vision_model_for_ulysses_sharding(Qwen3_5MoeVisionModel)
+ 
+         # Step 3: the training-step kernels
+         drop_conv_autotune_length_key()
+diff --git a/verl/models/transformers/qwen3_5.py b/verl/models/transformers/qwen3_5.py
+index b4efebad8ae5bc5c697bffd6cd1e7690986edcd0..af6cb78920d8e31ad81068b4ec50c5d21115e6b3 100644
+--- a/verl/models/transformers/qwen3_5.py
++++ b/verl/models/transformers/qwen3_5.py
+@@ -470,6 +470,53 @@ def fast_pos_embed_interpolate(self, grid_thw):
+     return patch_pos_embeds
+ 
+ 
++class _GatherVisionFeatures(torch.autograd.Function):
++    """All-gather of the SP ranks' image features (ragged sizes); the backward sums the ranks' gradients in fp32."""
++
++    @staticmethod
++    def forward(ctx, local: torch.Tensor, sizes: tuple[int, ...], group: dist.ProcessGroup):
++        ctx.group, ctx.rank, ctx.sizes, ctx.dtype = group, dist.get_rank(group), sizes, local.dtype
++        padded = F.pad(local, (0, 0, 0, max(sizes) - local.shape[0]))
++        gathered = [torch.empty_like(padded) for _ in sizes]
++        dist.all_gather(gathered, padded.contiguous(), group=group)
++        return torch.cat([part[:size] for part, size in zip(gathered, sizes, strict=True)], dim=0)
++
++    @staticmethod
++    def backward(ctx, grad_output: torch.Tensor):
++        # every rank's text model contributes a gradient to every image; FSDP averages the parameter gradients later
++        gradient = grad_output.to(dtype=torch.float32, memory_format=torch.contiguous_format, copy=True)
++        dist.all_reduce(gradient, group=ctx.group)
++        start = sum(ctx.sizes[: ctx.rank])
++        return gradient.narrow(0, start, ctx.sizes[ctx.rank]).to(dtype=ctx.dtype, copy=True), None, None
++
++
++def patch_vision_model_for_ulysses_sharding(model_class: type):
++    """Each Ulysses SP rank encodes a share of whole images and the features are all-gathered."""
++    original_forward = model_class.forward
++
++    def forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, **kwargs):
++        group = get_ulysses_sequence_parallel_group()
++        world = dist.get_world_size(group) if group is not None else 1
++        offsets = [0]
++        for temporal, height, width in grid_thw.tolist():
++            offsets.append(offsets[-1] + temporal * height * width)
++        # whole images only: their attention and position interpolation stay independent; fewer images than ranks,
++        # extra arguments (precomputed metadata) or an unexpected token count take the stock path
++        if world == 1 or grid_thw.shape[0] < world or kwargs or hidden_states.shape[0] != offsets[-1]:
++            return original_forward(self, hidden_states, grid_thw=grid_thw, **kwargs)
++
++        boundaries = [grid_thw.shape[0] * rank // world for rank in range(world + 1)]
++        sizes = tuple(offsets[end] - offsets[start] for start, end in zip(boundaries[:-1], boundaries[1:], strict=True))
++        first, last = boundaries[dist.get_rank(group)], boundaries[dist.get_rank(group) + 1]
++        output = original_forward(self, hidden_states[offsets[first] : offsets[last]], grid_thw=grid_thw[first:last])
++        output.last_hidden_state = _GatherVisionFeatures.apply(output.last_hidden_state, sizes, group)
++        pooled_sizes = tuple(size // self.spatial_merge_unit for size in sizes)
++        output.pooler_output = _GatherVisionFeatures.apply(output.pooler_output, pooled_sizes, group)
++        return output
++
++    model_class.forward = forward
++
++
+ def _get_input_embeds(
+     model: "Qwen3_5CausalLMOutputWithPast",
+     input_ids: torch.LongTensor,

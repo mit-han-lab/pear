@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [data] feat: data.pixel_dtype, the dtype the agent loop
+ stores pixel tensors in
+
+The agent loop casts the processor's pixel_values and pixel_values_videos to data.pixel_dtype, e.g. bf16, which
+halves their bytes in every stored trajectory. null, the default, keeps the processor's dtype.
+---
+ .../ppo/v1/test_agent_loop_tq_on_cpu.py       | 42 +++++++++++++++++++
+ verl/experimental/agent_loop/agent_loop.py    |  6 +++
+ .../_generated_ppo_megatron_trainer.yaml      |  1 +
+ .../_generated_ppo_torchtitan_trainer.yaml    |  1 +
+ .../config/_generated_ppo_trainer.yaml        |  1 +
+ .../config/_generated_ppo_veomni_trainer.yaml |  1 +
+ verl/trainer/config/data/legacy_data.yaml     |  4 ++
+ 7 files changed, 56 insertions(+)
+
+diff --git a/tests/trainer/ppo/v1/test_agent_loop_tq_on_cpu.py b/tests/trainer/ppo/v1/test_agent_loop_tq_on_cpu.py
+index 80da7ce1171a6bacfe586e88b5e142e61d433add..71d0478edc1a4ea25d3a7c47bd9031813c498c82 100644
+--- a/tests/trainer/ppo/v1/test_agent_loop_tq_on_cpu.py
++++ b/tests/trainer/ppo/v1/test_agent_loop_tq_on_cpu.py
+@@ -41,6 +41,48 @@ def test_settle_session_tasks_waits_for_siblings_after_failure():
+     asyncio.run(run())
+ 
+ 
++def test_pixel_dtype_switch():
++    """data.pixel_dtype: None keeps the processor's fp32 pixel tensors, bf16 casts them; grids and seqlens stay as
++    they are."""
++    from types import SimpleNamespace
++
++    from omegaconf import OmegaConf
++    from transformers import BatchFeature
++
++    from verl.experimental.agent_loop.agent_loop import AgentLoopWorker
++
++    pixels = torch.randn(2048, 1536)
++    grid = torch.tensor([[1, 32, 32], [1, 32, 32]])
++
++    def processor(text, images=None, videos=None, audio=None, return_tensors="pt", **kwargs):
++        return BatchFeature(
++            {"pixel_values": pixels.clone(), "image_grid_thw": grid.clone(), "input_ids": torch.tensor([[1]])}
++        )
++
++    processor.image_token_id, processor.video_token_id = 151655, None
++    output = SimpleNamespace(multi_modal_data={"images": [object(), object()]}, mm_processor_kwargs=None)
++
++    def compute(pixel_dtype):
++        # a real worker instance with the attributes __init__ sets, so a wrong attribute in the method fails here
++        worker = AgentLoopWorker.__new__(AgentLoopWorker)
++        worker.config = OmegaConf.create({"data": {"pixel_dtype": pixel_dtype}})
++        worker.processor, worker.tokenizer, worker.mm_processor_kwargs = (
++            processor,
++            SimpleNamespace(decode=lambda ids, **kw: "x"),
++            {},
++        )
++        return worker._compute_multi_modal_inputs(output, torch.tensor([[1, 151655, 151655, 2]]))
++
++    out = compute(None)  # the default: the processor's dtype
++    assert out["pixel_values"].dtype == torch.float32 and torch.equal(out["pixel_values"], pixels)
++    out = compute("bf16")
++    assert out["pixel_values"].dtype == torch.bfloat16 and torch.equal(
++        out["pixel_values"].float(), pixels.to(torch.bfloat16).float()
++    )
++    assert out["image_grid_thw"].dtype == torch.int64 and torch.equal(out["image_grid_thw"], grid)
++    assert torch.equal(out["images_seqlens"], torch.tensor([1024, 1024])) and "input_ids" not in out
++
++
+ def test_a_restored_group_runs_only_its_unfinished_sessions(monkeypatch):
+     """A row with __unfinished_session_ids__ (a group restored from a checkpoint) runs exactly those sessions; a row
+     without runs rollout.n of them; each group then reports finished."""
+diff --git a/verl/experimental/agent_loop/agent_loop.py b/verl/experimental/agent_loop/agent_loop.py
+index 9ac398bce89247b66bc43c14e4ed3201f21d257f..1c409c98774039d105f86ec1ca51be97d1198de9 100644
+--- a/verl/experimental/agent_loop/agent_loop.py
++++ b/verl/experimental/agent_loop/agent_loop.py
+@@ -64,6 +64,7 @@ from verl.utils.tokenizer import (
+     get_processor_token_id,
+ )
+ from verl.utils.tokenizer.continuous_token_wiring import create_continuous_token_builder
++from verl.utils.torch_dtypes import PrecisionType
+ from verl.workers.config import (
+     HFModelConfig,
+     RolloutConfig,
+@@ -957,6 +958,11 @@ class AgentLoopWorker:
+         # We must use dict(multi_modal_inputs) to convert BatchFeature values to a new dict
+         # because np.array() only keeps the keys for BatchFeature.
+         multi_modal_inputs = dict(multi_modal_inputs.convert_to_tensors("pt"))
++        if self.config.data.get("pixel_dtype") is not None:  # see data.pixel_dtype
++            dtype = PrecisionType.to_dtype(self.config.data.pixel_dtype)
++            for key in ("pixel_values", "pixel_values_videos"):
++                if key in multi_modal_inputs and torch.is_floating_point(multi_modal_inputs[key]):
++                    multi_modal_inputs[key] = multi_modal_inputs[key].to(dtype)
+         image_grid_thw = multi_modal_inputs.get("image_grid_thw")
+         if image_grid_thw is not None:
+             images_seqlens = torch.repeat_interleave(image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0])
+diff --git a/verl/trainer/config/_generated_ppo_megatron_trainer.yaml b/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
+index 5510052c390034220baf1fb204e93b49caef4462..0c07dff63832091374ba415e684910b4051c88b2 100644
+--- a/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
+@@ -534,6 +534,7 @@ data:
+   seed: null
+   dataloader_num_workers: 8
+   image_patch_size: 14
++  pixel_dtype: null
+   validation_shuffle: false
+   filter_overlong_prompts: false
+   filter_overlong_prompts_workers: 1
+diff --git a/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml b/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
+index c98cb91ce7e2ec7cbc7ba0eff642d78a75490938..fa089a8f631a11bf2a7eb5eb138b0ed68a2e4799 100644
+--- a/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
+@@ -478,6 +478,7 @@ data:
+   seed: null
+   dataloader_num_workers: 8
+   image_patch_size: 14
++  pixel_dtype: null
+   validation_shuffle: false
+   filter_overlong_prompts: false
+   filter_overlong_prompts_workers: 1
+diff --git a/verl/trainer/config/_generated_ppo_trainer.yaml b/verl/trainer/config/_generated_ppo_trainer.yaml
+index 64e349eeac25be6bc99acf93a45d5fa231bd57d3..d0deacc200c37561bff0db3c5e212140b68be5d0 100644
+--- a/verl/trainer/config/_generated_ppo_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_trainer.yaml
+@@ -523,6 +523,7 @@ data:
+   seed: null
+   dataloader_num_workers: 8
+   image_patch_size: 14
++  pixel_dtype: null
+   validation_shuffle: false
+   filter_overlong_prompts: false
+   filter_overlong_prompts_workers: 1
+diff --git a/verl/trainer/config/_generated_ppo_veomni_trainer.yaml b/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
+index a8fa35f8e6729673c6eb2ddd5d1965fa3c85550d..89d6c2f4d274eb60293f7b29062cedb18cba378a 100644
+--- a/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
+@@ -500,6 +500,7 @@ data:
+   seed: null
+   dataloader_num_workers: 8
+   image_patch_size: 14
++  pixel_dtype: null
+   validation_shuffle: false
+   filter_overlong_prompts: false
+   filter_overlong_prompts_workers: 1
+diff --git a/verl/trainer/config/data/legacy_data.yaml b/verl/trainer/config/data/legacy_data.yaml
+index 2971c6b5c400685e23a0c07f4cf7fdad35005a1a..9341d8278e624622d98e7778295fc715740a83af 100644
+--- a/verl/trainer/config/data/legacy_data.yaml
++++ b/verl/trainer/config/data/legacy_data.yaml
+@@ -76,6 +76,10 @@ dataloader_num_workers: 8
+ # image patch size
+ image_patch_size: 14
+ 
++# Dtype the pixel tensors are stored in (the processor emits fp32; a vision tower that casts its input to bf16 anyway
++# loses nothing and every trajectory halves its bytes). null keeps the processor's dtype.
++pixel_dtype: null
++
+ # Whether to shuffle the validation set.
+ validation_shuffle: False
+ 

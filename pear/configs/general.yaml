@@ -1,0 +1,35 @@
+# The general-capability evaluation (pear/eval/general.py): one protocol for every model compared.
+
+# the model card's thinking mode
+sampling: {temperature: 1.0, top_p: 0.95, top_k: 20, min_p: 0.0, presence_penalty: 0.0}
+# per request, then evalscope retries it; part of generation_config, so a change invalidates finished samples
+request_timeout_s: 21600
+concurrency: 256  # requests in flight per benchmark
+bootstrap: {samples: 2000, seed: 0, confidence: 0.95}  # of a paired difference
+
+token_budgets: {long: &long 131072, short: &short 81920}  # the output tokens of a request, which a benchmark names
+
+# evalscope's dataset and dataset_args, the repeats, the output token budget; hf_dataset_id: from Hugging Face
+benchmarks:
+  aime26: {dataset: aime26, dataset_args: {}, repeats: 16, max_tokens: *long}
+  gpqa_diamond: {dataset: gpqa_diamond, dataset_args: {}, repeats: 8, max_tokens: *short}
+  ifbench: {dataset: ifbench, dataset_args: {}, repeats: 1, max_tokens: *short}
+  live_code_bench:  # v6 as the model card reports it
+    dataset: live_code_bench
+    dataset_args: {subset_list: [release_v6], extra_params: {start_date: "2025-02-01", end_date: "2025-05-01"}}
+    repeats: 4
+    max_tokens: *long
+  real_world_qa: {dataset: real_world_qa, dataset_args: {}, repeats: 1, max_tokens: *short}
+  erqa: {dataset: erqa, dataset_args: {}, repeats: 1, max_tokens: *short}
+  mmmu: {dataset: mmmu, dataset_args: {}, repeats: 1, max_tokens: *short}
+  mmmu_pro_standard10:
+    dataset: mmmu_pro
+    dataset_args: {extra_params: {dataset_format: "standard (10 options)"}}
+    repeats: 1
+    max_tokens: *short
+  mmmu_pro_vision:
+    dataset: mmmu_pro
+    dataset_args: {extra_params: {dataset_format: vision}}
+    repeats: 1
+    max_tokens: *short
+    hf_dataset_id: MMMU/MMMU_Pro

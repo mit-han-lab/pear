@@ -1,0 +1,122 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [ckpt] feat: --fp32_modules for the FSDP model merger
+
+The FSDP merger saves the weights whose names contain one of the given substrings in fp32 instead of bf16.
+---
+ .../test_fsdp_fp32_modules_on_cpu.py          | 31 +++++++++++++++++++
+ verl/model_merger/base_model_merger.py        | 11 +++++++
+ verl/model_merger/fsdp_model_merger.py        |  7 +++--
+ 3 files changed, 47 insertions(+), 2 deletions(-)
+ create mode 100644 tests/model_merger/test_fsdp_fp32_modules_on_cpu.py
+
+diff --git a/tests/model_merger/test_fsdp_fp32_modules_on_cpu.py b/tests/model_merger/test_fsdp_fp32_modules_on_cpu.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..398d7644935cf766391a0fa8938989326120aa5f
+--- /dev/null
++++ b/tests/model_merger/test_fsdp_fp32_modules_on_cpu.py
+@@ -0,0 +1,31 @@
++import types
++
++import torch
++
++from verl.model_merger.fsdp_model_merger import FSDPModelMerger
++
++A_LOG = "model.layers.0.linear_attn.A_log"
++UP_PROJ = "model.layers.0.mlp.up_proj.weight"
++
++
++def _merge(tmp_path, fp32_modules):
++    # two ranks holding the same replicated weights, as a world-size-2 checkpoint; values bf16 cannot represent
++    weights = {A_LOG: torch.tensor([0.1234567, 1.7654321]), UP_PROJ: torch.tensor([[0.1234567, 1.7654321]])}
++    for rank in range(2):
++        torch.save(dict(weights), tmp_path / f"model_world_size_2_rank_{rank}.pt")
++    merger = FSDPModelMerger.__new__(FSDPModelMerger)
++    merger.config = types.SimpleNamespace(local_dir=str(tmp_path), fp32_modules=fp32_modules)
++    return weights, merger._load_and_merge_state_dicts(2, 2, (2,), ("fsdp",))
++
++
++def test_the_fp32_modules_keep_their_fp32_values(tmp_path):
++    weights, merged = _merge(tmp_path, ["A_log"])
++
++    assert merged[A_LOG].dtype == torch.float32 and torch.equal(merged[A_LOG], weights[A_LOG])
++    assert merged[UP_PROJ].dtype == torch.bfloat16
++
++
++def test_without_fp32_modules_every_weight_is_bf16(tmp_path):
++    _, merged = _merge(tmp_path, [])
++
++    assert {tensor.dtype for tensor in merged.values()} == {torch.bfloat16}
+diff --git a/verl/model_merger/base_model_merger.py b/verl/model_merger/base_model_merger.py
+index 874b15928d25245a2a83f9a3e5e3455fd6041350..19da9d7e4121be2ccc9ec0dc4e927b36f0fbfa84 100644
+--- a/verl/model_merger/base_model_merger.py
++++ b/verl/model_merger/base_model_merger.py
+@@ -57,6 +57,13 @@ def parse_args():
+         help="Whether to use CPU initialization for the model. This is useful for large models that cannot "
+         "fit into GPU memory during initialization.",
+     )
++    base_op_parser.add_argument(
++        "--fp32_modules",
++        nargs="*",
++        default=[],
++        help="Weights whose names contain one of these substrings are saved in fp32 instead of bf16 (the weights a "
++        "rollout engine computes in fp32).",
++    )
+ 
+     merge_parser = subparsers.add_parser("merge", parents=[base_op_parser], help="Merge model checkpoints and save.")
+     merge_parser.add_argument(
+@@ -100,6 +107,8 @@ class ModelMergerConfig:
+         hf_model_config_path (Optional[str]): Path to HuggingFace model configuration files. Defaults to None.
+         hf_upload (bool): Whether to upload to HuggingFace (computed automatically). Not for initialization.
+         use_cpu_initialization (bool): Whether to use CPU initialization for large models. Defaults to False.
++        fp32_modules (list[str]): Weights whose names contain one of these substrings are saved in fp32, everything
++            else in bf16: the weights a rollout engine computes in fp32. Defaults to [].
+     """
+ 
+     operation: str  # 'merge' or 'test'
+@@ -115,6 +124,7 @@ class ModelMergerConfig:
+     hf_model_config_path: Optional[str] = None
+     hf_upload: bool = field(init=False)
+     use_cpu_initialization: bool = False
++    fp32_modules: list[str] = field(default_factory=list)
+ 
+     def __post_init__(self):
+         self.hf_upload = self.operation == "merge" and bool(self.hf_upload_path)
+@@ -149,6 +159,7 @@ def generate_config_from_args(args: argparse.Namespace) -> ModelMergerConfig:
+         "local_dir": args.local_dir,
+         "hf_model_config_path": _default_hf_model_config_path(args.backend, args.local_dir),
+         "use_cpu_initialization": args.use_cpu_initialization,
++        "fp32_modules": args.fp32_modules,
+     }
+ 
+     if args.operation == "merge":
+diff --git a/verl/model_merger/fsdp_model_merger.py b/verl/model_merger/fsdp_model_merger.py
+index e05887949ba7fd5b028268afb6b41f9187062aa5..6aec79196b042089ad76ecdd169d8d7876265507 100644
+--- a/verl/model_merger/fsdp_model_merger.py
++++ b/verl/model_merger/fsdp_model_merger.py
+@@ -186,11 +186,14 @@ class FSDPModelMerger(BaseModelMerger):
+ 
+         for key in set(model_state_dict_lst[0].keys()):
+             state_dict[key] = []
++            # bf16, except the fp32 modules (the rollout's replicas load them in fp32)
++            is_fp32 = any(pattern in key for pattern in self.config.fp32_modules)
+             for model_state_shard in model_state_dict_lst:
+                 # add tensor shard in order of rank to state_dict[key]
+                 tensor = model_state_shard.pop(key)
+                 if isinstance(tensor, DTensor):
+-                    state_dict[key].append(tensor._local_tensor.bfloat16())
++                    local = tensor._local_tensor
++                    state_dict[key].append(local.float() if is_fp32 else local.bfloat16())
+ 
+                     placements = tuple(tensor.placements)
+                     # replicated placement at dp dimension can be discarded
+@@ -202,7 +205,7 @@ class FSDPModelMerger(BaseModelMerger):
+                     else:
+                         assert param_placements[key] == placements
+                 else:
+-                    state_dict[key].append(tensor.bfloat16())
++                    state_dict[key].append(tensor.float() if is_fp32 else tensor.bfloat16())
+ 
+         del model_state_dict_lst
+ 

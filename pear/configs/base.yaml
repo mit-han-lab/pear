@@ -1,0 +1,124 @@
+# What every PEAR run sets on top of verl's PPO trainer config (ppo_trainer of verl.trainer.config). An entry point's
+# config composes it: training.yaml for `python -m pear.trainer.main`, pear/configs/embodied.yaml for
+# `python -m pear.eval.embodied`. The recipes in examples/ set a run's own values as overrides.
+defaults:
+  - ppo_trainer
+  - _self_
+
+run_dir: ???  # the run's directory, resolved: a recipe's RUN
+# The run's rollout sizes. An entry point sets verl's keys from them before the launch (pear/trainer/config.py): a
+# replica's decoding slots (rollout.max_num_seqs), the agent loop's processes (rollout.agent.num_workers) and the
+# sessions kept generating across all replicas (trainer.v1.sampler.max_inflight_sessions).
+run_sizes:
+  sessions_per_replica: null  # sessions a replica keeps generating, a recipe's to give; null: verl's keys stand
+  # decoding slots per session a replica holds on average: a replica's share of the sessions drifts above the mean
+  seqs_per_session: 2
+  seqs_per_agent_worker: 8  # decoding slots per agent-loop process (templating, image processing, the calls)
+
+algorithm:
+  adv_estimator: grpo  # a sample's advantage within its group: no critic
+  use_kl_in_reward: false  # no reference policy
+
+trainer:
+  project_name: pear
+  v1:
+    # separate_async: no vLLM on the trainer's GPUs, generation never stops, the trainer takes groups as they finish;
+    # the weights go out after every step and the interrupted episodes resume on them
+    trainer_mode: separate_async
+    separate_async:
+      parameter_sync_step: 1
+    sampler:
+      # a group trains at most 4 versions behind the policy (staleness <= 4): the threshold also counts the version
+      # its prompt was issued under, so 5; older finished groups are dropped and replaced
+      max_off_policy_threshold: 5
+      max_off_policy_strategy: drop
+      # Sessions kept generating: the replay buffer refills finished and evicted groups up to it while it samples,
+      # instead of a new batch every step. Every group counts as rollout.n sessions; within it a tool's sessions stay
+      # under what its family's servers take at once (its tool config). null: no cap
+      max_inflight_sessions: null
+
+data:
+  custom_cls:  # the episodes: episode files turned into rows
+    path: pear/agent_loop/dataset.py
+    name: EpisodeDataset
+  tool_config_path: null  # verl's dataset would otherwise build the tools on the driver for schemas the rows never use
+  image_key: images
+  return_raw_chat: true
+  return_multi_modal_inputs: false
+  val_batch_size: 128
+
+actor_rollout_ref:
+  actor:
+    strategy: fsdp2
+    use_kl_loss: false  # no reference policy
+    fsdp_config:
+      _target_: pear.trainer.config.PearFSDPEngineConfig  # verl's FSDP engine config with the two keys below
+      # A model family's training kernels, by class path (pear/models/kernels.py); null: verl's engine as it is
+      kernels: null
+      # Whether the kernels install the backend of the machine's GPU generation beside what they install on any GPU
+      use_gpu_backend: false
+  rollout:
+    _target_: pear.rollout.config.PearRolloutConfig  # verl's rollout config with the two keys below
+    name: vllm  # PEAR's vLLM replica, which pear.rollout.server registers under verl's name
+    mode: async
+    max_num_batched_tokens: 8192
+    enable_prefix_caching: true
+    calculate_log_probs: true
+    # the replicas run without sleep mode (a sleep-mode replica's KV cache cannot be shared with the LMCache sidecar
+    # over CUDA IPC) and keep their KV cache through the weight sync
+    enable_sleep_mode: false
+    free_cache_engine: false
+    custom:
+      node_label: rollout  # the Ray resource of the machines the replicas go to (scripts/start_ray_node.sh)
+    engine_kwargs:
+      vllm:
+        disable_log_stats: false
+        enable_log_requests: false
+    # Weights the vLLM replicas keep in fp32 instead of dtype, by substrings of their names: built in fp32, then loaded
+    # and synced in fp32. The weight sync casts every other weight to dtype, so a weight vLLM itself keeps in fp32
+    # belongs here too.
+    fp32_modules: []
+    # A model family's vLLM classes and patches for its replicas, by class path (pear/models/kernels.py); null: vLLM's own
+    kernels: null
+    checkpoint_engine:
+      backend: nccl
+      custom_backend_module: pear.rollout.checkpoint_engine  # it registers PEAR's NCCL engine as the backend nccl
+      update_weights_bucket_megabytes: 512
+      engine_kwargs:
+        nccl:  # what the trainer's weights are cast to on the way to the replicas, and what stays fp32
+          rollout_dtype: ${actor_rollout_ref.rollout.dtype}
+          fp32_modules: ${actor_rollout_ref.rollout.fp32_modules}
+          # the NCCL group between the actor and the replicas is rebuilt for every sync: a kept group's buffers would
+          # stay on the trainer GPUs
+          rebuild_group: true
+    multi_turn:
+      max_parallel_calls: 1  # an answer is one action: verl's generating state keeps that many calls of an answer
+    agent:
+      agent_loop_config_path: pear/agent_loop/config.yaml
+      agent_loop_manager_class: pear.agent_loop.manager.PearAgentLoopManager  # it starts the simulators' server pools
+      default_agent_loop: pear_agent  # the entry of the agent loop's config.yaml; the rows carry no agent_name
+
+transfer_queue:
+  backend:
+    SimpleStorage:
+      # the queue snapshot is written one file per storage unit: 32 writers, not verl's 8; a snapshot loads only into
+      # the same number of units
+      num_data_storage_units: 32
+
+ray_kwargs:
+  ray_init:
+    runtime_env:
+      # What the Ray workers read, over verl's own values for a worker (verl.trainer.constants_ppo); a recipe adds its
+      # tree's, its model's and its family's. The entry points resolve them before verl takes them.
+      env_vars:
+        WANDB_DIR: ${run_dir}
+        PEAR_LOG_DIR: ${run_dir}/sim  # the simulators' servers' logs, the tools' call logs, the turns' records
+        TENSORBOARD_DIR: ${run_dir}/tensorboard
+        # NCCL_LAUNCH_ORDER_IMPLICIT=1 orders the kernels of a GPU's several communicators (FSDP, Ulysses SP, weight
+        # sync) by host issue order: without it they can deadlock. NCCL_MNNVL_ENABLE=0: machines held by different
+        # allocations get different IMEX channels, so multi-node NVLink fails between them and they use InfiniBand.
+        NCCL_LAUNCH_ORDER_IMPLICIT: "1"
+        NCCL_MNNVL_ENABLE: "0"
+        # verl's own value for a worker is 'true'. With 'false' a tokenizer encodes on the calling thread, not on a
+        # pool of every core in each of a machine's processes
+        TOKENIZERS_PARALLELISM: "false"

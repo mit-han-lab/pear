@@ -1,0 +1,16 @@
+name: Feature request
+description: A capability PEAR does not have
+labels: [enhancement]
+body:
+  - type: textarea
+    attributes:
+      label: What is missing
+      description: The use case, and what you do today instead.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: What you propose
+      description: The behaviour you would like, and how it could be verified.
+    validations:
+      required: true

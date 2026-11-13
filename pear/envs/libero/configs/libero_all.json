@@ -1,0 +1,14 @@
+{
+  "env_class": "pear.envs.libero.env.LiberoEnv",
+  "data_source": "suite",
+  "env": {
+    "suite": [
+      "libero_goal",
+      "libero_spatial",
+      "libero_object",
+      "libero_10"
+    ],
+    "task_id": "0-9",
+    "trial_id": "0-49"
+  }
+}

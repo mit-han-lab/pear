@@ -1,0 +1,7 @@
+# Sourced, not run: the upstream LMCache commit patches/ applies to (scripts/checkout_lmcache.sh,
+# scripts/export_lmcache_patches.sh, scripts/build_lmcache_wheel.sh)
+LMCACHE_URL=https://github.com/LMCache/LMCache.git
+# dev: [Refactor] Extract server-bench cold/warm flow into BenchCase (#4883)
+LMCACHE_COMMIT=59a56a2cb6cdf36ace6661d2ed557f435609969e
+# the wheel's version: upstream's development version with the number of the preemption fix's pull request
+LMCACHE_VERSION=0.5.5.dev4955

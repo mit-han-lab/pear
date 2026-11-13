@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [fsdp] refactor: _optimizer_update, the update optimizer_step
+ applies, as a method a subclass can replace
+
+optimizer_step clips the gradients, skips a non-finite norm and then updates. The update moves into
+_optimizer_update unchanged, so that an engine subclass can run it another way (for example on optimizer
+states it keeps on the host) without restating the clipping and the checks around it.
+---
+ verl/workers/engine/fsdp/transformer_impl.py | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
+index dc4cbdd386f74277911d77a2262719156e94eb24..032f1e97be85dc877930a0c90e7226b2b24a0f11 100644
+--- a/verl/workers/engine/fsdp/transformer_impl.py
++++ b/verl/workers/engine/fsdp/transformer_impl.py
+@@ -824,7 +824,7 @@ class FSDPEngine(BaseEngine):
+                 print(f"WARN: grad_norm is not finite: {grad_norm}")
+                 self.optimizer.zero_grad()
+             else:
+-                self.optimizer.step()
++                self._optimizer_update()
+ 
+         if self._qat_enabled:
+             from verl.utils.qat.core import invalidate_all_scales
+@@ -833,6 +833,10 @@ class FSDPEngine(BaseEngine):
+ 
+         return grad_norm.item()
+ 
++    def _optimizer_update(self):
++        """Apply the optimizer's update to the clipped, finite gradients. A subclass may replace how it runs."""
++        self.optimizer.step()
++
+     def lr_scheduler_step(self):
+         """
+         Advance FSDP scheduler and return updated learning rate.

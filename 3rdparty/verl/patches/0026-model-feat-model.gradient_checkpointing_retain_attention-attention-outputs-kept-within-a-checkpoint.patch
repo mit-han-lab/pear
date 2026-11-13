@@ -1,0 +1,229 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [model] feat: model.gradient_checkpointing_retain_attention,
+ attention outputs kept within a checkpoint
+
+A checkpointed full-attention layer keeps its FlashAttention-4 or -3 outputs from its forward to its backward,
+whose recompute replays them instead of running the attention again. Off by default.
+---
+ .../transformers/attention_retention.py       | 80 +++++++++++++++++++
+ .../_generated_ppo_megatron_trainer.yaml      |  2 +
+ .../_generated_ppo_torchtitan_trainer.yaml    |  2 +
+ .../config/_generated_ppo_trainer.yaml        |  2 +
+ .../config/_generated_ppo_veomni_trainer.yaml |  2 +
+ verl/trainer/config/model/hf_model.yaml       |  5 ++
+ verl/workers/config/model.py                  |  1 +
+ verl/workers/engine/fsdp/transformer_impl.py  |  4 +
+ 8 files changed, 98 insertions(+)
+ create mode 100644 verl/models/transformers/attention_retention.py
+
+diff --git a/verl/models/transformers/attention_retention.py b/verl/models/transformers/attention_retention.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..eb4b903670c130846d6298ed02055ccca38ce717
+--- /dev/null
++++ b/verl/models/transformers/attention_retention.py
+@@ -0,0 +1,80 @@
++import importlib
++from collections import deque
++from contextlib import contextmanager
++from contextvars import ContextVar
++from functools import partial, wraps
++
++import torch
++from torch.utils.checkpoint import checkpoint
++
++_active_cache: ContextVar = ContextVar("attention_checkpoint_cache", default=None)
++
++
++# the forward that the cache wraps, by attention implementation: (module, function)
++_FLASH_ATTENTION_FORWARDS = {
++    "flash_attention_4": ("flash_attn.cute.interface", "_flash_attn_fwd"),
++    "flash_attention_3": ("flash_attn_interface", "_flash_attn_forward"),  # Hopper
++}
++
++
++def _install_flash_attention_cache(module_name: str, function_name: str):
++    """Wraps a FlashAttention forward: inside a retaining checkpoint the recompute replays the cached outputs."""
++    module = importlib.import_module(module_name)
++    original = getattr(module, function_name)
++    if getattr(original, "_retains_outputs", False):
++        return
++
++    @wraps(original)
++    def forward(*args, **kwargs):
++        active = _active_cache.get()
++        if active is None:
++            return original(*args, **kwargs)
++        cache, recompute = active
++        if recompute:
++            return cache.pop()
++        outputs = original(*args, **kwargs)
++        cache.appendleft(tuple(t.detach() if isinstance(t, torch.Tensor) else t for t in outputs))
++        return outputs
++
++    forward._retains_outputs = True
++    setattr(module, function_name, forward)
++
++
++def _checkpoint_contexts():
++    cache = deque()
++
++    @contextmanager
++    def context(recompute: bool):
++        token = _active_cache.set((cache, recompute))
++        try:
++            yield
++        finally:
++            _active_cache.reset(token)
++            if recompute:
++                cache.clear()
++
++    return context(False), context(True)
++
++
++def _attn_implementations(model: torch.nn.Module) -> set:
++    """The attention implementations of the model's config and of its sub-models' configs."""
++    configs = [model.config] + [getattr(model.config, name, None) for name in getattr(model.config, "sub_configs", {})]
++    return {getattr(config, "_attn_implementation", None) for config in configs}
++
++
++def retain_attention_in_checkpoints(model: torch.nn.Module):
++    """Keeps a checkpointed attention layer's FlashAttention-4 or -3 outputs from its forward to its backward."""
++    for name in _attn_implementations(model) & _FLASH_ATTENTION_FORWARDS.keys():
++        _install_flash_attention_cache(*_FLASH_ATTENTION_FORWARDS[name])
++    for layer in model.modules():
++        if not getattr(layer, "gradient_checkpointing", False):
++            continue
++        if getattr(layer, "layer_type", "full_attention") != "full_attention":  # linear attention: nothing to retain
++            continue
++        original = layer._gradient_checkpointing_func
++        # the checkpoint calls context_fn afresh for every forward: a cache lives for one forward and its backward
++        options = dict(getattr(original, "keywords", None) or {})
++        options.update(use_reentrant=False, context_fn=_checkpoint_contexts)
++        function = original.func if isinstance(original, partial) else checkpoint
++        arguments = original.args if isinstance(original, partial) else ()
++        layer._gradient_checkpointing_func = partial(function, *arguments, **options)
+diff --git a/verl/trainer/config/_generated_ppo_megatron_trainer.yaml b/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
+index 0c07dff63832091374ba415e684910b4051c88b2..d0242ba96751f914c4be304473626540c4d72672 100644
+--- a/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
+@@ -459,6 +459,7 @@ actor_rollout_ref:
+     external_lib: null
+     override_config: {}
+     enable_gradient_checkpointing: true
++    gradient_checkpointing_retain_attention: false
+     enable_activation_offload: false
+     use_remove_padding: true
+     lora_rank: 0
+@@ -722,6 +723,7 @@ critic:
+     external_lib: null
+     override_config: {}
+     enable_gradient_checkpointing: true
++    gradient_checkpointing_retain_attention: false
+     enable_activation_offload: false
+     use_remove_padding: true
+     lora_rank: 0
+diff --git a/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml b/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
+index fa089a8f631a11bf2a7eb5eb138b0ed68a2e4799..da8d625a48e8fcd604b5ab6d305708eca8caa33a 100644
+--- a/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
+@@ -403,6 +403,7 @@ actor_rollout_ref:
+     external_lib: null
+     override_config: {}
+     enable_gradient_checkpointing: true
++    gradient_checkpointing_retain_attention: false
+     enable_activation_offload: false
+     use_remove_padding: true
+     lora_rank: 0
+@@ -617,6 +618,7 @@ critic:
+     external_lib: null
+     override_config: {}
+     enable_gradient_checkpointing: true
++    gradient_checkpointing_retain_attention: false
+     enable_activation_offload: false
+     use_remove_padding: true
+     lora_rank: 0
+diff --git a/verl/trainer/config/_generated_ppo_trainer.yaml b/verl/trainer/config/_generated_ppo_trainer.yaml
+index d0deacc200c37561bff0db3c5e212140b68be5d0..dce58b9652eb2deb0fe99c370df3b6ba15710f74 100644
+--- a/verl/trainer/config/_generated_ppo_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_trainer.yaml
+@@ -448,6 +448,7 @@ actor_rollout_ref:
+     external_lib: null
+     override_config: {}
+     enable_gradient_checkpointing: true
++    gradient_checkpointing_retain_attention: false
+     enable_activation_offload: false
+     use_remove_padding: true
+     lora_rank: 0
+@@ -692,6 +693,7 @@ critic:
+     external_lib: null
+     override_config: {}
+     enable_gradient_checkpointing: true
++    gradient_checkpointing_retain_attention: false
+     enable_activation_offload: false
+     use_remove_padding: true
+     lora_rank: 0
+diff --git a/verl/trainer/config/_generated_ppo_veomni_trainer.yaml b/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
+index 89d6c2f4d274eb60293f7b29062cedb18cba378a..93828695e9bcd7a07967e363f6ac7d5c6bda116e 100644
+--- a/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
+@@ -425,6 +425,7 @@ actor_rollout_ref:
+     external_lib: null
+     override_config: {}
+     enable_gradient_checkpointing: true
++    gradient_checkpointing_retain_attention: false
+     enable_activation_offload: false
+     use_remove_padding: true
+     lora_rank: 0
+@@ -657,6 +658,7 @@ critic:
+     external_lib: null
+     override_config: {}
+     enable_gradient_checkpointing: true
++    gradient_checkpointing_retain_attention: false
+     enable_activation_offload: false
+     use_remove_padding: true
+     lora_rank: 0
+diff --git a/verl/trainer/config/model/hf_model.yaml b/verl/trainer/config/model/hf_model.yaml
+index 6e8a2535146e3e7107237bc147b3e4a5a349d46e..6e37fb5e2f3f3efcb1ac8f6395846163386812ee 100644
+--- a/verl/trainer/config/model/hf_model.yaml
++++ b/verl/trainer/config/model/hf_model.yaml
+@@ -33,6 +33,11 @@ override_config: {}
+ # whether to enable gradient checkpointing. Only valid when we use hf model definition
+ enable_gradient_checkpointing: True
+ 
++# keep each checkpointed attention layer's FlashAttention-4 or -3 outputs between its forward and backward (no
++# attention recompute; the outputs of one checkpoint stay on the device). Only valid with
++# enable_gradient_checkpointing and flash_attention_4 or flash_attention_3
++gradient_checkpointing_retain_attention: False
++
+ # whether to enable activation offload. Only valid when we use hf model definition
+ enable_activation_offload: False
+ 
+diff --git a/verl/workers/config/model.py b/verl/workers/config/model.py
+index 545ec4682189d3811311cd0ac8fcae3e153bef3b..f7baab8b843798facaf6c9492a62bc4bd90201b2 100644
+--- a/verl/workers/config/model.py
++++ b/verl/workers/config/model.py
+@@ -115,6 +115,7 @@ class HFModelConfig(BaseConfig):
+     override_config: dict = field(default_factory=dict)
+ 
+     enable_gradient_checkpointing: bool = True
++    gradient_checkpointing_retain_attention: bool = False
+     enable_activation_offload: bool = False
+ 
+     use_remove_padding: bool = True
+diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
+index ccbec03058141e483e82863b487d7156b163af89..b0ca36bcfe9bdc36777cec09dcead66611c6c582 100644
+--- a/verl/workers/engine/fsdp/transformer_impl.py
++++ b/verl/workers/engine/fsdp/transformer_impl.py
+@@ -334,6 +334,10 @@ class FSDPEngine(BaseEngine):
+ 
+             if self.model_config.enable_gradient_checkpointing:
+                 module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
++                if self.model_config.gradient_checkpointing_retain_attention:
++                    from verl.models.transformers.attention_retention import retain_attention_in_checkpoints
++
++                    retain_attention_in_checkpoints(module)
+         return module
+ 
+     def _build_lora_module(self, module):

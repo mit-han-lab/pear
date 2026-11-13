@@ -1,0 +1,26 @@
+# @package _global_
+# What a deploy of a Qwen3.5 model sets on top of pear/configs/server.yaml, whatever its checkpoint and its GPU. A
+# deploy recipe of examples/models composes it with the override +qwen3_5=deploy.
+speculative:  # a DFlash draft's block: the target's token and the draft's proposals
+  method: dflash
+  num_speculative_tokens: 7
+  draft_sample_method: probabilistic
+# the family's vLLM classes and patches for one session on one GPU, the decode megakernel among them; null: vLLM's own
+kernels: pear.models.qwen3_5.deploy.deploy_kernels.Qwen3_5DeployKernels
+env:
+  VLLM_USE_V2_MODEL_RUNNER: "1"  # the runner the kernels hook into
+engine:
+  # the dtype of what a checkpoint leaves unquantized: embeddings, norms, the Gated DeltaNet's in_proj_a, in_proj_b and
+  # conv1d, the vision tower, the KV cache, the activations
+  dtype: bfloat16
+  max_model_len: 260096  # a session's 4096 prompt tokens and its 256000 response tokens
+  max_num_batched_tokens: 8192
+  mamba_cache_mode: align  # prefix caching of the Gated DeltaNet's state, kept at the block boundaries
+  # the requests' default sampling, which the decode megakernel's sampler implements: the checkpoint's own (top-k 20)
+  # would decode every request on vLLM's sampler
+  override_generation_config: {temperature: 1.0, top_k: -1, top_p: 0.95, repetition_penalty: 1.0}
+  limit_mm_per_prompt: {image: 1016}  # the images of a full context: max_model_len over an image's tokens
+  compilation_config:
+    cudagraph_mode: FULL_AND_PIECEWISE  # a full graph per decode step, pieces between the attention and GDN cores else
+    # 1, 4 and 8: the decode and verify steps; the rest: prefill chunks up to max_num_batched_tokens, replayed
+    cudagraph_capture_sizes: [1, 4, 8, 256, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192]

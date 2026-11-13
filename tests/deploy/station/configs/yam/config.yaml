@@ -1,0 +1,30 @@
+# The YAM station the tests run: the robot on stand-in hardware, with stand-in devices and one pair of arms'
+# calibration. Every other value is the shipped config.yaml's, read under this file.
+robot_class: stand_in_robots.StandInYAMRobot
+
+robot:
+  arms:
+    left:
+      channel: stand_in_left
+      adapter_serial: STAND-IN-ADAPTER-LEFT
+      joint_offsets: [0, 0, 0, -0.104, 0, 0]
+      gravity_compensation_factors: [1, 1.20, 1.26, 1.2, 1, 1]
+      friction_feedforward_nm: [0.65, 0.30, 1.74, 0.12, 0.10, 0.11]
+      friction_load_ratio: [0, 0.183, 0, 0, 0, 0]
+      gripper_limits: [6.340623149389457, 1.214282081185262]
+    right:
+      channel: stand_in_right
+      adapter_serial: STAND-IN-ADAPTER-RIGHT
+      joint_offsets: [0, 0, 0, -0.101, 0, 0]
+      gravity_compensation_factors: [1, 1.23, 1.27, 1.2, 1, 1]
+      friction_feedforward_nm: [0.45, 0.60, 1.86, 0.10, 0.11, 0.12]
+      friction_load_ratio: [0, 0.197, 0, 0, 0, 0]
+      gripper_limits: [6.46314946, 1.25219348]
+  cameras:
+    - serial: STAND-IN-CAMERA-LEFT
+      role: left
+    - serial: STAND-IN-CAMERA-TOP
+      role: top
+      crop: {x_offset: 80, y_offset: 60, width: 480, height: 360}
+    - serial: STAND-IN-CAMERA-RIGHT
+      role: right

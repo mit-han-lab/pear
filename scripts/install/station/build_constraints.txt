@@ -1,0 +1,4 @@
+# The build tools of what the station's environment compiles at its install (uv's UV_BUILD_CONSTRAINT). ruckig has
+# no wheel for the environment's Python, and its build configuration names cmake.targets, which scikit-build-core
+# 0.10 and newer refuse.
+scikit-build-core==0.9.10

@@ -1,0 +1,61 @@
+# One SO-101 follower arm with a wrist camera: its defaults, read over pear/configs/station.yaml. A station's own file
+# gives the values left ??? and any value of its own; joint values are rad in the calibrated frame, the gripper's an
+# opening, 0 closed and 1 open.
+
+robot_class: pear.deploy.station.control.robots.so101.robot.SO101Robot
+port: 18900  # of the page's service
+
+robot:
+  hardware:
+    port: ???  # the arm's Feetech bus device: `pear-station so101 check` lists the serial ports
+    calibration_id: so101_follower
+    # relative to the station's own file, which keeps its calibration next to it; `pear-station so101 calibrate`
+    # creates it
+    calibration_dir: calibration
+    joint_offsets: [0.0, 0.0, 0.0, 0.0, 0.0]  # a software zero correction on top of the calibration
+    status_poll_ticks: 10
+    # the servos' position gain; higher reduces sag but makes the arm shake. Every feedforward value below scales with
+    # 1 / P, so identify them again after a change
+    position_p_coefficient: 16
+  camera:
+    path: ???  # the wrist camera's video device: `pear-station so101 check` lists the video devices
+    role: wrist
+    width: 640
+    height: 480
+    fps: 30
+    fourcc: MJPG
+  geometry:  # urdf, the arm's description, is the package's own unless a station names another
+    gripper_width_cm: [0.0, 6.0]  # fingertip distance when closed and when open; measure with a ruler
+    max_rotation_rad: 3.141592653589793
+    position_residual_m: 0.001
+    rotation_residual_rad: 0.01
+    ik_iterations: 200
+  limits:
+    # the SO-101's generic range; verify it after a calibration. A folded rest pose may sit just outside lift and
+    # elbow: feedback_position_tolerance accepts it, and moves may only go inward
+    lower_bounds: [-1.7623, -1.7569, -1.6503, -1.7201, -2.618, 0.0]
+    upper_bounds: [1.7623, 1.7569, 1.6503, 1.7201, 2.618, 1.0]
+    velocity: [1.0, 1.0, 1.0, 1.0, 1.0, 0.5]
+    acceleration: [2.0, 2.0, 2.0, 2.0, 2.0, 2.0]
+    jerk: [10.0, 10.0, 10.0, 10.0, 10.0, 10.0]
+    tracking_error: [0.25, 0.25, 0.25, 0.25, 0.25, 1.0]  # the gripper's is not checked while the arm runs
+    # a STOP brakes with these, higher than the move caps
+    stop_acceleration: [6.0, 6.0, 6.0, 6.0, 6.0, 6.0]
+    stop_jerk: [60.0, 60.0, 60.0, 60.0, 60.0, 60.0]
+  home:
+    # the fingertip tilted down with the jaw rolled 90 degrees so that it closes sideways; Home opens the gripper
+    position: [0.0, -0.814, 0.077, 1.423, -1.613, 1.0]
+    joint_tolerance: [0.035, 0.06, 0.06, 0.06, 0.035]  # lift, elbow and wrist_flex carry gravity
+    speed_scale: 0.3333333333333333
+    settle_window_s: 0.5
+    arrival_timeout_s: 20
+  # goal offsets for the servos' P-only loop, joint 1 to 5: `pear-station so101 friction-sweep` measures them; zeros
+  # switch the compensation off
+  feedforward:
+    gravity_compliance: [0.0, 0.0, 0.0, 0.0, 0.0]
+    friction_offset_rad: [0.0, 0.0, 0.0, 0.0, 0.0]
+    friction_load_ratio: [0.0, 0.0, 0.0, 0.0, 0.0]
+  position_tolerance: 0.06  # of an arm joint's arrival; under gravity the elbow settles short of its command
+  gripper_tolerance: 0.02
+  feedback_position_tolerance: 0.06
+  velocity_tolerance: 0.06

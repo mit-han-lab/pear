@@ -1,0 +1,20 @@
+PEAR
+Copyright contributors to the PEAR project
+
+This product includes software derived from verl (https://github.com/volcengine/verl),
+Copyright 2023-2024 Bytedance Ltd. and/or its affiliates, licensed under the Apache License, Version 2.0:
+the patches under 3rdparty/verl/patches change verl's code, and tests/trainer/test_replay_buffer_on_cpu.py,
+tests/trainer/test_trainer_reissue_on_cpu.py and tests/trainer/test_trainer_session_caps_on_cpu.py derive from
+verl's tests and keep its copyright line.
+
+This product includes software derived from LMCache (https://github.com/LMCache/LMCache),
+licensed under the Apache License, Version 2.0: the patches under 3rdparty/LMCache/patches change LMCache's code.
+
+This product includes the robot description of the SO-101 arm from SO-ARM100
+(https://github.com/TheRobotStudio/SO-ARM100), licensed under the Apache License, Version 2.0:
+pear/deploy/station/control/robots/so101/description/so101_new_calib.urdf, changed as the README.md beside it
+states.
+
+This product includes the fonts IBM Plex Sans, Copyright 2017 IBM Corp., and JetBrains Mono, Copyright 2020 The
+JetBrains Mono Project Authors, each licensed under the SIL Open Font License, Version 1.1: the font files under
+pear/deploy/station/records/video/fonts, with their licenses.

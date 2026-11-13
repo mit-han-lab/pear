@@ -1,0 +1,162 @@
+.jump {
+  position: absolute;
+  top: -30px;
+  left: 45%;
+  border: 1px solid var(--border-strong);
+  border-radius: 20px;
+  background: var(--surface);
+  font-size: 10px;
+  padding: 5px 10px;
+  box-shadow: 0 2px 5px var(--shadow-faint);
+}
+
+/* The task box under the conversation: text, then one row of tools with the round task button at its end. */
+.composer-area {
+  position: relative;
+  flex-shrink: 0;
+  padding: 10px 24px 16px;
+}
+.composer {
+  border: 1px solid var(--border-strong);
+  border-radius: 22px;
+  background: var(--surface);
+  box-shadow: 0 4px 18px var(--shadow-composer);
+  padding: 14px 14px 10px 18px;
+}
+.composer textarea {
+  display: block;
+  width: 100%;
+  border: 0;
+  outline: 0;
+  resize: none;
+  background: transparent;
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--ink);
+}
+.composer textarea::placeholder {
+  color: var(--text-faint);
+}
+.image-support-note {
+  padding: 4px 0 0;
+  color: var(--notice-text);
+  font-size: 12px;
+}
+.composer-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+/* The image picker's button sits in the tool row. */
+.composer-tools .image-attachments {
+  display: contents;
+}
+.attach-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: 50%;
+  background: var(--surface);
+  color: var(--text-body);
+  font-size: 0; /* the button text stays only as its accessible name */
+}
+.composer-pill {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 36px;
+  padding: 0 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-body);
+  font-size: 13px;
+  white-space: nowrap;
+}
+.attach-button:hover:not(:disabled),
+.composer-pill:hover:not(:disabled) {
+  background: var(--surface-muted);
+}
+.recording-pill i {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--dot-idle);
+}
+.recording-pill.on {
+  border-color: var(--soft-border);
+  background: var(--soft);
+  color: var(--teal);
+  font-weight: 600;
+}
+.recording-pill.on i {
+  background: var(--stop-text);
+}
+
+/* Tags open in a panel above the pill: the next task's tags, and the running task's own tags. */
+.composer-tags {
+  position: relative;
+}
+.tags-popover {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 8px);
+  z-index: 40;
+  display: grid;
+  gap: 10px;
+  width: min(420px, calc(100vw - 48px));
+  padding: 12px 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: 14px;
+  background: var(--surface);
+  box-shadow: 0 8px 24px var(--shadow-popover);
+  outline: 0;
+}
+
+.composer-submit {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--text-secondary);
+  text-align: right;
+}
+.task-action {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border: 0;
+  border-radius: 50%;
+  background: var(--ink);
+  color: var(--on-solid);
+}
+.task-action:hover:not(:disabled) {
+  background: var(--primary);
+}
+.task-action:disabled {
+  background: var(--surface-strong);
+  color: var(--text-soft);
+  opacity: 1;
+}
+.composer-hint {
+  margin-top: 8px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+@media (max-width: 1050px) {
+  .composer-area {
+    padding: 10px 15px 14px;
+  }
+}

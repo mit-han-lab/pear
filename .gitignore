@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.DS_Store
+._*
+/runs/
+# the verl checkout the code runs with, and the scratch copies its scripts make next to it
+/3rdparty/verl/src*/
+# what npm installs for a build of the robot station's page
+/pear/deploy/station/gui/page/node_modules/

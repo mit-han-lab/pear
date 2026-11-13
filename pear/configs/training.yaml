@@ -1,0 +1,80 @@
+# The config of `python -m pear.trainer.main`: what every PEAR run sets (base.yaml) with the training's algorithm,
+# GRPO with DAPO's group filter and score centering. A stage's recipe sets its run's own values as overrides.
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+    # the model families: a recipe composes its family's own config as +<family>=config
+    - pkg://pear.models
+
+defaults:
+  - base
+  - _self_
+
+algorithm:
+  # verl's DAPO group filter: groups whose rewards have no variance are evicted and replaced one for one until
+  # train_batch_size usable groups exist
+  filter_groups:
+    enable: true
+    metric: reward
+    max_num_gen_batches: 0
+  # score centering on the sampler's top log-probs per generated token; it needs bypass-mode REINFORCE, the same
+  # update as the decoupled PPO loss at one update per step. The driver's settings here and the actor's below must
+  # agree (verl.utils.config checks)
+  rollout_correction:
+    bypass_mode: true
+    loss_type: reinforce
+    score_centering: true
+
+trainer:
+  node_label: trainer  # the Ray resource of the machines the actor goes to (scripts/start_ray_node.sh)
+  val_before_train: false
+  val_only: false
+  test_freq: -1  # no validation: a pass costs the rollout pool too much
+  # a machine can be taken away: a checkpoint every step; two kept: a backup of the latest one must not see it pruned
+  # by the next save
+  save_freq: 1
+  max_actor_ckpt_to_keep: 2
+  v1:
+    separate_async:
+      num_warmup_batches: 0
+
+actor_rollout_ref:
+  hybrid_engine: false  # standalone vLLM replicas on the rollout machines, none on the trainer's GPUs
+  model:
+    # the actor's model without its padding tokens, its layers checkpointed
+    use_remove_padding: true
+    enable_gradient_checkpointing: true
+  actor:
+    use_dynamic_bsz: true
+    fsdp_config:
+      strategy: fsdp2
+      # the HSDP replicas (one per trainer machine) all-reduce the gradients on the last micro-batch only; score
+      # centering's fused log-probs stay off
+      hsdp_all_reduce_on_last_micro_batch: true
+    entropy_coeff: 0
+    loss_agg_mode: token-mean  # every response token of the batch the same weight
+    optim:
+      lr: 1e-6
+    entropy_from_logits_with_chunking: true
+    entropy_checkpointing: true
+    policy_loss:
+      loss_mode: bypass_mode
+      rollout_correction:
+        bypass_mode: true
+        loss_type: reinforce
+        score_centering: true
+  rollout:
+    # top_p 1.0 = the full policy: below it the replica samples a truncated distribution while the trainer's log-probs
+    # cover the whole vocabulary, so every negative-advantage token raises the logits of the never-sampled tail
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    val_kwargs:
+      temperature: 1.0
+      top_p: 0.95
+      do_sample: true
+      n: 1
+    log_prob_use_dynamic_bsz: true
+    topk_log_probs: 32  # the sampler's top log-probs per generated token, which score centering reads
+    multi_turn:
+      enable: true

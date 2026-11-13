@@ -1,0 +1,476 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [fsdp] feat: optimizer_offload_step, the optimizer states on
+ the device for the step only
+
+With FSDP2 and manual optimizer offload, fsdp_config.optimizer_offload_step leaves the AdamW states on the CPU
+through train mode's forward and backward passes and loads them around optimizer.step() only. Port of #7804.
+---
+ tests/special_distributed/run_all.sh          |   2 +
+ .../test_fsdp2_optimizer_offload_step.py      | 136 ++++++++++++++++
+ .../config/test_engine_config_on_cpu.py       |  23 +++
+ ...test_fsdp_optimizer_offload_step_on_cpu.py | 154 ++++++++++++++++++
+ .../config/_generated_ppo_trainer.yaml        |   3 +
+ verl/trainer/config/engine/fsdp.yaml          |   3 +
+ verl/workers/config/engine.py                 |   9 +
+ verl/workers/engine/fsdp/transformer_impl.py  |  22 ++-
+ 8 files changed, 351 insertions(+), 1 deletion(-)
+ create mode 100644 tests/special_distributed/test_fsdp2_optimizer_offload_step.py
+ create mode 100644 tests/workers/test_fsdp_optimizer_offload_step_on_cpu.py
+
+diff --git a/tests/special_distributed/run_all.sh b/tests/special_distributed/run_all.sh
+index c2cb32992cf68a07e2b91c91c5feda8414f98616..c3457c1aec0d3d3ac56ed24303674d47272774b8 100644
+--- a/tests/special_distributed/run_all.sh
++++ b/tests/special_distributed/run_all.sh
+@@ -25,3 +25,5 @@ torchrun --nproc-per-node=2 --standalone tests/special_distributed/test_fsdp2_cp
+ # Regression for colocated FSDP2 full-parameter model transfers. It locks in
+ # PyTorch's implicit pinned allocation for non-blocking D2H Module.to().
+ torchrun --nproc-per-node=2 --standalone tests/special_distributed/test_fsdp2_pinned_model_transfer.py
++# Per-update optimizer offload: sharded Adam parity, residency, skipped updates, and state reload.
++torchrun --nproc-per-node=2 --standalone tests/special_distributed/test_fsdp2_optimizer_offload_step.py
+diff --git a/tests/special_distributed/test_fsdp2_optimizer_offload_step.py b/tests/special_distributed/test_fsdp2_optimizer_offload_step.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5685374d6178638d64946d86420b0f6c24d325da
+--- /dev/null
++++ b/tests/special_distributed/test_fsdp2_optimizer_offload_step.py
+@@ -0,0 +1,136 @@
++"""Exercise real sharded Adam states through FSDPEngine's automatic train context.
++
++Launch with torchrun --standalone --nproc-per-node=2
++    tests/special_distributed/test_fsdp2_optimizer_offload_step.py
++"""
++
++import io
++from contextlib import nullcontext
++from dataclasses import replace
++from types import SimpleNamespace
++
++import torch
++import torch.distributed as dist
++from torch.distributed import init_device_mesh
++from torch.distributed.fsdp import fully_shard
++from torch.distributed.tensor import DTensor
++
++from verl.utils.device import get_device_name, get_torch_device
++from verl.utils.distributed import initialize_global_process_group
++from verl.workers.config.engine import FSDPEngineConfig
++from verl.workers.engine.fsdp.transformer_impl import FSDPEngine
++
++
++def build_engine(mesh, enabled, param_offload, foreach, fused):
++    torch.manual_seed(5282)
++    engine = object.__new__(FSDPEngine)
++    engine.module = torch.nn.Sequential(torch.nn.Linear(32, 32), torch.nn.GELU(), torch.nn.Linear(32, 8))
++    engine.module.to(get_device_name())
++    fully_shard(engine.module, mesh=mesh)
++    assert all(isinstance(p, DTensor) for p in engine.module.parameters())
++    engine.optimizer = torch.optim.AdamW(engine.module.parameters(), lr=0.01, foreach=foreach, fused=fused)
++    engine.optimizer_config = SimpleNamespace(clip_grad=1.0)
++    engine.engine_config = FSDPEngineConfig(
++        strategy="fsdp2", optimizer_offload=True, optimizer_offload_step=enabled, param_offload=param_offload
++    )
++    engine._is_offload_param = param_offload
++    engine._is_offload_optimizer = True
++    engine._qat_enabled = False
++    engine.scaler = None
++    engine.mode = None
++    engine.ulysses_parallel_group = None
++    engine.to(device="cpu", model=param_offload, optimizer=True, grad=param_offload)
++    return engine
++
++
++def snapshot(engine):
++    # Every rank checks its entire parameter and optimizer shards. The collective
++    # exit barrier makes a failure on either rank fail the distributed test.
++    get_torch_device().synchronize()
++
++    def local_copy(tensor):
++        if isinstance(tensor, DTensor):
++            tensor = tensor.to_local()
++        return tensor.detach().cpu().clone()
++
++    result = {f"param/{name}": local_copy(p) for name, p in engine.module.named_parameters()}
++    for index, state in enumerate(engine.optimizer.state.values()):
++        for name, value in state.items():
++            result[f"optim/{index}/{name}"] = local_copy(value) if torch.is_tensor(value) else value
++    return result
++
++
++def assert_equal(actual, expected):
++    assert actual.keys() == expected.keys()
++    for key in actual:
++        torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0, msg=key)
++
++
++def assert_state_device(engine, device):
++    for state in engine.optimizer.state.values():
++        for name in ("exp_avg", "exp_avg_sq"):
++            assert isinstance(state[name], DTensor), "test must cover actual sharded optimizer states"
++            assert state[name].to_local().device.type == device
++
++
++def update(engine, index, nonfinite=False, nested=False):
++    with engine.train_mode():
++        if engine.optimizer.state:
++            assert_state_device(engine, "cpu" if engine.engine_config.optimizer_offload_step else get_device_name())
++        with engine.train_mode(disable_auto_offload=True) if nested else nullcontext():
++            generator = torch.Generator(device=get_device_name()).manual_seed(1000 + index + dist.get_rank())
++            # Two backward calls verify that state residency covers gradient accumulation.
++            for _ in range(2):
++                inputs = torch.randn(4, 32, device=get_device_name(), generator=generator)
++                engine.module(inputs).square().mean().div(2).backward()
++            if nonfinite and dist.get_rank() == 0:
++                next(engine.module.parameters()).grad.to_local().fill_(float("inf"))
++            grad_norm = engine.optimizer_step()
++            assert torch.isfinite(torch.tensor(grad_norm)).item() is not nonfinite
++            assert_state_device(engine, "cpu" if engine.engine_config.optimizer_offload_step else get_device_name())
++    assert_state_device(engine, "cpu")
++    assert all(p.grad is None for p in engine.module.parameters())
++    return snapshot(engine)
++
++
++def round_trip(engine, enabled):
++    # Serialize real DTensor optimizer state, then switch the option on resume.
++    buffer = io.BytesIO()
++    torch.save(engine.optimizer.state_dict(), buffer)
++    buffer.seek(0)
++    engine.optimizer.load_state_dict(torch.load(buffer, weights_only=False))
++    engine.to(device="cpu", model=False, optimizer=True, grad=False)
++    engine.engine_config = replace(engine.engine_config, optimizer_offload_step=enabled)
++
++
++def main():
++    _, rank, world_size = initialize_global_process_group()
++    mesh = init_device_mesh(get_device_name(), (world_size,), mesh_dim_names=("dp",))
++    for param_offload in (False, True):
++        for foreach, fused in ((False, False), (True, False), (False, True)):
++            baseline = build_engine(mesh, False, param_offload, foreach, fused)
++            offloaded = build_engine(mesh, True, param_offload, foreach, fused)
++            for index in range(4):
++                assert_equal(update(offloaded, index), update(baseline, index))
++            before = snapshot(offloaded)
++            assert_equal(update(offloaded, 4, nonfinite=True), before)
++            # Both directions resume against an uninterrupted baseline.
++            round_trip(offloaded, False)
++            assert_equal(update(offloaded, 5), update(baseline, 5))
++            round_trip(offloaded, True)
++            assert_equal(update(offloaded, 6), update(baseline, 6))
++            assert_equal(update(offloaded, 7, nested=True), update(baseline, 7, nested=True))
++            if rank == 0:
++                print(
++                    f"PASS world_size={world_size} param_offload={param_offload} foreach={foreach} fused={fused}",
++                    flush=True,
++                )
++            del baseline, offloaded
++    dist.barrier()
++    dist.destroy_process_group()
++    if rank == 0:
++        print("test_fsdp2_optimizer_offload_step passed", flush=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/workers/config/test_engine_config_on_cpu.py b/tests/workers/config/test_engine_config_on_cpu.py
+index c9a88f81d7ca4e0155b1506951bbd10dbe90df7c..d7b90d81d3a150b1d7817c065c91a91bb96bd82c 100644
+--- a/tests/workers/config/test_engine_config_on_cpu.py
++++ b/tests/workers/config/test_engine_config_on_cpu.py
+@@ -70,3 +70,26 @@ class TestFSDPEngineConfigCPU:
+         test_policy = {"layer_class": "TransformerBlock"}
+         config = FSDPEngineConfig(wrap_policy=test_policy)
+         assert config.wrap_policy == test_policy
++
++
++@pytest.mark.parametrize("param_offload", [False, True])
++def test_step_optimizer_offload_config(param_offload):
++    config = FSDPEngineConfig(
++        strategy="fsdp2", optimizer_offload=True, optimizer_offload_step=True, param_offload=param_offload
++    )
++    assert config.optimizer_offload_step is True
++
++
++@pytest.mark.parametrize(
++    "overrides",
++    [{"strategy": "fsdp"}, {"optimizer_offload": False}, {"offload_policy": True}, {"forward_only": True}],
++)
++def test_step_optimizer_offload_rejects_unsupported_config(overrides):
++    kwargs = {"strategy": "fsdp2", "optimizer_offload": True, "optimizer_offload_step": True}
++    kwargs.update(overrides)
++    with pytest.raises(ValueError, match="manual optimizer_offload"):
++        FSDPEngineConfig(**kwargs)
++
++
++def test_step_optimizer_offload_is_opt_in():
++    assert FSDPEngineConfig().optimizer_offload_step is False
+diff --git a/tests/workers/test_fsdp_optimizer_offload_step_on_cpu.py b/tests/workers/test_fsdp_optimizer_offload_step_on_cpu.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..86d015d0f2594d1bc7cf9888c87b1146ce5cc7fe
+--- /dev/null
++++ b/tests/workers/test_fsdp_optimizer_offload_step_on_cpu.py
+@@ -0,0 +1,154 @@
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from verl.workers.engine import base
++from verl.workers.engine.fsdp import transformer_impl
++from verl.workers.engine.fsdp.transformer_impl import FSDPEngine
++
++
++def _make_engine(monkeypatch, *, enabled=False, param_offload=False, foreach=False):
++    engine = object.__new__(FSDPEngine)
++    engine.module = torch.nn.Linear(2, 1, bias=False)
++    with torch.no_grad():
++        engine.module.weight.fill_(0.5)
++    engine.optimizer = torch.optim.AdamW(engine.module.parameters(), lr=0.01, foreach=foreach)
++    engine.optimizer_config = SimpleNamespace(clip_grad=1.0)
++    engine.engine_config = SimpleNamespace(optimizer_offload_step=enabled)
++    engine._is_offload_param = param_offload
++    engine._is_offload_optimizer = True
++    engine._qat_enabled = False
++    engine.scaler = None
++    engine.mode = None
++    engine.ulysses_parallel_group = None
++    events = []
++    engine.to = lambda **kwargs: events.append(("transfer", kwargs))
++    step = engine.optimizer.step
++
++    def record_step():
++        events.append(("step",))
++        return step()
++
++    engine.optimizer.step = record_step
++    monkeypatch.setattr(base, "get_device_name", lambda: "cuda")
++    monkeypatch.setattr(transformer_impl, "get_device_name", lambda: "cuda")
++    monkeypatch.setattr(transformer_impl, "get_ulysses_sequence_parallel_group", lambda: None)
++    monkeypatch.setattr(transformer_impl, "set_ulysses_sequence_parallel_group", lambda _: None)
++    return engine, events
++
++
++def _optimizer_transfers(events):
++    return [event[1]["device"] for event in events if event[0] == "transfer" and event[1]["optimizer"]]
++
++
++@pytest.mark.parametrize("enabled", [False, True])
++@pytest.mark.parametrize("param_offload", [False, True])
++def test_optimizer_residency_and_parameter_transfers(monkeypatch, enabled, param_offload):
++    engine, events = _make_engine(monkeypatch, enabled=enabled, param_offload=param_offload)
++    with engine.train_mode():
++        assert _optimizer_transfers(events) == ([] if enabled else ["cuda"])
++        assert any(e[0] == "transfer" and e[1]["model"] for e in events) == param_offload
++        engine.module(torch.ones(1, 2)).sum().backward()
++        before_step = len(events)
++        engine.optimizer_step()
++        step_events = events[before_step:]
++        assert [e[0] for e in step_events] == (["transfer", "step", "transfer"] if enabled else ["step"])
++        assert _optimizer_transfers(step_events) == (["cuda", "cpu"] if enabled else [])
++    assert _optimizer_transfers(events)[-1] == "cpu"
++
++
++@pytest.mark.parametrize("enabled", [False, True])
++def test_manual_offload_control_places_nothing_but_the_step_still_moves_the_states(monkeypatch, enabled):
++    engine, events = _make_engine(monkeypatch, enabled=enabled, param_offload=True)
++    with engine.train_mode(disable_auto_offload=True):
++        engine.module(torch.ones(1, 2)).sum().backward()
++        engine.optimizer_step()
++    assert [e[0] for e in events] == (["transfer", "step", "transfer"] if enabled else ["step"])
++    assert not any(e[0] == "transfer" and e[1]["model"] for e in events)
++
++
++@pytest.mark.parametrize("value", [float("inf"), float("nan")])
++def test_nonfinite_gradients_skip_update_without_state_transfer(monkeypatch, value):
++    engine, events = _make_engine(monkeypatch, enabled=True)
++    initial = engine.module.weight.detach().clone()
++    with engine.train_mode():
++        engine.module.weight.grad = torch.full_like(engine.module.weight, value)
++        engine.optimizer_step()
++        assert events == []
++        assert not engine.optimizer.state
++        torch.testing.assert_close(engine.module.weight, initial, rtol=0, atol=0)
++    assert engine.module.weight.grad is None
++
++
++def test_state_offloaded_when_optimizer_step_raises(monkeypatch):
++    engine, events = _make_engine(monkeypatch, enabled=True)
++
++    def fail_step():
++        events.append(("step",))
++        raise RuntimeError("update failed")
++
++    engine.optimizer.step = fail_step
++    with pytest.raises(RuntimeError, match="update failed"):
++        with engine.train_mode():
++            engine.module(torch.ones(1, 2)).sum().backward()
++            engine.optimizer_step()
++    assert [e[0] for e in events[:3]] == ["transfer", "step", "transfer"]
++    assert _optimizer_transfers(events)[:2] == ["cuda", "cpu"]
++    assert engine.module.weight.grad is None
++
++
++@pytest.mark.parametrize("unsupported", ["optimizer", "scaler"])
++def test_unsupported_opt_in_fails_before_loading(monkeypatch, unsupported):
++    engine, events = _make_engine(monkeypatch, enabled=True)
++    if unsupported == "optimizer":
++        engine.optimizer = torch.optim.SGD(engine.module.parameters(), lr=0.1)
++    else:
++        engine.scaler = object()
++    with pytest.raises(ValueError, match="ordinary AdamW"):
++        with engine.train_mode():
++            pytest.fail("unsupported configuration entered training")
++    assert events == []
++    assert engine.mode is None
++
++
++def test_default_context_does_not_restrict_other_optimizers(monkeypatch):
++    engine, _ = _make_engine(monkeypatch)
++    engine.optimizer = torch.optim.SGD(engine.module.parameters(), lr=0.1)
++    with engine.train_mode():
++        engine.module(torch.ones(1, 2)).sum().backward()
++        engine.optimizer_step()
++    assert torch.all(engine.module.weight < 0.5)
++
++
++@pytest.mark.parametrize("foreach", [False, True])
++def test_scheduling_does_not_change_adamw_updates(monkeypatch, foreach):
++    baseline, _ = _make_engine(monkeypatch, foreach=foreach)
++    optimized, _ = _make_engine(monkeypatch, enabled=True, foreach=foreach)
++    for engine in (baseline, optimized):
++        with engine.train_mode():
++            for _ in range(3):
++                engine.optimizer_zero_grad()
++                engine.module(torch.ones(1, 2)).square().sum().backward()
++                engine.optimizer_step()
++    torch.testing.assert_close(baseline.module.weight, optimized.module.weight, rtol=0, atol=0)
++    a = baseline.optimizer.state[baseline.module.weight]
++    b = optimized.optimizer.state[optimized.module.weight]
++    for key in a:
++        torch.testing.assert_close(a[key], b[key], rtol=0, atol=0)
++
++
++@pytest.mark.parametrize("enabled", [False, True])
++@pytest.mark.parametrize("param_offload", [False, True])
++def test_nested_worker_context_preserves_outer_policy(monkeypatch, enabled, param_offload):
++    engine, events = _make_engine(monkeypatch, enabled=enabled, param_offload=param_offload)
++    with engine.train_mode():
++        for _ in range(3):
++            before_inner = len(events)
++            # TrainingWorker.train_mini_batch delegates to train_batch this way.
++            with engine.train_mode(disable_auto_offload=True):
++                engine.module(torch.ones(1, 2)).sum().backward()
++                engine.optimizer_step()
++            inner_events = events[before_inner:]
++            assert _optimizer_transfers(inner_events) == (["cuda", "cpu"] if enabled else [])
++            assert not any(e[0] == "transfer" and e[1]["model"] for e in inner_events)
+diff --git a/verl/trainer/config/_generated_ppo_trainer.yaml b/verl/trainer/config/_generated_ppo_trainer.yaml
+index 2151b29c52aa31d773c53893dcd346be6508ebd6..ef206c3032e1ade3796c5c3eef43284369f7c127 100644
+--- a/verl/trainer/config/_generated_ppo_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_trainer.yaml
+@@ -30,6 +30,7 @@ actor_rollout_ref:
+         min_num_params: 0
+       param_offload: false
+       optimizer_offload: false
++      optimizer_offload_step: false
+       offload_policy: false
+       reshard_after_forward: true
+       fsdp_size: -1
+@@ -238,6 +239,7 @@ actor_rollout_ref:
+         min_num_params: 0
+       param_offload: false
+       optimizer_offload: false
++      optimizer_offload_step: false
+       offload_policy: false
+       reshard_after_forward: true
+       fsdp_size: -1
+@@ -559,6 +561,7 @@ critic:
+       min_num_params: 0
+     param_offload: false
+     optimizer_offload: false
++    optimizer_offload_step: false
+     offload_policy: false
+     reshard_after_forward: true
+     fsdp_size: -1
+diff --git a/verl/trainer/config/engine/fsdp.yaml b/verl/trainer/config/engine/fsdp.yaml
+index a14ec2af57347c5f9430b07a3a4424a4213448c5..5ee909ace0619e92fe88e0cea9038130d69b4419 100644
+--- a/verl/trainer/config/engine/fsdp.yaml
++++ b/verl/trainer/config/engine/fsdp.yaml
+@@ -15,6 +15,9 @@ param_offload: false
+ # Note that this differs from the offload_policy in FSDP
+ optimizer_offload: false
+ 
++# Load optimizer states only during updates. Requires FSDP2 and manual optimizer_offload.
++optimizer_offload_step: false
++
+ # Only for FSDP2: offload param/grad/optimizer during train
+ offload_policy: false
+ 
+diff --git a/verl/workers/config/engine.py b/verl/workers/config/engine.py
+index 6378375209044596e25e9502035bafdf797d0baa..e9f535b036b3f1bb9db56cd6dbc8869ead0b7ec1 100644
+--- a/verl/workers/config/engine.py
++++ b/verl/workers/config/engine.py
+@@ -246,6 +246,8 @@ class FSDPEngineConfig(EngineConfig):
+         wrap_policy (Dict[str, Any]): Configuration for FSDP wrap policy.
+         param_offload (bool): Whether to offload parameters to CPU, default False
+         optimizer_offload (bool): Whether to offload optimizer states to CPU, default False
++        optimizer_offload_step (bool): Load optimizer states only for each update inside automatic train mode.
++            Requires FSDP2 with manual optimizer offloading. default False
+         offload_policy (bool): Whether to offload policy model parameters, default False
+         reshard_after_forward (bool): Whether to reshard parameters after forward pass, default True
+         fsdp_size (int): FSDP group size. -1 means use all available GPUs.
+@@ -301,9 +303,16 @@ class FSDPEngineConfig(EngineConfig):
+     qat: QATEngineConfig = field(default_factory=QATEngineConfig)
+     turbo_config: dict[str, Any] = field(default_factory=dict)
+ 
++    # Load optimizer states only for parameter updates inside automatic train mode.
++    optimizer_offload_step: bool = False
++
+     def __post_init__(self):
+         super().__post_init__()
+         assert self.strategy in ["fsdp", "fsdp2", "fsdp_turbo"], f"strategy {self.strategy} not supported"
++        if self.optimizer_offload_step and (
++            self.strategy != "fsdp2" or not self.optimizer_offload or self.offload_policy or self.forward_only
++        ):
++            raise ValueError("optimizer_offload_step requires training FSDP2 with manual optimizer_offload")
+ 
+ 
+ @dataclass
+diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
+index 032f1e97be85dc877930a0c90e7226b2b24a0f11..0830123aefdb7ea8be86f5a1f645794754a510ad 100644
+--- a/verl/workers/engine/fsdp/transformer_impl.py
++++ b/verl/workers/engine/fsdp/transformer_impl.py
+@@ -835,7 +835,16 @@ class FSDPEngine(BaseEngine):
+ 
+     def _optimizer_update(self):
+         """Apply the optimizer's update to the clipped, finite gradients. A subclass may replace how it runs."""
+-        self.optimizer.step()
++        if self.engine_config.optimizer_offload_step:
++            # the optimizer states live on the CPU (EngineTrainModeCtx does not preload them): in for the update,
++            # out again
++            try:
++                self.to(device=get_device_name(), model=False, optimizer=True, grad=False)
++                self.optimizer.step()
++            finally:
++                self.to(device="cpu", model=False, optimizer=True, grad=False)
++        else:
++            self.optimizer.step()
+ 
+     def lr_scheduler_step(self):
+         """
+@@ -1132,6 +1141,17 @@ class EngineEvalModeCtx(BaseEngineCtx):
+ class EngineTrainModeCtx(BaseEngineCtx):
+     def __init__(self, engine: FSDPEngine, **kwargs):
+         super().__init__(engine=engine, mode="train", **kwargs)
++        # optimizer_offload_step: the optimizer states stay on the CPU and come to the device for optimizer.step() only
++        # (FSDPEngine.optimizer_step), so the automatic placement leaves them out
++        self.offload_step = engine.engine_config.optimizer_offload_step and not self.disable_auto_offload
++        if self.offload_step and (type(engine.optimizer) is not torch.optim.AdamW or engine.scaler is not None):
++            raise ValueError("optimizer_offload_step supports ordinary AdamW without a gradient scaler")
++
++    def _context_switch(self, device):
++        if not (self.offload_step and device != "cpu"):
++            return super()._context_switch(device)
++        if self.engine.is_param_offload_enabled:  # the model and its gradients only
++            self.engine.to(device=device, model=True, optimizer=False, grad=True)
+ 
+     def __enter__(self):
+         assert isinstance(self.engine, FSDPEngine)

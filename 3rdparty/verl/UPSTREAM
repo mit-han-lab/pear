@@ -1,0 +1,5 @@
+# Sourced, not run: the upstream verl commit patches/ applies to (scripts/checkout_verl.sh,
+# scripts/export_verl_patches.sh)
+VERL_URL=https://github.com/volcengine/verl.git
+# main: [megatron] fix: preserve bucketed VLM THD lengths (#7948)
+VERL_COMMIT=8e03c039f9a70750490c93196b759b332fc029fd

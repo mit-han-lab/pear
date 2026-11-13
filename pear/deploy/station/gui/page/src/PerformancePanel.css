@@ -1,0 +1,28 @@
+.performance {
+  display: grid;
+  gap: 8px;
+  margin: 14px 0;
+  padding: 12px;
+  background: var(--media-bg);
+  border: 1px solid var(--media-border);
+  border-radius: 10px;
+  font-size: 11px;
+}
+.performance > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+.performance span {
+  color: var(--media-text);
+}
+.performance strong {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+.performance p {
+  margin: 0;
+  color: var(--media-text);
+  font-size: 10px;
+  line-height: 1.4;
+}

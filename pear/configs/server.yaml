@@ -1,0 +1,22 @@
+# The config of `python -m pear.deploy.server.main`: one checkpoint served by vLLM's OpenAI-compatible server to one
+# session at a time. A model family's deploy config (+<family>=deploy) sets its kernels, its draft's decoding and its
+# engine arguments; a model's deploy recipe (examples/models/<model>/deploy) sets the checkpoints and its GPU's engine arguments.
+hydra:
+  searchpath:
+    # the model families: a recipe composes its family's deploy config as +<family>=deploy
+    - pkg://pear.models
+
+model: ???  # the checkpoint
+draft: null  # a draft checkpoint, decoding with it as speculative says; null: no speculative decoding
+speculative: {}  # vLLM's speculative_config without its model
+kernels: null  # a model family's deploy kernels (pear/models/kernels.py) by class path; null: vLLM's own
+env: {}  # environment variables of the server and of the engine processes it starts
+server: {}  # vLLM's server options (host, port, served_model_name, ...)
+engine:  # vLLM's engine arguments
+  tensor_parallel_size: 1
+  max_num_seqs: 1  # one session at a time
+  enable_chunked_prefill: true
+  enable_prefix_caching: true  # a session's next turn prefills only its new tokens
+  logprobs_mode: processed_logprobs  # of the distribution sampled from, after temperature and top-p
+  max_logprobs: 32
+  seed: 0

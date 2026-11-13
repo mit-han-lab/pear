@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [trainer] refactor: _replay_buffer_class and
+ _replay_buffer_kwargs, what _build_replay_buffer builds and with what
+
+_build_replay_buffer passes the class it chose and the keyword arguments it assembled through two methods, which
+return them as they are. A trainer with a replay buffer class of its own overrides them to name its class and to
+add its arguments to the built-in ones, instead of repeating them. Nothing changes by default.
+---
+ .../ppo/v1/test_trainer_base_on_cpu.py        | 32 +++++++++++++++++--
+ verl/trainer/ppo/v1/trainer_base.py           | 11 ++++++-
+ 2 files changed, 40 insertions(+), 3 deletions(-)
+
+diff --git a/tests/trainer/ppo/v1/test_trainer_base_on_cpu.py b/tests/trainer/ppo/v1/test_trainer_base_on_cpu.py
+index a5a9045eceb146197331431babd89d180775d853..811e8d7c72709bfae473051cdf85d4a2767b0753 100644
+--- a/tests/trainer/ppo/v1/test_trainer_base_on_cpu.py
++++ b/tests/trainer/ppo/v1/test_trainer_base_on_cpu.py
+@@ -35,8 +35,24 @@ class _CustomSampler:
+         self.kwargs = kwargs
+ 
+ 
+-def _trainer_with_filter_groups(filter_groups: dict, trainer_mode: str = "sync") -> _StubTrainer:
+-    trainer = _StubTrainer.__new__(_StubTrainer)
++class _CappedSampler(ReplayBufferAsync):
++    def __init__(self, *, session_cap: int, **kwargs):
++        super().__init__(**kwargs)
++        self.session_cap = session_cap
++
++
++class _CappedSamplerTrainer(_StubTrainer):
++    def _replay_buffer_class(self, sampler_cls):
++        return _CappedSampler
++
++    def _replay_buffer_kwargs(self, replay_buffer_kwargs):
++        return dict(replay_buffer_kwargs, session_cap=16)
++
++
++def _trainer_with_filter_groups(
++    filter_groups: dict, trainer_mode: str = "sync", trainer_class: type[_StubTrainer] = _StubTrainer
++) -> _StubTrainer:
++    trainer = trainer_class.__new__(trainer_class)
+     trainer.trainer_mode = trainer_mode
+     trainer.config = OmegaConf.create(
+         {
+@@ -92,6 +108,18 @@ def test_custom_sampler_skips_builtin_filter_groups_validation():
+     assert "sync_refill_failed_groups" not in sampler.kwargs
+ 
+ 
++def test_a_subclass_names_the_sampler_class_and_adds_to_the_builtin_arguments():
++    trainer = _trainer_with_filter_groups(
++        {"enable": True, "metric": "acc"}, trainer_mode="separate_async", trainer_class=_CappedSamplerTrainer
++    )
++
++    sampler = trainer._build_replay_buffer()
++
++    assert type(sampler) is _CappedSampler
++    assert (sampler.session_cap, sampler.filter_groups_metric) == (16, "acc")
++    assert sampler.train_batch_size is None
++
++
+ def test_builtin_filter_groups_uses_default_inflight_limit():
+     trainer = _trainer_with_filter_groups({"enable": True, "metric": "acc"})
+ 
+diff --git a/verl/trainer/ppo/v1/trainer_base.py b/verl/trainer/ppo/v1/trainer_base.py
+index 95a089e97b7706a9258c82bba7e709ab2f3b718f..14366a6f9b6b65faef54a4512f2ce52298d5963c 100644
+--- a/verl/trainer/ppo/v1/trainer_base.py
++++ b/verl/trainer/ppo/v1/trainer_base.py
+@@ -167,6 +167,7 @@ class PPOTrainer(ABC):
+             sampler_cls = load_extern_type(custom_sampler.path, custom_sampler.name)
+         else:
+             sampler_cls = ReplayBuffer if self.trainer_mode == "sync" else ReplayBufferAsync
++        sampler_cls = self._replay_buffer_class(sampler_cls)
+ 
+         replay_buffer_kwargs = dict(
+             trainer_mode=self.trainer_mode,
+@@ -198,7 +199,15 @@ class PPOTrainer(ABC):
+                     else (self.config.data.get("gen_batch_size", None) or train_batch_size),
+                     max_inflight_gen_batches=max_inflight_gen_batches,
+                 )
+-        return sampler_cls(**replay_buffer_kwargs)
++        return sampler_cls(**self._replay_buffer_kwargs(replay_buffer_kwargs))
++
++    def _replay_buffer_class(self, sampler_cls: type[ReplayBuffer]) -> type[ReplayBuffer]:
++        """The class of the replay buffer to build: the one the config selects, unless a trainer builds its own."""
++        return sampler_cls
++
++    def _replay_buffer_kwargs(self, replay_buffer_kwargs: dict[str, Any]) -> dict[str, Any]:
++        """The keyword arguments the replay buffer is built with: a trainer with a class of its own adds to them."""
++        return replay_buffer_kwargs
+ 
+     def _resolve_filter_groups_metric(self) -> str | None:
+         """Resolve DAPO's group metric and verify that rollout computes it before sampling."""

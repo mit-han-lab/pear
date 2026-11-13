@@ -1,0 +1,23 @@
+# The robot station (pear/deploy/station): what every station starts from. A robot's defaults (the config.yaml of its
+# package) are read over it, then the station's own file, which gives every value that is still ???.
+
+robot_class: ???  # the robot, a class of a package of pear/deploy/station/control/robots
+robot: ???  # the robot's own settings: its package's config.yaml with this machine's devices and calibration
+
+# the joints' control loop
+control:
+  rate_hz: 50  # periods a second
+  state_timeout_s: 0.1  # the age past which a reading of the joints is stale
+  deadline_tolerance_s: 0.05  # how late a sequence of targets may run
+  settle_timeout_s: 3  # the longest wait for the arms to come to rest
+  settle_window_s: 0.5  # the readings a judgement of rest looks back over
+  action_timeout_s: 0.5  # the longest gap between two targets of a sequence
+
+default_model: ???  # the model a task starts with, a key of models
+# the models an operator chooses from, each under a name of the station's own: label (what the page shows),
+# client_class and client (the client's class and its arguments), timeout_s (how long a turn's answer may take)
+# and, where the robot has several, action_format
+models: ???
+
+port: ???  # of the page's service, which listens on this machine alone: each robot's defaults give one
+run_dir: ???  # the service's log and token, and the tasks' records

@@ -1,0 +1,8 @@
+--- a/robosuite/macros.py
++++ b/robosuite/macros.py
+@@ -41,4 +41,4 @@
+ # If LOGGING LEVEL is set to None, the logger will be turned off
+ CONSOLE_LOGGING_LEVEL = "WARN"
+ # File logging is written to /tmp/robosuite.log by default
+-FILE_LOGGING_LEVEL = "DEBUG"
++FILE_LOGGING_LEVEL = None  # PEAR's installer: /tmp/robosuite.log is shared by a machine's users

@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [rollout] refactor: ToolAgentLoop._prompt_tool_schemas, the
+ tool schemas a session's prompts render
+
+The two places that render a session's tools, the first prompt and the merge of the tool responses, read
+agent_data._active_tool_schemas with the loop's own schemas as the fallback; that read is now one method. An
+agent loop whose prompts render other schemas than its row's tools, or none, overrides it instead of writing the
+session's private attribute. Nothing changes by default.
+---
+ .../agent_loop/test_tool_call_id_on_cpu.py    | 33 ++++++++++++++++++-
+ .../agent_loop/tool_agent_loop.py             |  8 +++--
+ 2 files changed, 38 insertions(+), 3 deletions(-)
+
+diff --git a/tests/experimental/agent_loop/test_tool_call_id_on_cpu.py b/tests/experimental/agent_loop/test_tool_call_id_on_cpu.py
+index 07e3ba983c02f65ba60fdf3ab6de03e084c95e48..985089304ca3ff0dbd31aaeba17be5523ccadf86 100644
+--- a/tests/experimental/agent_loop/test_tool_call_id_on_cpu.py
++++ b/tests/experimental/agent_loop/test_tool_call_id_on_cpu.py
+@@ -128,7 +128,7 @@ class TestToolCallIdOnCpu(unittest.IsolatedAsyncioTestCase):
+             processor=None,
+             tool_parser_name="qwen3_coder",
+             response_length=128,
+-            tool_schemas=[],
++            _prompt_tool_schemas=lambda agent_data: [],
+             _assert_mm_supported=lambda has_multi_modal: None,
+             ct_merge_context_msg=ct_merge_context_msg,
+             _call_tool=call_tool,
+@@ -176,6 +176,37 @@ class TestToolCallIdOnCpu(unittest.IsolatedAsyncioTestCase):
+         assert agent_data.response_mask == [0, 0]
+         assert agent_data.tool_rewards == [1.0]
+ 
++    def test_prompt_tool_schemas_are_those_of_the_tools_the_session_s_row_selects(self) -> None:
++        loop = SimpleNamespace(tool_schemas=[{"name": "every_tool"}])
++        routed_session = SimpleNamespace(_active_tool_schemas=[{"name": "selected_tool"}])
++
++        assert ToolAgentLoop._prompt_tool_schemas(loop, routed_session) == [{"name": "selected_tool"}]
++        assert ToolAgentLoop._prompt_tool_schemas(loop, SimpleNamespace()) == [{"name": "every_tool"}]
++
++    async def test_pending_state_renders_the_prompt_tool_schemas(self) -> None:
++        rendered_tools: list[Any] = []
++
++        async def ct_build_initial_tokens(messages: list[dict[str, Any]], tools: Any = None, **kwargs: Any):
++            del messages, kwargs
++            rendered_tools.append(tools)
++            return [1, 2, 3]
++
++        loop = SimpleNamespace(
++            _prompt_tool_schemas=lambda agent_data: [{"name": "a_subclass_s_choice"}],
++            _assert_mm_supported=lambda has_multi_modal: None,
++            ct_build_initial_tokens=ct_build_initial_tokens,
++            build_sglang_video_payload=lambda videos, mm_inputs: None,
++        )
++        agent_data = SimpleNamespace(
++            messages=[{"role": "user", "content": "weather?"}], image_data=None, video_data=None, audio_data=None
++        )
++
++        state = await ToolAgentLoop._handle_pending_state(loop, agent_data, {})
++
++        assert state == AgentState.GENERATING
++        assert rendered_tools == [[{"name": "a_subclass_s_choice"}]]
++        assert agent_data.prompt_ids == [1, 2, 3]
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/verl/experimental/agent_loop/tool_agent_loop.py b/verl/experimental/agent_loop/tool_agent_loop.py
+index 8e82e5771859b87475d0e621114a61e903cfdca6..dde4dfc6a6afdf8fd8c5014fb8f861220182d5c0 100644
+--- a/verl/experimental/agent_loop/tool_agent_loop.py
++++ b/verl/experimental/agent_loop/tool_agent_loop.py
+@@ -231,7 +231,7 @@ class ToolAgentLoop(AgentLoopBase):
+ 
+     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
+         """Handle the pending state: prepare the prompt and start generation."""
+-        schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
++        schemas = self._prompt_tool_schemas(agent_data)
+         # Continuous Token is the only tokenization path; multimodal prompts require a
+         # VL builder + processor, so validate before building any tokens.
+         self._assert_mm_supported(bool(agent_data.image_data or agent_data.video_data or agent_data.audio_data))
+@@ -414,7 +414,7 @@ class ToolAgentLoop(AgentLoopBase):
+ 
+         agent_data.messages.extend(add_messages)
+ 
+-        schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
++        schemas = self._prompt_tool_schemas(agent_data)
+         merge_result, response_mask, response_logprobs = await self.ct_merge_context_msg(
+             previous_messages,
+             agent_data.messages,
+@@ -448,6 +448,10 @@ class ToolAgentLoop(AgentLoopBase):
+         agent_data.user_turns += 1
+         return AgentState.GENERATING
+ 
++    def _prompt_tool_schemas(self, agent_data: AgentData) -> list[dict[str, Any]]:
++        """The tool schemas a session's prompts render: those of the tools its row selects."""
++        return getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
++
+     def _build_assistant_message(self, content: str, agent_data: AgentData) -> dict[str, Any]:
+         message: dict[str, Any] = {"role": "assistant", "content": content or ""}
+         if not agent_data.tool_calls:

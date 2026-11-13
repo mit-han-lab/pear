@@ -1,0 +1,12 @@
+# Tool config for actor_rollout_ref.rollout.multi_turn.tool_config_path: the RoboDojo environment family (its
+# conversation, its trajectories' sessions on the run's servers); the config dict reaches EnvironmentTool. Its variables
+# are resolved by OmegaConf when the file is loaded.
+tools:
+  - class_name: pear.envs.tool.EnvironmentTool
+    config:
+      type: native
+      env_class: pear.envs.robodojo.env.RoboDojoEnv  # the family: its facts and its simulator
+      server_n: ${oc.env:ROBODOJO_SERVER_N}         # a GPU of a simulator machine each (the recipe's ROBODOJO_SERVER_N)
+      apps_per_gpu: ${oc.env:ROBODOJO_APPS_PER_GPU,8}  # a server's Apps, an episode each (the recipe's ROBODOJO_APPS_PER_GPU)
+      response_budget: ${oc.env:ROBODOJO_RESPONSE_BUDGET,null}  # its episodes' response tokens, null: the run's MAX_RESPONSE
+      log_dir: ${oc.env:PEAR_LOG_DIR}                # the servers' logs and the tool's call log (the recipe: $RUN/sim)

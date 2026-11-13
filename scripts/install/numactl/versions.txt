@@ -1,0 +1,7 @@
+# The conda-forge packages of the numactl prefix: numactl and numastat (the package numactl) with the libraries they
+# load. No process loads them together with the Mesa or the ImageMagick prefix: the list is the prefix's own.
+_openmp_mutex==4.5
+libgcc==16.2.0
+libgomp==16.2.0
+libnuma==2.0.18
+numactl==2.0.18

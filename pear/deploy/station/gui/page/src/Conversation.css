@@ -1,0 +1,227 @@
+.conversation-scroll {
+  height: 430px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+  padding: 24px 24px 8px;
+}
+.empty-state {
+  min-height: 365px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  text-align: center;
+}
+.empty-orbit {
+  width: 76px;
+  height: 76px;
+  border-radius: 50%;
+  border: 1px solid var(--border-accent);
+  background: var(--surface-muted);
+  display: grid;
+  place-items: center;
+  color: var(--icon-accent-soft);
+  position: relative;
+  margin-bottom: 20px;
+}
+.empty-orbit span {
+  position: absolute;
+  width: 90px;
+  height: 90px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 50%;
+}
+.empty-orbit i {
+  position: absolute;
+  bottom: 0;
+  right: 0;
+  width: 16px;
+  height: 16px;
+  border: 4px solid var(--surface);
+  border-radius: 50%;
+  background: var(--empty-dot);
+}
+.empty-state h3 {
+  font-weight: 530;
+  letter-spacing: -0.4px;
+  font-size: 21px;
+  margin: 6px 0 10px;
+}
+.empty-state p {
+  font-size: 12px;
+  line-height: 1.85;
+  color: var(--text-faint);
+  margin: 0;
+}
+.empty-steps {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-top: 23px;
+}
+.empty-steps span {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.empty-steps > svg {
+  color: var(--icon-faint);
+}
+@media (min-width: 1500px) {
+  .conversation-scroll {
+    height: 490px;
+  }
+}
+@media (max-width: 760px) {
+  .conversation-scroll {
+    height: 430px;
+    padding: 16px 14px 8px;
+  }
+}
+@media (min-width: 1000px) {
+  .conversation-scroll {
+    height: auto;
+    min-height: 0;
+    flex: 1;
+  }
+  .empty-state {
+    min-height: 100%;
+    padding: 15px;
+  }
+  .empty-orbit {
+    width: 52px;
+    height: 52px;
+    margin-bottom: 9px;
+  }
+  .empty-orbit span {
+    width: 66px;
+    height: 66px;
+  }
+  .empty-state h3 {
+    font-size: 19px;
+  }
+  .empty-state p {
+    font-size: 11px;
+  }
+  .empty-steps {
+    margin-top: 12px;
+  }
+}
+
+/* The task conversation: a full-width thread of the operator's task and the model's turns. */
+.conversation-heading {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--tint);
+}
+.conversation-heading > div {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.conversation-heading h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.turn-pill {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: var(--surface-sunken);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.turn-pill.running {
+  background: var(--soft);
+  color: var(--teal);
+}
+.turn-pill i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.new-task {
+  flex-shrink: 0;
+  min-height: 40px;
+  padding: 0 16px;
+  border: 1px solid var(--ink);
+  border-radius: 10px;
+  background: var(--ink);
+  color: var(--on-solid);
+  font-size: 13px;
+  font-weight: 600;
+}
+.new-task:hover:not(:disabled) {
+  background: var(--ink-hover);
+}
+.chat-thread {
+  display: flex;
+  flex-direction: column;
+  gap: 26px;
+  font-size: 14px;
+}
+
+/* The operator's task, on the right. */
+.user-turn {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+}
+.user-bubble {
+  max-width: 78%;
+  padding: 11px 16px;
+  border-radius: 18px 18px 6px 18px;
+  background: var(--tint);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.user-tags {
+  max-width: 78%;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+.user-tags span {
+  padding: 2px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  color: var(--text-body);
+  font-size: 11px;
+}
+.chat-notice {
+  margin: 0;
+  color: var(--text-muted-cool);
+  font-size: 12px;
+  line-height: 1.5;
+}
+@media (max-width: 760px) {
+  .conversation-heading {
+    padding: 12px 14px;
+  }
+  .user-bubble,
+  .user-tags {
+    max-width: 90%;
+  }
+}

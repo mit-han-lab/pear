@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# bash with -e and pipefail: a step ends at the first command that fails, inside a pipeline too
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  pre-commit:
+    name: The checks of .pre-commit-config.yaml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      # the version the training environment pins, with its dependencies
+      - run: pip install pre-commit --constraint scripts/install/verl/constraints.in
+      - run: pre-commit run --all-files --show-diff-on-failure
+
+  patches:
+    name: The third-party patches apply to their pinned commits
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # each script builds the checkout and ends with a status other than 0 unless it is the pin with the patches
+      - name: verl
+        run: bash 3rdparty/verl/scripts/checkout_verl.sh
+      - name: LMCache
+        run: LMCACHE_SRC="$RUNNER_TEMP/LMCache" bash 3rdparty/LMCache/scripts/checkout_lmcache.sh
+
+  tests:
+    name: PEAR's tests, without the integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/training-env
+      # without the robot station's directory, whose conftest imports the station's packages: station.yml runs it
+      - run: $PEAR_PYTHON -m pytest tests --ignore=tests/deploy/station --ignore-glob='*_on_gpu.py' -m "not integration"

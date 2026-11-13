@@ -1,0 +1,44 @@
+name: Integration tests
+
+# The tests marked `integration`: each starts Ray and simulator server processes, so they take minutes. They run when the
+# code they exercise changes, and on main.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      - "pear/sim/**"
+      - "pear/envs/**"
+      - "pear/utils/**"
+      - "tests/**"
+      - "scripts/**"
+      - "3rdparty/verl/**"
+      - "3rdparty/patched_checkout.sh"
+      - "pyproject.toml"
+      - ".github/actions/training-env/**"
+      - ".github/workflows/integration.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# bash with -e and pipefail: a step ends at the first command that fails, inside a pipeline too
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  integration:
+    name: The tests marked integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/training-env
+      # by the marker, as ci.yml leaves them out: a test marked in any file runs here; without the robot station's
+      # directory, as in ci.yml
+      - run: $PEAR_PYTHON -m pytest tests --ignore=tests/deploy/station --ignore-glob='*_on_gpu.py' -m integration

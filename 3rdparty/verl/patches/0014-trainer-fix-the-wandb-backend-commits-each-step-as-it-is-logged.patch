@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [trainer] fix: the wandb backend commits each step as it is
+ logged
+
+A step-addressed wandb.log is uploaded only when a later step arrives: Tracking now logs to wandb with
+commit=True. fit() logs the DAPO filtered-reward table before the step's metrics, because later logs to a
+committed step are dropped.
+---
+ tests/utils/test_tracking_on_cpu.py | 23 +++++++++++++++++++++++
+ verl/trainer/ppo/v1/trainer_base.py |  3 ++-
+ verl/utils/tracking.py              |  3 ++-
+ 3 files changed, 27 insertions(+), 2 deletions(-)
+
+diff --git a/tests/utils/test_tracking_on_cpu.py b/tests/utils/test_tracking_on_cpu.py
+index fd36d196dea3bcdebd750d8a9036f54912c23817..adc557cea19bd16588261fdabc05a6625f373287 100644
+--- a/tests/utils/test_tracking_on_cpu.py
++++ b/tests/utils/test_tracking_on_cpu.py
+@@ -109,3 +109,26 @@ def test_validation_generations_logger_logs_trackio_traces():
+     assert trace_kwargs["metadata"]["score"] == 0.5
+     mock_trackio.log.assert_called_once()
+     assert mock_trackio.log.call_args.kwargs["step"] == 7
++
++
++def test_wandb_backend_commits_each_step(monkeypatch):
++    """A step-addressed wandb.log is only uploaded when committed; the backend must pass commit=True."""
++    import sys
++    import types
++
++    calls = []
++    stub = types.SimpleNamespace(
++        init=lambda **kwargs: calls.append(("init", kwargs)),
++        log=lambda **kwargs: calls.append(("log", kwargs)),
++        finish=lambda **kwargs: calls.append(("finish", kwargs)),
++    )
++    monkeypatch.setitem(sys.modules, "wandb", stub)
++    from verl.utils.tracking import Tracking
++
++    tracking = Tracking(project_name="p", experiment_name="e", default_backend=["wandb"], config=None)
++    tracking.log(data={"a": 1.0}, step=3)
++    tracking.finish(exit_code=0)
++
++    assert [c[0] for c in calls] == ["init", "log", "finish"]
++    assert calls[1][1] == {"data": {"a": 1.0}, "step": 3, "commit": True}
++    assert calls[2][1] == {"exit_code": 0}
+diff --git a/verl/trainer/ppo/v1/trainer_base.py b/verl/trainer/ppo/v1/trainer_base.py
+index 0c34da8f05a91bb454e298e2ddedaabe4af9f889..b7f0c24839a2aff86f09174123f67c1b7a8b94a4 100644
+--- a/verl/trainer/ppo/v1/trainer_base.py
++++ b/verl/trainer/ppo/v1/trainer_base.py
+@@ -524,11 +524,12 @@ class PPOTrainer(ABC):
+             tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
+ 
+             dapo_filtered_reward_counts = metrics.pop(DAPO_FILTERED_REWARD_COUNTS_KEY, None)
+-            self.logger.log(data=metrics, step=self.global_steps)
++            # before the metrics: the wandb backend commits the step, later logs to it are dropped
+             if dapo_filtered_reward_counts:
+                 self.dapo_filtered_reward_logger.log(
+                     self.config.trainer.logger, dapo_filtered_reward_counts, self.global_steps
+                 )
++            self.logger.log(data=metrics, step=self.global_steps)
+             progress_bar.update(1)
+             self.global_steps += 1
+             SkipManager.set_step(self.global_steps)
+diff --git a/verl/utils/tracking.py b/verl/utils/tracking.py
+index 3107f50b307b0ad711b1aaa2ed51bed3513d553d..58ade738d339655948e4fc9279909a67e74a3f10 100644
+--- a/verl/utils/tracking.py
++++ b/verl/utils/tracking.py
+@@ -83,7 +83,8 @@ class Tracking:
+                 settings = wandb.Settings(https_proxy=config["trainer"]["wandb_proxy"])
+             entity = os.environ.get("WANDB_ENTITY", None)
+             wandb.init(project=project_name, name=experiment_name, entity=entity, config=config, settings=settings)
+-            self.logger["wandb"] = wandb
++            # commit each step at once: a step-addressed wandb.log is uploaded only when a later step arrives
++            self.logger["wandb"] = SimpleNamespace(log=partial(wandb.log, commit=True), finish=wandb.finish)
+ 
+         if "trackio" in default_backend:
+             import trackio

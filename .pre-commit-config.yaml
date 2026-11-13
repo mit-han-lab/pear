@@ -1,0 +1,59 @@
+# The checks every commit passes: `pre-commit install` once, then they run on `git commit`; `pre-commit run --all-files`
+# runs them on the whole tree, as CI does.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: cef0300fd0fc4d2a87a85fa2093c6b283ea36f4b  # frozen: v5.0.0
+    hooks:
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: detect-private-key
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]  # RoboLab's uv.lock is the largest file
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: a56c0b927e6465d37cae3e97d35d4d18ab2b96cd  # frozen: v0.16.9
+    hooks:
+      - id: ruff-check
+        args: ["--fix", "--show-fixes"]
+      - id: ruff-format
+
+  # Shell scripts: shellcheck, shfmt's layout and at most 120 columns.
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: 745eface02aef23e168a8afb6b5737818efbea95  # frozen: v0.11.0.1
+    hooks:
+      - id: shellcheck
+        args: ["--external-sources", "--source-path=SCRIPTDIR"]  # follows `source`, relative to the script
+
+  - repo: https://github.com/scop/pre-commit-shfmt
+    rev: 479be5958357ba5ab65ce47172117348516860e9  # frozen: v3.14.1-1
+    hooks:
+      - id: shfmt
+        args: ["--write", "--indent=2", "--case-indent", "--space-redirects"]
+
+  - repo: local
+    hooks:
+      - id: shell-line-length
+        name: shell lines of at most 120 columns
+        entry: "^.{121,}$"
+        language: pygrep
+        types: [shell]
+
+      # A test file's name ends with where its tests run. The robot station's are the files of tests/deploy/station:
+      # the training environment's runners leave that directory out, and choose among the others by the suffix.
+      - id: test-file-names
+        name: a test file is named for where it runs
+        entry: a test file ends with _on_cpu.py, _on_gpu.py or _in_sim.py, the robot station's with _in_station.py
+        language: fail
+        files: ^tests/(.*/)?test_[^/]*\.py$
+        exclude: ^tests/deploy/station/.*_in_station\.py$|^tests/(?!deploy/station/).*_(on_cpu|on_gpu|in_sim)\.py$
+
+      # A test starts its Ray cluster through tests/conftest.py (local_ray_cluster), which turns off Ray's usage
+      # report and its OpenTelemetry thread; a cluster in a process of its own says where it gets that environment.
+      - id: test-ray-clusters
+        name: a test's Ray cluster starts through tests/conftest.py
+        entry: 'ray\.init\((?!.*# with LocalRayCluster\.ENVIRONMENT)'
+        language: pygrep
+        files: ^tests/(.*/)?test_[^/]*\.py$

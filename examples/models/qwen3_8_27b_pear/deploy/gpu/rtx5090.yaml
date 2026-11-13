@@ -1,0 +1,18 @@
+# @package _global_
+# The deploy server's engine arguments on one RTX 5090 (32 GB), composed as +gpu=rtx5090.
+env:
+  # KV cache groups without full-attention padding, the embedding table and the vision encoder in pinned host memory
+  # (pear/models/qwen3_5/deploy/memory_plan.py): the window below fits with them
+  PEAR_DEPLOY_MEMORY_PLAN: groups,embed,vision_host
+engine:
+  kv_cache_dtype: fp8_e4m3  # e4m3 at scale 1: a bf16 cache does not fit the window in 32 GB
+  # the largest window whose KV cache, vLLM's speculative Gated DeltaNet pages included, fits beside the weights, the
+  # draft, FlashInfer's autotuning at the engine's start and a prefill's working set
+  max_model_len: 191168
+  kv_cache_memory_bytes: 8181252096  # 303 KV cache blocks of 1648 tokens; vLLM then ignores gpu_memory_utilization
+  gpu_memory_utilization: 0.97  # with no kv_cache_memory_bytes
+  # the vision encoder's memory profiled at the 512 x 512 frames of a session, not the processor's largest image
+  limit_mm_per_prompt: {image: {count: 1016, width: 512, height: 512}}
+  compilation_config:
+    # the decode and verify steps only: prefill chunks run compiled without graphs, whose pool does not fit
+    cudagraph_capture_sizes: [1, 4, 8]

@@ -1,0 +1,121 @@
+/* Task video controls */
+.recordings {
+  margin: 20px 0;
+  padding: 16px;
+  background: var(--recordings-bg);
+  border: 1px solid var(--recordings-border);
+  border-radius: 12px;
+}
+.recordings-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  font-size: 13px;
+  color: var(--recordings-title);
+}
+.recording-row {
+  padding: 12px 0;
+  border-top: 1px solid var(--recordings-border);
+  font-size: 12px;
+}
+.recording-row > div:first-child {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+.recording-state {
+  text-transform: capitalize;
+  color: var(--recordings-text);
+}
+.recording-state.recording {
+  color: var(--danger);
+}
+.recording-state.saved {
+  color: var(--saved-text);
+}
+.recording-state.failed,
+.recording-error {
+  color: var(--failed-text);
+}
+.recording-files {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  margin-top: 9px;
+  color: var(--recordings-text);
+}
+.recording-files > div {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.recording-files button {
+  padding: 6px 9px;
+  background: var(--surface);
+  border: 1px solid var(--recordings-border);
+  border-radius: 6px;
+  color: var(--recordings-title);
+  font-size: 12px;
+}
+.recording-files button span {
+  margin-left: 6px;
+  color: var(--recordings-text-faint);
+}
+.recording-files a {
+  color: var(--link);
+  padding: 5px;
+}
+.recording-note {
+  font-size: 11px;
+  color: var(--recording-note-text);
+  margin: 8px 0 0;
+}
+.recording-files a.recording-source {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  text-decoration: none;
+  font-size: 12px;
+}
+.recording-player {
+  position: relative;
+  margin-top: 12px;
+}
+.recording-player video {
+  width: 100%;
+  display: block;
+  border-radius: 8px;
+  background: var(--video-bg);
+}
+.recording-player > button {
+  position: absolute;
+  right: 8px;
+  top: 8px;
+  z-index: 1;
+  background: var(--surface);
+  border: 0;
+  border-radius: 50%;
+  padding: 5px;
+}
+.recording-merged .recording-state {
+  text-transform: none;
+}
+.recording-merge {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  background: var(--link);
+  color: var(--on-solid);
+  border: 0;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.recording-merge:disabled {
+  opacity: 0.55;
+  cursor: default;
+}

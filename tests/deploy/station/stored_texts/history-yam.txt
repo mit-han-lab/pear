@@ -1,0 +1,232 @@
+{
+ "tasks": [
+  "backend",
+  "created",
+  "id",
+  "images",
+  "instruction",
+  "model",
+  "model_label",
+  "tags"
+ ],
+ "events": {
+  "action": {
+   "event": [
+    "data",
+    "id",
+    "monotonic_s",
+    "task_id",
+    "time",
+    "type"
+   ],
+   "data": [
+    "attempt",
+    "episode_id",
+    "left_arm",
+    "left_gripper",
+    "phase",
+    "right_arm",
+    "right_gripper",
+    "started_at",
+    "turn_number",
+    "type"
+   ]
+  },
+  "answer_delta": {
+   "event": [
+    "data",
+    "id",
+    "monotonic_s",
+    "task_id",
+    "time",
+    "type"
+   ],
+   "data": [
+    "attempt",
+    "episode_id",
+    "phase",
+    "started_at",
+    "text",
+    "turn_number"
+   ]
+  },
+  "execution": {
+   "event": [
+    "data",
+    "id",
+    "monotonic_s",
+    "task_id",
+    "time",
+    "type"
+   ],
+   "data": [
+    "attempt",
+    "episode_id",
+    "error",
+    "gripper_outcome",
+    "gripper_outcomes",
+    "measured_position",
+    "measured_state",
+    "phase",
+    "reached",
+    "settled",
+    "started_at",
+    "status",
+    "tracking_error",
+    "turn_number"
+   ]
+  },
+  "model_output": {
+   "event": [
+    "data",
+    "id",
+    "monotonic_s",
+    "task_id",
+    "time",
+    "type"
+   ],
+   "data": [
+    "answer",
+    "attempt",
+    "episode_id",
+    "phase",
+    "reasoning",
+    "reasoning_kind",
+    "started_at",
+    "turn_number",
+    "usage"
+   ]
+  },
+  "observation": {
+   "event": [
+    "data",
+    "id",
+    "monotonic_s",
+    "task_id",
+    "time",
+    "type"
+   ],
+   "data": [
+    "attempt",
+    "captured_monotonic_s",
+    "details_url",
+    "episode_id",
+    "image_uuids",
+    "images",
+    "observation_id",
+    "phase",
+    "previous_result",
+    "started_at",
+    "state",
+    "text",
+    "turn_id",
+    "turn_number"
+   ]
+  },
+  "phase": {
+   "event": [
+    "data",
+    "id",
+    "monotonic_s",
+    "task_id",
+    "time",
+    "type"
+   ],
+   "data": [
+    "attempt",
+    "episode_id",
+    "phase",
+    "started_at",
+    "turn_number"
+   ]
+  },
+  "reasoning_delta": {
+   "event": [
+    "data",
+    "id",
+    "monotonic_s",
+    "task_id",
+    "time",
+    "type"
+   ],
+   "data": [
+    "attempt",
+    "episode_id",
+    "phase",
+    "reasoning_kind",
+    "simulated",
+    "started_at",
+    "text",
+    "turn_number"
+   ]
+  },
+  "session": {
+   "event": [
+    "data",
+    "id",
+    "monotonic_s",
+    "task_id",
+    "time",
+    "type"
+   ],
+   "data": [
+    "episode_id",
+    "message"
+   ]
+  },
+  "task": {
+   "event": [
+    "data",
+    "id",
+    "monotonic_s",
+    "task_id",
+    "time",
+    "type"
+   ],
+   "data": [
+    "backend",
+    "created",
+    "id",
+    "images",
+    "instruction",
+    "model",
+    "model_label"
+   ]
+  },
+  "task_end": {
+   "event": [
+    "data",
+    "id",
+    "monotonic_s",
+    "task_id",
+    "time",
+    "type"
+   ],
+   "data": [
+    "message"
+   ]
+  },
+  "turn_started": {
+   "event": [
+    "data",
+    "id",
+    "monotonic_s",
+    "task_id",
+    "time",
+    "type"
+   ],
+   "data": [
+    "attempt",
+    "episode_id",
+    "phase",
+    "started_at",
+    "turn_number"
+   ]
+  }
+ },
+ "turn_numbers": [
+  1,
+  2,
+  3
+ ]
+}

@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [trainer] fix: stop the train dataloader's workers before
+ fit() returns at the last step
+
+fit() returned at the last step with the dataloader iterator's worker processes alive. It now shuts them
+down first, so that Ray's teardown does not kill them under torch's SIGCHLD handler while the trainer
+actor still runs.
+---
+ .../ppo/test_train_loader_shutdown_on_cpu.py  | 19 +++++++++++++++++++
+ verl/trainer/ppo/v1/trainer_base.py           |  7 +++++++
+ 2 files changed, 26 insertions(+)
+ create mode 100644 tests/trainer/ppo/test_train_loader_shutdown_on_cpu.py
+
+diff --git a/tests/trainer/ppo/test_train_loader_shutdown_on_cpu.py b/tests/trainer/ppo/test_train_loader_shutdown_on_cpu.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..400fe4e248aa950f18acbae53f74ae0ed7c1f9f3
+--- /dev/null
++++ b/tests/trainer/ppo/test_train_loader_shutdown_on_cpu.py
+@@ -0,0 +1,19 @@
++from types import SimpleNamespace
++
++import pytest
++from torchdata.stateful_dataloader import StatefulDataLoader
++
++from verl.trainer.ppo.v1.trainer_base import PPOTrainer
++
++
++@pytest.mark.parametrize("num_workers", [0, 2])
++def test_last_step_stops_the_mid_epoch_loader_workers(num_workers):
++    loader = StatefulDataLoader(list(range(16)), batch_size=2, num_workers=num_workers)
++    trainer = SimpleNamespace(train_dataloader=loader, train_dataloader_it=iter(loader))
++    next(trainer.train_dataloader_it)  # mid-epoch, as at the last training step
++    workers = list(getattr(trainer.train_dataloader_it, "_workers", []))
++    assert len(workers) == num_workers and all(w.is_alive() for w in workers)
++
++    PPOTrainer._shutdown_train_loader_workers(trainer)
++
++    assert not any(w.is_alive() for w in workers)
+diff --git a/verl/trainer/ppo/v1/trainer_base.py b/verl/trainer/ppo/v1/trainer_base.py
+index b7f0c24839a2aff86f09174123f67c1b7a8b94a4..8eb2d46db470915b4558aedfa2152ce0ad677c30 100644
+--- a/verl/trainer/ppo/v1/trainer_base.py
++++ b/verl/trainer/ppo/v1/trainer_base.py
+@@ -536,6 +536,7 @@ class PPOTrainer(ABC):
+             current_epoch = (self.global_steps - 1) // self.steps_per_epoch
+             if is_last_step:
+                 self._shutdown_dump_executor()
++                self._shutdown_train_loader_workers()
+                 pprint(f"Final validation metrics: {last_val_metrics}")
+                 progress_bar.close()
+                 return
+@@ -1338,6 +1339,12 @@ class PPOTrainer(ABC):
+         self._dump_futures.clear()
+         self._dump_executor.shutdown(wait=True)
+ 
++    def _shutdown_train_loader_workers(self) -> None:
++        """Stop the train dataloader's worker processes."""
++        shutdown = getattr(self.train_dataloader_it, "_shutdown_workers", None)  # none with num_workers=0
++        if shutdown is not None:
++            shutdown()
++
+     def _log_rollout_data(self, batch: KVBatchMeta, timing_raw: dict, rollout_data_dir: str):
+         """Fetch rollout data from TransferQueue and dump sorted by uid."""
+         with marked_timer("dump_rollout_generations", timing_raw, color="green"):

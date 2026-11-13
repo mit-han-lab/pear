@@ -1,0 +1,189 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [vllm] fix: the sub-paged attention view for FlashInfer's
+ fused K/V layout, and for HND
+
+Local, from no pull request. LMCache pull request #4253 (https://github.com/LMCache/LMCache/pull/4253) addresses
+the same layout another way.
+
+vLLM's FlashInfer backend registers each attention layer as a fused-K/V rank-4 tensor
+(pages, num_kv_heads, kernel_block_size, 2 * head_size) and requires the HND layout. _SubpagedAttentionViewEdit only
+matched rank-5 (pages, 2, ...) tensors, so under FlashInfer the edit never applied: the attention group stayed at the
+kernel's page size while the scheduler's block is the recurrent-state page, LMCache classified it as a compressed
+group, and store and retrieve moved a fraction of each block's KV, corrupting live KV on every load. The rank-4
+branch re-views the tensor at the scheduler block size in the layout's own memory order
+((blocks, 1, block_size, num_kv_heads * content) for HND, the NHD-strided equivalent otherwise); with one KV head per
+rank the dims stay semantic. For the rank-5 layout the kernel block size is read from the layout's token dim (dim 3
+under HND) instead of assuming NHD. Each group's kind, block size, page size, layout and registered tensor shape are
+logged once at registration.
+---
+ .../integration/vllm/kv_cache_group_edits.py  | 103 ++++++++++++++++--
+ 1 file changed, 91 insertions(+), 12 deletions(-)
+
+diff --git a/lmcache/integration/vllm/kv_cache_group_edits.py b/lmcache/integration/vllm/kv_cache_group_edits.py
+index 54611175ee4b29243dae799c2c374c13662c517f..b2c5cd39ea5e2ace0c54166cb80d5364131f7c3c 100644
+--- a/lmcache/integration/vllm/kv_cache_group_edits.py
++++ b/lmcache/integration/vllm/kv_cache_group_edits.py
+@@ -296,26 +296,41 @@ class _SubpagedAttentionViewEdit(KVCacheGroupEdit):
+             # compression (DeepSeek) belong to other transfer paths.
+             get_kv_cache_spec_kind(spec) in _SUBPAGEABLE_ATTENTION_KINDS
+             and not _declares_slot_compression(spec)
+-            # (num_blocks, 2, block_size, num_heads, head_size) layout whose
+-            # block dim disagrees with the scheduler block-id unit -- the
+-            # backend re-paged the tensor at its kernel block size.
++            # (num_blocks, 2, block_size, num_heads, head_size) (NHD) or
++            # (num_blocks, 2, num_heads, block_size, head_size) (HND) layout
++            # whose block dim disagrees with the scheduler block-id unit -- the
++            # backend re-paged the tensor at its kernel block size. The layout
++            # is not known here, so both candidate dims are checked.
+             and isinstance(kv_cache, torch.Tensor)
+-            and kv_cache.ndim == 5
+-            and kv_cache.shape[2] != spec.block_size
++            and (
++                (
++                    kv_cache.ndim == 5
++                    and kv_cache.shape[2] != spec.block_size
++                    and kv_cache.shape[3] != spec.block_size
++                )
++                # Fused K/V (FlashInfer): logical (num_blocks, num_heads,
++                # block_size, 2 * head_size) in both layouts, so the token
++                # axis is always dim 2 and only its size has to disagree.
++                or (kv_cache.ndim == 4 and kv_cache.shape[2] != spec.block_size)
++            )
+         )
+ 
+     def apply(
+         self,
+         spec: KVCacheSpec,
+         kv_cache: RegisteredKVCache,
+-        _layout_hints: LayoutHints,
++        layout_hints: LayoutHints,
+     ) -> torch.Tensor:
+         """Re-view ``kv_cache`` at logical-block granularity.
+ 
+         The tensor is kernel-paged as ``(num_kernel_pages, 2,
+-        kernel_block_size, num_kv_heads, head_size)``; the result is
++        kernel_block_size, num_kv_heads, head_size)`` (NHD) or
++        ``(num_kernel_pages, 2, num_kv_heads, kernel_block_size, head_size)``
++        (HND, what FlashInfer requires on Blackwell); the result is
+         ``(num_logical_blocks, 2, spec.block_size, num_heads, head_size)``
+-        over the same storage.
++        over the same storage. One logical block is ``ratio`` consecutive
++        kernel pages, contiguous in either layout, so the result is a plain
++        byte re-view; its dims are addressing metadata only.
+ 
+         Raises:
+             ValueError: If the layout is not the expected kernel-paged shape,
+@@ -323,6 +338,8 @@ class _SubpagedAttentionViewEdit(KVCacheGroupEdit):
+                 logical block do not tile its page bytes exactly (which would
+                 indicate an undeclared packed layout that must not be edited).
+         """
++        if isinstance(kv_cache, torch.Tensor) and kv_cache.ndim == 4:
++            return self._apply_fused(spec, kv_cache)
+         if not isinstance(kv_cache, torch.Tensor) or kv_cache.shape[1] != 2:
+             got = (
+                 tuple(kv_cache.shape)
+@@ -334,7 +351,9 @@ class _SubpagedAttentionViewEdit(KVCacheGroupEdit):
+                 f"attention KV tensor, got {got}"
+             )
+         logical_block_size = spec.block_size
+-        kernel_block_size = kv_cache.shape[2]
++        # HND keeps the token dim after the heads; NHD (the default) before them
++        block_dim = 3 if layout_hints.get("kv_layout") == "HND" else 2
++        kernel_block_size = kv_cache.shape[block_dim]
+         if logical_block_size % kernel_block_size != 0:
+             raise ValueError(
+                 f"logical block size {logical_block_size} is not a multiple of "
+@@ -367,6 +386,53 @@ class _SubpagedAttentionViewEdit(KVCacheGroupEdit):
+         )
+         return kv_cache.view(num_blocks, 2, logical_block_size, num_heads, head_size)
+ 
++    @staticmethod
++    def _apply_fused(spec: KVCacheSpec, kv_cache: torch.Tensor) -> torch.Tensor:
++        """Re-view a fused-K/V kernel-paged tensor at logical-block granularity.
++
++        vLLM's FlashInfer backend registers ``(num_kernel_pages, num_kv_heads,
++        kernel_block_size, 2 * head_size)``: the logical shape is the same in
++        both layouts, HND memory is that shape contiguous and NHD memory is
++        ``(pages, block, heads, content)`` behind a permuted view. The result
++        keeps the layout's memory order and has ``spec.block_size`` tokens per
++        page: ``(num_blocks, 1, block_size, num_kv_heads * content)`` for HND,
++        the NHD-strided equivalent otherwise. With one KV head per rank the
++        dims stay semantic; with more heads the token rows interleave heads at
++        kernel-page granularity, which round-trips but is not content-aware
++        (the same caveat as the 5-D re-view above).
++        """
++        num_kernel_pages, num_heads, kernel_block_size, content = kv_cache.shape
++        logical_block_size = spec.block_size
++        if logical_block_size % kernel_block_size != 0:
++            raise ValueError(
++                f"logical block size {logical_block_size} is not a multiple of "
++                f"kernel block size {kernel_block_size}"
++            )
++        ratio = logical_block_size // kernel_block_size
++        if num_kernel_pages % ratio != 0:
++            raise ValueError(
++                f"kernel page count {num_kernel_pages} is not a multiple of "
++                f"the logical/kernel block ratio {ratio}"
++            )
++        kernel_page_bytes = kv_cache.shape[1:].numel() * kv_cache.element_size()
++        if kernel_page_bytes * ratio != spec.page_size_bytes:
++            raise ValueError(
++                f"{ratio} kernel pages ({kernel_page_bytes * ratio} bytes) do "
++                f"not tile the logical page ({spec.page_size_bytes} bytes)"
++            )
++        num_blocks = num_kernel_pages // ratio
++        if kv_cache.is_contiguous():  # HND memory: (pages, heads, block, content)
++            return kv_cache.view(num_blocks, 1, logical_block_size, num_heads * content)
++        nhd = kv_cache.permute(0, 2, 1, 3)  # NHD memory: (pages, block, heads, content)
++        if not nhd.is_contiguous():
++            raise ValueError(
++                f"fused K/V tensor with strides {tuple(kv_cache.stride())} is "
++                "neither HND- nor NHD-contiguous; cannot re-view as logical pages"
++            )
++        return nhd.view(num_blocks, logical_block_size, 1, num_heads * content).permute(
++            0, 2, 1, 3
++        )
++
+ 
+ ######################
+ # vLLM 0.26.0 or later
+@@ -483,14 +549,18 @@ class _SubpagedMLAAttentionViewEdit(KVCacheGroupEdit):
+         self,
+         spec: KVCacheSpec,
+         kv_cache: RegisteredKVCache,
+-        _layout_hints: LayoutHints,
++        layout_hints: LayoutHints,
+     ) -> torch.Tensor:
+         """Re-view ``kv_cache`` at logical-block granularity.
+ 
+         The tensor is kernel-paged as ``(num_kernel_pages, 2,
+-        kernel_block_size, num_kv_heads, head_size)``; the result is
++        kernel_block_size, num_kv_heads, head_size)`` (NHD) or
++        ``(num_kernel_pages, 2, num_kv_heads, kernel_block_size, head_size)``
++        (HND, what FlashInfer requires on Blackwell); the result is
+         ``(num_logical_blocks, 2, spec.block_size, num_heads, head_size)``
+-        over the same storage.
++        over the same storage. One logical block is ``ratio`` consecutive
++        kernel pages, contiguous in either layout, so the result is a plain
++        byte re-view; its dims are addressing metadata only.
+ 
+         Raises:
+             ValueError: If the layout is not the expected kernel-paged shape,
+@@ -573,6 +643,15 @@ def apply_kv_cache_group_edits(
+     counts: Counter[str] = Counter()
+     for group in kv_cache_config.kv_cache_groups:
+         spec = group.kv_cache_spec
++        first = kv_caches[group.layer_names[0]] if group.layer_names else None
++        logger.info(
++            "KV cache group %s: block_size=%s page_size_bytes=%s layout=%s registered=%s",
++            get_kv_cache_spec_kind(spec).name,
++            spec.block_size,
++            getattr(spec, "page_size_bytes", None),
++            layout_hints.get("kv_layout", "none"),
++            [tuple(t.shape) for t in first] if isinstance(first, list) else tuple(first.shape) if first is not None else None,
++        )
+         for name in group.layer_names:
+             for edit in _EDITS:
+                 if edit.matches(spec, kv_caches[name]):

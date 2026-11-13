@@ -1,0 +1,38 @@
+{
+  "turn_id": "e1f3cbbb02fc",
+  "dispatched": true,
+  "status": "completed",
+  "settled": true,
+  "reached": true,
+  "measured_position": [
+    0.00015732952251188933,
+    -4.08110063102268e-09,
+    6.022613163896156e-09,
+    -2.4103292229666896e-09,
+    -4.3825169667289256e-07,
+    1.0
+  ],
+  "tracking_error": [
+    -2.710505431213761e-20,
+    -3.460096502309315e-21,
+    -4.846500839784942e-19,
+    -2.9991463836513836e-18,
+    5.293955920339377e-23,
+    0.0
+  ],
+  "measured_state": {
+    "arm": {
+      "x": 39.1,
+      "y": 0.0,
+      "z": 22.6,
+      "pitch": 0.0,
+      "roll": -0.05
+    },
+    "gripper": {
+      "width": 6.0
+    }
+  },
+  "gripper_outcome": null,
+  "error": null,
+  "adjusted": null
+}

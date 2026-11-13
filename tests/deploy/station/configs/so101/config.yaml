@@ -1,0 +1,13 @@
+# The SO-101 station the tests run: the robot on stand-in hardware, with stand-in devices, the calibration beside this
+# file and one arm's feedforward. Every other value is the shipped config.yaml's, read under this file.
+robot_class: stand_in_robots.StandInSO101Robot
+
+robot:
+  hardware:
+    port: /dev/stand-in-so101-serial
+  camera:
+    path: /dev/stand-in-wrist-camera
+  feedforward:
+    gravity_compliance: [0.0, 0.061, 0.068, 0.074, 0.0]
+    friction_offset_rad: [0.0036, 0.0029, 0.0099, 0.007, 0.0048]
+    friction_load_ratio: [0.0, 0.0295, 0.0138, 0.0, 0.0]

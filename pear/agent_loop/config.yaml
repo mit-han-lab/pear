@@ -1,0 +1,3 @@
+# actor_rollout_ref.rollout.agent.agent_loop_config_path; verl instantiates the entry with hydra.
+- name: pear_agent         # rollout.agent.default_agent_loop; the rows carry no agent_name
+  _target_: pear.agent_loop.agent_loop.PearAgentLoop

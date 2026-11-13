@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [trainer] refactor: PPOTrainer._prompt_tags, the tags a
+ submitted batch's prompts are registered with
+
+The list _submit_batch_to_rollout built inline, as a method: a subclass adds what its replay buffer reads from a
+prompt's tag. Nothing changes by default.
+---
+ tests/trainer/ppo/v1/test_reissue_inflight_on_cpu.py | 1 +
+ verl/trainer/ppo/v1/trainer_base.py                  | 6 +++++-
+ 2 files changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/tests/trainer/ppo/v1/test_reissue_inflight_on_cpu.py b/tests/trainer/ppo/v1/test_reissue_inflight_on_cpu.py
+index 3fdceb33a00ceca885e71936ab4975cba8ea1351..fece90c65bb6e24fbedaadfab0da85b3ec6106bc 100644
+--- a/tests/trainer/ppo/v1/test_reissue_inflight_on_cpu.py
++++ b/tests/trainer/ppo/v1/test_reissue_inflight_on_cpu.py
+@@ -143,6 +143,7 @@ def test_async_submission_persists_reissuable_prompt_fields(monkeypatch):
+     stub.trainer_mode = "separate_async"
+     stub.global_steps = 4
+     stub.agent_loop_manager = FakeAgentLoopManager()
++    stub._prompt_tags = PPOTrainer._prompt_tags.__get__(stub)
+     stub._submit_batch_to_rollout = PPOTrainer._submit_batch_to_rollout.__get__(stub)
+     batch = tu.get_tensordict(
+         {
+diff --git a/verl/trainer/ppo/v1/trainer_base.py b/verl/trainer/ppo/v1/trainer_base.py
+index 1eed28b6e08957bf49f29d19d5882e2673efd637..71e428d57a21fab503462a63c1f4b10605a43911 100644
+--- a/verl/trainer/ppo/v1/trainer_base.py
++++ b/verl/trainer/ppo/v1/trainer_base.py
+@@ -1516,7 +1516,7 @@ class PPOTrainer(ABC):
+ 
+     def _submit_batch_to_rollout(self, batch: TensorDict) -> int:
+         """Register prompts in TransferQueue and dispatch them for generation."""
+-        tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in range(len(batch))]
++        tags = self._prompt_tags(batch)
+         if self.trainer_mode != "sync":
+             tq.kv_batch_put(
+                 keys=list(batch["uid"]),
+@@ -1532,6 +1532,10 @@ class PPOTrainer(ABC):
+         self.agent_loop_manager.generate_sequences(batch)
+         return len(batch)
+ 
++    def _prompt_tags(self, batch: TensorDict) -> list[dict]:
++        """The tags a batch's prompts are registered with in TransferQueue, one per prompt."""
++        return [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in range(len(batch))]
++
+     def _add_prompts_to_generate(self, num_prompts: int) -> int:
+         """Add an exact number of prompts to the AgentLoopManager."""
+         batch = self._next_train_batch(num_prompts)

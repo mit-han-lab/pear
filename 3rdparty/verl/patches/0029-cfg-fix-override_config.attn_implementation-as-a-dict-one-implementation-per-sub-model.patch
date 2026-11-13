@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [cfg] fix: override_config.attn_implementation as a dict, one
+ implementation per sub-model
+
+attn_implementation is an argument of from_pretrained, one name or one per sub-model config. It is now dropped
+before the other overrides are written onto the loaded config, where its dict form was taken for a sub-config.
+---
+ verl/workers/config/model.py | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/verl/workers/config/model.py b/verl/workers/config/model.py
+index 5f7d517b0dd7fe1777a565bb807da57260f6f2ca..0472044abbd64a9909f6f3bcad1e05cae3001ee1 100644
+--- a/verl/workers/config/model.py
++++ b/verl/workers/config/model.py
+@@ -219,6 +219,9 @@ class HFModelConfig(BaseConfig):
+             self.override_config["model_config"] if "model_config" in self.override_config else self.override_config
+         )
+         override_config_kwargs.update(override_config)
++        # attn_implementation went to from_pretrained above (one name, or one per sub-model: {"text_config": ...}); it is
++        # not a config attribute
++        override_config_kwargs.pop("attn_implementation", None)
+         update_model_config(self.hf_config, override_config_kwargs=override_config_kwargs)
+ 
+         self.share_embeddings_and_output_weights = getattr(self.hf_config, "tie_word_embeddings", False)

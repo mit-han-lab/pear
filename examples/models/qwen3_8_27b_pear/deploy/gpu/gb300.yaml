@@ -1,0 +1,6 @@
+# @package _global_
+# The deploy server's engine arguments on one GB300, composed as +gpu=gb300.
+engine:
+  attention_config: {use_trtllm_attention: true}  # vLLM's TRT-LLM attention kernels
+  # what the engine takes of the GPU: the decode megakernel's and its draft's buffers live outside it
+  gpu_memory_utilization: 0.85

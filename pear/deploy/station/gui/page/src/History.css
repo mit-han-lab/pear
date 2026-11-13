@@ -1,0 +1,57 @@
+.history-list button {
+  width: 100%;
+  justify-content: flex-start;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  padding: 18px 5px;
+  text-align: left;
+  color: var(--text-muted-warm);
+}
+.history-list button > div {
+  flex: 1;
+  min-width: 0;
+}
+.history-list strong {
+  display: block;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--ink);
+}
+.history-list span {
+  display: block;
+  font-size: 9px;
+  margin-top: 7px;
+  color: var(--text-hint);
+}
+.empty-small {
+  padding: 50px;
+  text-align: center;
+  color: var(--text-hint);
+  font-size: 12px;
+}
+.history-footer {
+  display: flex;
+  justify-content: space-between;
+  margin: 20px 0;
+  font-size: 11px;
+}
+.history-footer a {
+  display: flex;
+  gap: 7px;
+  text-decoration: none;
+  color: var(--accent-green);
+}
+.history-footer button {
+  background: var(--surface-accent);
+  border: 0;
+  border-radius: 4px;
+  font-size: 10px;
+  padding: 6px 10px;
+}
+.history-list .history-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 7px;
+}

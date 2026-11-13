@@ -1,0 +1,41 @@
+{
+  "turn_id": "57b780ef7518",
+  "observation_id": "a5326cf2-9dd3-4c6f-a45a-e1c5d3ff276e",
+  "captured_monotonic_s": 149595.830141431,
+  "state": {
+    "left_arm": {
+      "x": 25.8,
+      "y": 30.6,
+      "z": 17.9,
+      "roll": -1.57,
+      "pitch": 0.0,
+      "yaw": 1.57
+    },
+    "right_arm": {
+      "x": 25.8,
+      "y": -30.4,
+      "z": 17.9,
+      "roll": -1.57,
+      "pitch": 0.0,
+      "yaw": 1.57
+    },
+    "left_gripper": {
+      "width": 4.8
+    },
+    "right_gripper": {
+      "width": 4.8
+    }
+  },
+  "text": "{\"left_arm\": {\"x\": 25.8, \"y\": 30.6, \"z\": 17.9, \"roll\": -1.57, \"pitch\": 0.0, \"yaw\": 1.57}, \"right_arm\": {\"x\": 25.8, \"y\": -30.4, \"z\": 17.9, \"roll\": -1.57, \"pitch\": 0.0, \"yaw\": 1.57}, \"left_gripper\": {\"width\": 4.8}, \"right_gripper\": {\"width\": 4.8}}\n\nThe current camera frames follow. End your response with one json block containing the next action.",
+  "images": {
+    "head": "records/3e4c42ba48d047a8b1b841303f443a87/57b780ef7518-head.jpg",
+    "left_wrist": "records/3e4c42ba48d047a8b1b841303f443a87/57b780ef7518-left_wrist.jpg",
+    "right_wrist": "records/3e4c42ba48d047a8b1b841303f443a87/57b780ef7518-right_wrist.jpg"
+  },
+  "image_uuids": {
+    "head": "db4bdef1-c7b9-4334-a04c-8798daf5e4cd",
+    "left_wrist": "652e1e46-a5c1-437d-bf61-4c0d9af1aa36",
+    "right_wrist": "7791ab1d-21de-4109-aa48-e5924cc77827"
+  },
+  "previous_result": null
+}

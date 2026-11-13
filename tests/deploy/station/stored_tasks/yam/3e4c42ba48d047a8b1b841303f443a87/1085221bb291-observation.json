@@ -1,0 +1,104 @@
+{
+  "turn_id": "1085221bb291",
+  "observation_id": "a6737364-5a1b-4eb6-a748-02c72c57c74d",
+  "captured_monotonic_s": 149597.565237355,
+  "state": {
+    "left_arm": {
+      "x": 25.8,
+      "y": 30.6,
+      "z": 17.9,
+      "roll": -1.57,
+      "pitch": 0.0,
+      "yaw": 1.57
+    },
+    "right_arm": {
+      "x": 25.8,
+      "y": -30.4,
+      "z": 17.9,
+      "roll": -1.57,
+      "pitch": 0.0,
+      "yaw": 1.57
+    },
+    "left_gripper": {
+      "width": 4.8
+    },
+    "right_gripper": {
+      "width": 4.8
+    }
+  },
+  "text": "{\"left_arm\": {\"x\": 25.8, \"y\": 30.6, \"z\": 17.9, \"roll\": -1.57, \"pitch\": 0.0, \"yaw\": 1.57}, \"right_arm\": {\"x\": 25.8, \"y\": -30.4, \"z\": 17.9, \"roll\": -1.57, \"pitch\": 0.0, \"yaw\": 1.57}, \"left_gripper\": {\"width\": 4.8}, \"right_gripper\": {\"width\": 4.8}}\n\nThe current camera frames follow. End your response with one json block containing the next action.",
+  "images": {
+    "head": "records/3e4c42ba48d047a8b1b841303f443a87/1085221bb291-head.jpg",
+    "left_wrist": "records/3e4c42ba48d047a8b1b841303f443a87/1085221bb291-left_wrist.jpg",
+    "right_wrist": "records/3e4c42ba48d047a8b1b841303f443a87/1085221bb291-right_wrist.jpg"
+  },
+  "image_uuids": {
+    "head": "404eb349-0406-45d9-8e81-a0df3738984d",
+    "left_wrist": "36e201c0-f3aa-4976-874e-620040f5a48b",
+    "right_wrist": "ec8f2882-2752-4666-ae8b-72b13a33bd2d"
+  },
+  "previous_result": {
+    "status": "completed",
+    "settled": true,
+    "reached": true,
+    "measured_position": [
+      -4.4489536276374836e-07,
+      0.0004421047737122691,
+      -3.640596893487723e-05,
+      0.0004785431006313626,
+      -4.5066929643615684e-07,
+      -2.4296478736668043e-11,
+      0.5,
+      -4.4489536276374836e-07,
+      0.0004421047737122691,
+      -3.640596893487723e-05,
+      0.0004785431006313626,
+      -4.5066929643615684e-07,
+      -2.4296478736668043e-11,
+      0.5
+    ],
+    "tracking_error": [
+      -5.293955920339377e-22,
+      2.6020852139652106e-18,
+      3.1848438816761693e-19,
+      -2.710505431213761e-19,
+      -1.164670302474663e-21,
+      -3.554291694563791e-26,
+      0.0,
+      -5.293955920339377e-22,
+      2.6020852139652106e-18,
+      3.1848438816761693e-19,
+      -2.710505431213761e-19,
+      -1.164670302474663e-21,
+      -3.554291694563791e-26,
+      0.0
+    ],
+    "measured_state": {
+      "left_arm": {
+        "x": 25.8,
+        "y": 30.6,
+        "z": 17.9,
+        "roll": -1.57,
+        "pitch": 0.0,
+        "yaw": 1.57
+      },
+      "right_arm": {
+        "x": 25.8,
+        "y": -30.4,
+        "z": 17.9,
+        "roll": -1.57,
+        "pitch": 0.0,
+        "yaw": 1.57
+      },
+      "left_gripper": {
+        "width": 4.8
+      },
+      "right_gripper": {
+        "width": 4.8
+      }
+    },
+    "gripper_outcome": null,
+    "gripper_outcomes": {},
+    "error": null
+  }
+}

@@ -1,0 +1,22 @@
+name: Bug report
+description: Something fails or gives a wrong result
+labels: [bug]
+body:
+  - type: textarea
+    attributes:
+      label: What happened
+      description: What you ran, what you expected and what you got. Paste the error with its traceback.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: How to reproduce
+      description: The recipe or command with its overrides, and the smallest setting that still fails.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Environment
+      description: The PEAR commit, the GPUs and their count, the driver and CUDA versions, and how the environments were installed.
+    validations:
+      required: true

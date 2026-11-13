@@ -1,0 +1,36 @@
+name: Training environment
+description: >-
+  The training environment of scripts/install.sh without what it compiles for a GPU, taken from the cache while its
+  inputs are unchanged, with the verl checkout it runs with. Sets PEAR_PYTHON for the steps that follow.
+
+runs:
+  using: composite
+  steps:
+    - name: The environment and the installer's uv, from the cache when the installer and its pins are unchanged
+      id: cache
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: |
+          ${{ runner.temp }}/pear/bin
+          ${{ runner.temp }}/pear/envs
+        key: training-env-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/install.sh', 'scripts/install/verl/install.sh', 'scripts/install/common.sh', 'scripts/install/versions.env', 'pyproject.toml', 'scripts/install/verl/constraints.txt', 'scripts/install/verl/overrides.txt', '3rdparty/verl/UPSTREAM') }}
+
+    - name: Install it otherwise
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        WORK_DIR: ${{ runner.temp }}/pear
+        NO_GPU: "1"
+      run: bash scripts/install.sh verl
+
+    - name: This commit's verl checkout and the two editable installs, on a cached environment
+      if: steps.cache.outputs.cache-hit == 'true'
+      shell: bash
+      run: |
+        bash 3rdparty/verl/scripts/checkout_verl.sh
+        "$RUNNER_TEMP/pear/bin/uv" pip install --python "$RUNNER_TEMP/pear/envs/verl/bin/python" --no-deps \
+          -e 3rdparty/verl/src -e .
+
+    - name: PEAR_PYTHON
+      shell: bash
+      run: echo "PEAR_PYTHON=$RUNNER_TEMP/pear/envs/verl/bin/python" >> "$GITHUB_ENV"

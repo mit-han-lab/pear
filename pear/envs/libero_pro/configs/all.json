@@ -1,0 +1,21 @@
+{
+  "env_class": "pear.envs.libero_pro.env.LiberoProEnv",
+  "data_source": "perturbation",
+  "env": {
+    "suite": [
+      "libero_spatial",
+      "libero_object",
+      "libero_goal",
+      "libero_10"
+    ],
+    "perturbation": [
+      "none",
+      "lan",
+      "object",
+      "swap",
+      "task"
+    ],
+    "task_id": "0-9",
+    "trial_id": "0-49"
+  }
+}

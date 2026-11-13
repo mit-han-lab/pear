@@ -1,0 +1,30 @@
+name: PR title
+
+# The title against the rule of .github/scripts/pr_title.py. `edited`: a title changed after a failed check is checked
+# again without a new commit.
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, edited, synchronize, reopened]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# bash with -e and pipefail: a step ends at the first command that fails, inside a pipeline too
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  pr-title:
+    name: The pull request's title
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: python3 .github/scripts/pr_title.py

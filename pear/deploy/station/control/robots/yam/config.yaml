@@ -1,0 +1,82 @@
+# The YAM robot: two follower arms and three RealSense cameras. Its defaults, read over pear/configs/station.yaml; a
+# station's own file gives every value that is still ???: the CAN buses and the cameras of its machine. Sides are named
+# from the operator's position, facing the worktable.
+robot_class: pear.deploy.station.control.robots.yam.robot.YAMRobot
+port: 18800  # of the page's service
+
+robot:
+  position_tolerance: 0.02  # how close an arm joint ends to its target at an arrival, rad
+  gripper_tolerance: 0.01  # how close a gripper's opening ends to its target at an arrival
+  feedback_position_tolerance: 0.02  # how far measured feedback may rest outside the position bounds
+  velocity_tolerance: 0.06  # the absolute window-mean velocity below which an arm counts as settled
+  gripper_contact_confirm_s: 0.2  # how long a gripper's contact must hold, steady and loaded, to be confirmed
+  gripper_contact_effort_ratio: 0.8  # the share of the SDK's holding torque a gripper's effort must reach
+  # Home opens the selected grippers, then checks and runs one direct joint path
+  home:
+    left_pose: [0, 0, 0, 0, 0, 0, 1]  # J1-J6 in rad, then the gripper's opening
+    right_pose: [0, 0, 0, 0, 0, 0, 1]
+    speed_scale: 1
+    limits:  # one arm's caps, J1-J6 and the gripper
+      velocity: [0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.1]
+      acceleration: [0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.06666666666666667]
+      jerk: [2, 2, 2, 2, 2, 2, 0.07407407407407407]
+    settle_window_s: 0.5
+    arrival_timeout_s: 30
+    joint_tolerance: [0.02, 0.02, 0.035, 0.02, 0.02, 0.02]  # J1-J6, rad
+  arms:
+    left:
+      # the SocketCAN interface and the adapter's serial: `pear-station yam check --config FILE` lists both
+      channel: ???
+      adapter_serial: ???
+      arm_type: yam_ultra
+      joint_position_gains: [80, 80, 80, 40, 10, 10]  # J1-J6; null: the SDK's own
+      # software zero correction per joint, true = SDK + offset; the motors' zeros are never written: measure each
+      # arm's J4 stall against its stop and enter the difference
+      joint_offsets: [0, 0, 0, 0, 0, 0]  # J1-J6
+      gripper_type: linear_4310
+      gripper_force_n: 50.0  # the SDK's nominal setting, not a calibrated fingertip force
+      uses_velocity_feedforward: true  # false: position-only commands
+      # times the SDK's gravity model, J1-J6; null: the SDK's own; `pear-station yam friction-sweep` measures them
+      gravity_compensation_factors: [1, 1.1, 1.1, 1.2, 1, 1]
+      friction_feedforward_nm: [0, 0, 0, 0, 0, 0]  # J1-J6, the constant part, from friction-sweep; zeros: none
+      friction_load_ratio: [0, 0, 0, 0, 0, 0]  # J1-J6, Nm per Nm of gravity load
+      # [closed, open] in motor radians: `pear-station yam calibrate-gripper left --config FILE --yes` measures them
+      gripper_limits: null
+      gripper_stroke_range: [4.7, 5.7]
+      # joint bounds inside the SDK's limits and clear of each joint's physical stop
+      limits: &arm_limits
+        lower_bounds: [-2.61799, -0.10, -0.10, -1.68, -1.5708, -2.0944, 0]
+        upper_bounds: [3.14159, 3.66519, 3.14159, 1.5708, 1.5708, 2.0944, 1]
+        velocity: [1, 1, 1, 1, 1, 1, 0.3]
+        acceleration: [2, 2, 2, 2, 2, 2, 1.2]
+        jerk: [10, 10, 10, 10, 10, 10, 6]
+        tracking_error: [0.15, 0.15, 0.15, 0.15, 0.15, 0.15, 0.12]
+    right:
+      channel: ???
+      adapter_serial: ???
+      arm_type: yam_ultra
+      joint_position_gains: [80, 80, 80, 40, 10, 10]
+      joint_offsets: [0, 0, 0, 0, 0, 0]
+      gripper_type: linear_4310
+      gripper_force_n: 50.0
+      uses_velocity_feedforward: true
+      gravity_compensation_factors: [1, 1.1, 1.1, 1.2, 1, 1]
+      friction_feedforward_nm: [0, 0, 0, 0, 0, 0]
+      friction_load_ratio: [0, 0, 0, 0, 0, 0]
+      gripper_limits: null
+      gripper_stroke_range: [4.7, 5.7]
+      limits: *arm_limits
+  # one entry for each RealSense, its serial as `pear-station yam cameras` lists it; a camera may also give a crop
+  # of its frame, {x_offset, y_offset, width, height} in pixels
+  cameras:
+    - serial: ???
+      role: left
+    - serial: ???
+      role: top
+    - serial: ???
+      role: right
+  geometry:
+    base_spacing_m: 0.61  # between the two arms' bases
+    max_rotation_rad: 3.141592653589793
+    position_residual_m: 0.0005
+    rotation_residual_rad: 0.005

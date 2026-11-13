@@ -1,0 +1,255 @@
+/* One model turn. */
+.turn-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+.turn-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+.turn-head strong {
+  color: var(--ink);
+  font-weight: 600;
+}
+.turn-badge {
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  border-radius: 7px;
+  background: var(--teal);
+  color: var(--on-solid);
+  font-size: 11px;
+  font-weight: 700;
+}
+.turn-active .turn-badge {
+  background: var(--surface-strong);
+  color: var(--teal);
+}
+.disclosure {
+  gap: 6px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary);
+}
+.disclosure:hover {
+  background: var(--page);
+}
+.disclosure svg {
+  transition: transform 0.15s;
+}
+.disclosure[aria-expanded='true'] svg {
+  transform: rotate(90deg);
+}
+.details-toggle {
+  margin-left: auto;
+  min-height: 26px;
+  padding: 0 6px 0 8px;
+  gap: 2px;
+  color: var(--text-muted-cool);
+  font-size: 12px;
+}
+.thought-toggle {
+  align-self: flex-start;
+  min-height: 32px;
+  padding: 0 10px 0 6px;
+  font-size: 13px;
+}
+.thought {
+  margin-left: 8px;
+  padding: 2px 0 2px 14px;
+  border-left: 2px solid var(--border);
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.turn-text {
+  margin: 0;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* The action the model asked for: one part per line, non-zero quantities marked. */
+.action-card {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.action-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  background: var(--surface-subtle);
+  color: var(--text-body);
+  font-size: 12px;
+  font-weight: 600;
+}
+.action-head code {
+  font: 400 11px var(--mono);
+}
+.action-card pre {
+  margin: 0;
+  padding: 12px 14px;
+  color: var(--text-code);
+  font: 12.5px/1.7 var(--mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.action-card mark {
+  padding: 0 3px;
+  border-radius: 3px;
+  background: var(--mark-bg);
+  color: var(--mark-text);
+}
+
+/* What the action did. */
+.turn-outcome {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+.result-chip,
+.outcome-chip {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border-radius: 999px;
+}
+.result-chip {
+  font-weight: 600;
+}
+.result-chip.completed {
+  background: var(--success-bg);
+  color: var(--success-text);
+}
+.result-chip.rejected {
+  background: var(--rejected-bg);
+  color: var(--rejected-text);
+}
+.result-chip.failed {
+  background: var(--failed-bg);
+  color: var(--failed-text);
+}
+.result-chip.interrupted {
+  background: var(--tint);
+  color: var(--text-body);
+}
+.outcome-chip {
+  border: 1px solid var(--border-strong);
+  color: var(--text-body);
+}
+.outcome-note {
+  color: var(--text-secondary);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.outcome-note.duration {
+  margin-left: 4px;
+}
+.turn-note {
+  margin: 0;
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: var(--note-bg);
+  color: var(--note-text);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* A turn in progress: its phase, elapsed time and tokens, after three pulsing dots. */
+.turn-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-left: 6px;
+  color: var(--teal);
+  font-size: 13px;
+}
+.turn-dots {
+  display: flex;
+  gap: 4px;
+}
+.turn-dots i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--teal);
+  animation: turn-dot 1.2s ease-in-out infinite;
+}
+.turn-dots i:nth-child(2) {
+  animation-delay: 0.2s;
+}
+.turn-dots i:nth-child(3) {
+  animation-delay: 0.4s;
+}
+@keyframes turn-dot {
+  0%,
+  80%,
+  100% {
+    opacity: 0.25;
+  }
+  40% {
+    opacity: 1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .turn-dots i {
+    animation: none;
+  }
+  .turn-dots i:nth-child(2) {
+    opacity: 0.6;
+  }
+  .turn-dots i:nth-child(3) {
+    opacity: 0.3;
+  }
+}
+
+/* A turn's folded details: what the model saw and the robot state it was given. */
+.turn-details {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--tint);
+  border-radius: 12px;
+  background: var(--surface-subtle);
+  font-size: 12px;
+}
+.turn-frames {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 8px;
+}
+.turn-frames a {
+  display: grid;
+  gap: 4px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  text-decoration: none;
+}
+.turn-frames img {
+  width: 100%;
+  border-radius: 6px;
+}
+.turn-json {
+  margin: 0;
+  max-height: 240px;
+  overflow: auto;
+  padding: 10px;
+  border-radius: 8px;
+  background: var(--surface-sunken);
+  font: 11px/1.6 var(--mono);
+}

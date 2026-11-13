@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [trainer] refactor: PPOTrainer._next_dataloader_batch, the
+ batch _fetch_one_gen_batch takes from the dataloader
+
+The handling of the train dataloader's iterator (created on first use, started over when a pass ends), as a method
+of its own: a trainer that reads its dataset once replaces it and keeps _fetch_one_gen_batch's uids and
+tensordict. Nothing changes by default.
+---
+ .../ppo/v1/test_trainer_base_on_cpu.py        | 20 +++++++++++++++++++
+ verl/trainer/ppo/v1/trainer_base.py           | 13 +++++++-----
+ 2 files changed, 28 insertions(+), 5 deletions(-)
+
+diff --git a/tests/trainer/ppo/v1/test_trainer_base_on_cpu.py b/tests/trainer/ppo/v1/test_trainer_base_on_cpu.py
+index 811e8d7c72709bfae473051cdf85d4a2767b0753..250c56fd2a2af446d4392bb72952d25b6e62be02 100644
+--- a/tests/trainer/ppo/v1/test_trainer_base_on_cpu.py
++++ b/tests/trainer/ppo/v1/test_trainer_base_on_cpu.py
+@@ -195,6 +195,26 @@ def test_builtin_filter_groups_warns_when_total_generation_limit_is_configured()
+     )
+ 
+ 
++def test_the_dataloader_starts_over_once_its_batches_run_out():
++    trainer = _StubTrainer.__new__(_StubTrainer)
++    trainer.train_dataloader = [{"raw_prompt": ["a"]}, {"raw_prompt": ["b"]}]
++    trainer.train_dataloader_it = None
++
++    prompts = [trainer._next_dataloader_batch()["raw_prompt"] for _ in range(3)]
++
++    assert prompts == [["a"], ["b"], ["a"]]
++
++
++def test_fetch_one_gen_batch_gives_each_prompt_of_the_next_dataloader_batch_a_uid():
++    trainer = _StubTrainer.__new__(_StubTrainer)
++    trainer._next_dataloader_batch = lambda: {"raw_prompt": ["a", "b"]}
++
++    batch = trainer._fetch_one_gen_batch()
++
++    assert list(batch["raw_prompt"]) == ["a", "b"]
++    assert len(set(batch["uid"])) == 2
++
++
+ @pytest.mark.parametrize("score_centering", [True, False])
+ def test_update_actor_passes_score_centering_flag(score_centering):
+     trainer = _StubTrainer.__new__(_StubTrainer)
+diff --git a/verl/trainer/ppo/v1/trainer_base.py b/verl/trainer/ppo/v1/trainer_base.py
+index 14366a6f9b6b65faef54a4512f2ce52298d5963c..764cb99217613f1a8c8ab4f21aadfec0bfb39aaf 100644
+--- a/verl/trainer/ppo/v1/trainer_base.py
++++ b/verl/trainer/ppo/v1/trainer_base.py
+@@ -1532,16 +1532,19 @@ class PPOTrainer(ABC):
+ 
+     def _fetch_one_gen_batch(self) -> TensorDict:
+         """Fetch one ``gen_batch_size`` chunk from the dataloader."""
++        batch_dict = self._next_dataloader_batch()
++        batch_dict["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch_dict["raw_prompt"]))], dtype=object)
++        return tu.get_tensordict(batch_dict)
++
++    def _next_dataloader_batch(self) -> dict:
++        """The train dataloader's next batch, from a new pass over the dataset once a pass has ended."""
+         try:
+             if self.train_dataloader_it is None:
+                 self.train_dataloader_it = iter(self.train_dataloader)
+-            batch_dict = next(self.train_dataloader_it)
++            return next(self.train_dataloader_it)
+         except StopIteration:
+             self.train_dataloader_it = iter(self.train_dataloader)
+-            batch_dict = next(self.train_dataloader_it)
+-
+-        batch_dict["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch_dict["raw_prompt"]))], dtype=object)
+-        return tu.get_tensordict(batch_dict)
++            return next(self.train_dataloader_it)
+ 
+     def _next_train_batch(self, num_prompts: int | None = None) -> TensorDict:
+         """Fetch and coalesce the requested number of prompts."""

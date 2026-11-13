@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [trainer] feat: ctx_total_length metrics, prompt plus
+ response length
+
+compute_data_metrics reports ctx_total_length/mean and ctx_total_length/max: the prompt length plus the
+response length, the context held per trajectory.
+---
+ verl/trainer/ppo/metric_utils.py | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/verl/trainer/ppo/metric_utils.py b/verl/trainer/ppo/metric_utils.py
+index 3de61d360c644a8e982633b6832262fd7ea8df2f..57dbbf41b0c20b5119af6c15f723b6d1e2a6aeca 100644
+--- a/verl/trainer/ppo/metric_utils.py
++++ b/verl/trainer/ppo/metric_utils.py
+@@ -590,6 +590,9 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
+         "prompt_length/max": torch.max(prompt_length).detach().item(),
+         "prompt_length/min": torch.min(prompt_length).detach().item(),
+         "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
++        # prompt + response: the context the engines and the trainer hold per trajectory
++        "ctx_total_length/mean": torch.mean(prompt_length + response_length).detach().item(),
++        "ctx_total_length/max": torch.max(prompt_length + response_length).detach().item(),
+     }
+ 
+     # multi-turn conversation

@@ -1,0 +1,10 @@
+{"arm": {"x": 39.1, "y": 0.0, "z": 22.6, "pitch": 0.0, "roll": -0.05}, "gripper": {"width": 6.0}}
+
+The current camera frame follows. End your response with one json block containing the next action.
+--- images: wrist turn-1-wrist.jpg
+--- with feedback:
+{"arm": {"x": 39.1, "y": 0.0, "z": 22.6, "pitch": 0.0, "roll": -0.05}, "gripper": {"width": 6.0}}
+
+The current camera frame follows. End your response with one json block containing the next action.
+
+Previous execution: an earlier execution report

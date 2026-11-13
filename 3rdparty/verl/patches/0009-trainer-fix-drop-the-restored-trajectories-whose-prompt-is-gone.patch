@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [trainer] fix: drop the restored trajectories whose prompt is
+ gone
+
+A checkpoint's TransferQueue snapshot is taken before the step's kv_clear, so a restore brings back the trajectories
+that step consumed, without their prompt keys: nothing samples or clears them and they accumulate.
+_reissue_inflight_prompts now clears them.
+---
+ .../test_reissue_inflight_prompts_on_cpu.py   | 38 +++++++++++++++++++
+ verl/trainer/ppo/v1/trainer_base.py           | 11 ++++++
+ 2 files changed, 49 insertions(+)
+ create mode 100644 tests/trainer/ppo/v1/test_reissue_inflight_prompts_on_cpu.py
+
+diff --git a/tests/trainer/ppo/v1/test_reissue_inflight_prompts_on_cpu.py b/tests/trainer/ppo/v1/test_reissue_inflight_prompts_on_cpu.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f290c62c321fc37f8c52803b9a7661c3a021e9ce
+--- /dev/null
++++ b/tests/trainer/ppo/v1/test_reissue_inflight_prompts_on_cpu.py
+@@ -0,0 +1,38 @@
++from types import SimpleNamespace
++from unittest.mock import MagicMock
++
++import pytest
++
++from verl.trainer.ppo.v1 import trainer_base
++from verl.trainer.ppo.v1.trainer_base import PPOTrainer
++
++
++@pytest.fixture
++def restore(monkeypatch):
++    """Runs _reissue_inflight_prompts on a restored partition; returns (prompts re-issued, keys cleared)."""
++
++    def run(items: dict) -> tuple[int, set]:
++        tq = MagicMock(kv_list=MagicMock(return_value={"train": items}))
++        monkeypatch.setattr(trainer_base, "tq", tq)
++        monkeypatch.setattr(trainer_base.tu, "assign_non_tensor_data", MagicMock())
++        trainer = SimpleNamespace(trainer_mode="separate_async", global_steps=7, agent_loop_manager=MagicMock())
++        reissued = PPOTrainer._reissue_inflight_prompts(trainer)
++        return reissued, {key for call in tq.kv_clear.call_args_list for key in call.kwargs["keys"]}
++
++    return run
++
++
++def test_consumed_rows_are_dropped_and_the_finished_groups_kept(restore):
++    items = {
++        "fin": {"is_prompt": True, "status": "finished", "global_steps": 6},
++        "fin_0_0": {"status": "success"},
++        "run": {"is_prompt": True, "status": "running", "global_steps": 6},
++        "old_0_0": {},
++        "pad_0_0": {"is_padding": True},  # the batch trained before the checkpoint, prompt keys gone
++    }
++    assert restore(items) == (1, {"old_0_0", "pad_0_0"})
++
++
++def test_without_inflight_prompts(restore):
++    items = {"fin": {"is_prompt": True, "status": "finished", "global_steps": 6}, "fin_0_0": {}, "old_0_0": {}}
++    assert restore(items) == (0, {"old_0_0"})
+diff --git a/verl/trainer/ppo/v1/trainer_base.py b/verl/trainer/ppo/v1/trainer_base.py
+index 71e428d57a21fab503462a63c1f4b10605a43911..58ef450407ea8d49df1e264e101bc6bf9d0eb08a 100644
+--- a/verl/trainer/ppo/v1/trainer_base.py
++++ b/verl/trainer/ppo/v1/trainer_base.py
+@@ -922,6 +922,17 @@ class PPOTrainer(ABC):
+         if not data:
+             return 0
+         items = data.get(partition_id, {})
++        # trajectories whose prompt key is gone were consumed by a step before the checkpoint (the queue is saved
++        # before that step's kv_clear): nothing samples or clears them after a restore, they only accumulate
++        prompt_uids = {key for key, tag in items.items() if tag.get("is_prompt", False)}
++        orphan_keys = [
++            key
++            for key, tag in items.items()
++            if not tag.get("is_prompt", False) and key.split("_", 1)[0] not in prompt_uids
++        ]
++        if orphan_keys:
++            tq.kv_clear(keys=orphan_keys, partition_id=partition_id)
++            logger.info(f"Dropped {len(orphan_keys)} consumed trajectories restored with the transfer queue")
+         inflight_uids = [
+             key
+             for key, tag in items.items()

@@ -1,0 +1,7 @@
+valid: {"arm": {"pitch": 0.0, "roll": 0.0, "x": 0.0, "y": 0.0, "z": 0.3}, "gripper": {"width": 0.0}, "type": "single_arm_delta"}
+missing part: ValueError: Expected exactly the parts arm, gripper
+text after the block: ValueError: Final answer must end with a fenced json action
+non-number: ValueError: Action quantities must be finite numbers, not booleans
+thinking block: ValueError: Final answer unexpectedly contains a thinking block
+duplicate field: ValueError: Duplicate action field: x
+no block: ValueError: Final answer must end with a fenced json action

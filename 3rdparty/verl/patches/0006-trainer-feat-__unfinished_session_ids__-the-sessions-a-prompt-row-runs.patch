@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [trainer] feat: __unfinished_session_ids__, the sessions a
+ prompt row runs
+
+AgentLoopWorkerTQ runs the session ids a prompt row carries under __unfinished_session_ids__ instead of all
+rollout.n of them, a per-prompt key like __rollout_n__ and __do_sample__. Hook for the PEAR-specific resume, which
+re-issues a restored group with the sessions it had not stored.
+---
+ .../ppo/v1/test_agent_loop_tq_on_cpu.py       | 59 +++++++++++++++++++
+ verl/trainer/ppo/v1/agent_loop_tq.py          |  4 +-
+ 2 files changed, 62 insertions(+), 1 deletion(-)
+
+diff --git a/tests/trainer/ppo/v1/test_agent_loop_tq_on_cpu.py b/tests/trainer/ppo/v1/test_agent_loop_tq_on_cpu.py
+index 1900194cfb5d066c318efea62662ea7533319582..6be2ccca6b3d076625e0d0a5a96d6c1b8f01dc83 100644
+--- a/tests/trainer/ppo/v1/test_agent_loop_tq_on_cpu.py
++++ b/tests/trainer/ppo/v1/test_agent_loop_tq_on_cpu.py
+@@ -14,6 +14,8 @@
+ 
+ import asyncio
+ 
++import torch
++
+ from verl.trainer.ppo.v1.agent_loop_tq import _settle_session_tasks
+ 
+ 
+@@ -37,3 +39,60 @@ def test_settle_session_tasks_waits_for_siblings_after_failure():
+         assert isinstance(errors[0], RuntimeError)
+ 
+     asyncio.run(run())
++
++
++def test_a_restored_group_runs_only_its_unfinished_sessions(monkeypatch):
++    """A row with __unfinished_session_ids__ (a group restored from a checkpoint) runs exactly those sessions; a row
++    without runs rollout.n of them; each group then reports finished."""
++    from omegaconf import OmegaConf
++    from tensordict import TensorDict
++
++    from verl.trainer.ppo.v1 import agent_loop_tq
++    from verl.trainer.ppo.v1.agent_loop_tq import AgentLoopWorkerTQ
++    from verl.utils import tensordict_utils as tu
++
++    statuses, sessions = [], []
++
++    async def async_kv_put(*, key, partition_id, tag):
++        statuses.append((key, tag["status"]))
++
++    async def run_agent_loop(sampling_params, *, trajectory, trace, session_id, **prompt):
++        sessions.append((prompt["uid"], prompt["global_steps"], session_id))
++
++    monkeypatch.setattr(agent_loop_tq.tq, "async_kv_put", async_kv_put)
++    worker_class = AgentLoopWorkerTQ.__ray_metadata__.modified_class
++    worker = worker_class.__new__(worker_class)
++    worker.config = OmegaConf.create(
++        {
++            "actor_rollout_ref": {
++                "rollout": {
++                    "n": 4,
++                    "val_kwargs": {"n": 1},
++                    "temperature": 1.0,
++                    "top_p": 1.0,
++                    "top_k": -1,
++                    "calculate_log_probs": False,
++                    "agent": {"default_agent_loop": "tool_agent"},
++                }
++            }
++        }
++    )
++    worker.background_tasks = set()
++    worker._run_agent_loop = run_agent_loop
++    restored = TensorDict({"index": torch.tensor([0, 1])}, batch_size=2)
++    tu.assign_non_tensor_stack(restored, "uid", ["a", "b"])
++    tu.assign_non_tensor_stack(restored, "__unfinished_session_ids__", [[1, 3], [0]])
++    tu.assign_non_tensor_data(restored, "global_steps", 5)
++    fresh = TensorDict({"index": torch.tensor([2])}, batch_size=1)
++    tu.assign_non_tensor_stack(fresh, "uid", ["c"])
++    tu.assign_non_tensor_data(fresh, "global_steps", 7)
++
++    async def run():
++        for batch in (restored, fresh):
++            await worker.generate_sequences(batch)
++        await asyncio.gather(*worker.background_tasks)
++
++    asyncio.run(run())
++
++    assert sorted(sessions) == [("a", 5, 1), ("a", 5, 3), ("b", 5, 0)] + [("c", 7, i) for i in range(4)]
++    assert sorted(statuses) == sorted([(uid, "running") for uid in "abc"] + [(uid, "finished") for uid in "abc"])
+diff --git a/verl/trainer/ppo/v1/agent_loop_tq.py b/verl/trainer/ppo/v1/agent_loop_tq.py
+index 05f5604315f5d4902353caaffd0c36cb3129806c..f950698f31aca0ceac57863afbbd79c18eb044c0 100644
+--- a/verl/trainer/ppo/v1/agent_loop_tq.py
++++ b/verl/trainer/ppo/v1/agent_loop_tq.py
+@@ -113,6 +113,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
+             # NOTE: user can dynamically adjust n for each sample here, e.g according to task difficulty.
+             config = self.config.actor_rollout_ref.rollout
+             n = prompt.pop("__rollout_n__", config.n if not trajectory["validate"] else config.val_kwargs.n)
++            # a group restored from a checkpoint runs only the sessions it had not stored
++            unfinished_session_ids = prompt.pop("__unfinished_session_ids__", range(n))
+             do_sample = prompt.pop("__do_sample__", True)
+ 
+             run_sampling_params = dict(sampling_params)
+@@ -120,7 +122,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
+                 apply_greedy_sampling_params(run_sampling_params)
+ 
+             tasks = []
+-            for i in range(n):
++            for i in unfinished_session_ids:
+                 task = asyncio.create_task(
+                     self._run_agent_loop(
+                         run_sampling_params, trajectory=trajectory, trace=trace, session_id=i, **prompt

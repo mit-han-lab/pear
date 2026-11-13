@@ -1,0 +1,3 @@
+- agentview: a fixed camera; the robot's base is at the top of its image, +x points toward the bottom of the image and +y toward its left.
+- wrist: a camera on the gripper; with the gripper pointing straight down at yaw 0, +x points toward the top of its image and +y toward its right.
+- the episode ends by itself as soon as the task is done: while observations keep coming, the task is not done yet.

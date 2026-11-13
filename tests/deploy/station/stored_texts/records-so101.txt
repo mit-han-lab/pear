@@ -1,0 +1,273 @@
+{
+ "<hex>/<turn>-observation.json": [
+  "captured_monotonic_s",
+  "image_uuids",
+  "images",
+  "observation_id",
+  "previous_result",
+  "state",
+  "text",
+  "turn_id"
+ ],
+ "<hex>/<turn>-output.json": [
+  "answer",
+  "reasoning",
+  "reasoning_kind",
+  "usage"
+ ],
+ "<hex>/<turn>-result.json": [
+  "dispatched",
+  "error",
+  "gripper_outcome",
+  "measured_position",
+  "measured_state",
+  "reached",
+  "settled",
+  "status",
+  "tracking_error",
+  "turn_id"
+ ],
+ "<hex>/<turn>-wrist.jpg": ".jpg",
+ "<hex>/events.jsonl": {
+  "action": {
+   "data": [
+    "arm",
+    "attempt",
+    "episode_id",
+    "gripper",
+    "phase",
+    "started_at",
+    "turn_number",
+    "type"
+   ],
+   "event": [
+    "data",
+    "id",
+    "monotonic_s",
+    "task_id",
+    "time",
+    "type"
+   ]
+  },
+  "answer_delta": {
+   "data": [
+    "attempt",
+    "episode_id",
+    "phase",
+    "started_at",
+    "text",
+    "turn_number"
+   ],
+   "event": [
+    "data",
+    "id",
+    "monotonic_s",
+    "task_id",
+    "time",
+    "type"
+   ]
+  },
+  "execution": {
+   "data": [
+    "attempt",
+    "episode_id",
+    "error",
+    "gripper_outcome",
+    "measured_position",
+    "measured_state",
+    "phase",
+    "reached",
+    "settled",
+    "started_at",
+    "status",
+    "tracking_error",
+    "turn_number"
+   ],
+   "event": [
+    "data",
+    "id",
+    "monotonic_s",
+    "task_id",
+    "time",
+    "type"
+   ]
+  },
+  "model_output": {
+   "data": [
+    "answer",
+    "attempt",
+    "episode_id",
+    "phase",
+    "reasoning",
+    "reasoning_kind",
+    "started_at",
+    "turn_number",
+    "usage"
+   ],
+   "event": [
+    "data",
+    "id",
+    "monotonic_s",
+    "task_id",
+    "time",
+    "type"
+   ]
+  },
+  "observation": {
+   "data": [
+    "attempt",
+    "captured_monotonic_s",
+    "details_url",
+    "episode_id",
+    "image_uuids",
+    "images",
+    "observation_id",
+    "phase",
+    "previous_result",
+    "started_at",
+    "state",
+    "text",
+    "turn_id",
+    "turn_number"
+   ],
+   "event": [
+    "data",
+    "id",
+    "monotonic_s",
+    "task_id",
+    "time",
+    "type"
+   ]
+  },
+  "phase": {
+   "data": [
+    "attempt",
+    "episode_id",
+    "phase",
+    "started_at",
+    "turn_number"
+   ],
+   "event": [
+    "data",
+    "id",
+    "monotonic_s",
+    "task_id",
+    "time",
+    "type"
+   ]
+  },
+  "reasoning_delta": {
+   "data": [
+    "attempt",
+    "episode_id",
+    "phase",
+    "reasoning_kind",
+    "simulated",
+    "started_at",
+    "text",
+    "turn_number"
+   ],
+   "event": [
+    "data",
+    "id",
+    "monotonic_s",
+    "task_id",
+    "time",
+    "type"
+   ]
+  },
+  "session": {
+   "data": [
+    "episode_id",
+    "message"
+   ],
+   "event": [
+    "data",
+    "id",
+    "monotonic_s",
+    "task_id",
+    "time",
+    "type"
+   ]
+  },
+  "task": {
+   "data": [
+    "created",
+    "id",
+    "images",
+    "instruction",
+    "model",
+    "model_label"
+   ],
+   "event": [
+    "data",
+    "id",
+    "monotonic_s",
+    "task_id",
+    "time",
+    "type"
+   ]
+  },
+  "task_end": {
+   "data": [
+    "message"
+   ],
+   "event": [
+    "data",
+    "id",
+    "monotonic_s",
+    "task_id",
+    "time",
+    "type"
+   ]
+  },
+  "turn_started": {
+   "data": [
+    "attempt",
+    "episode_id",
+    "phase",
+    "started_at",
+    "turn_number"
+   ],
+   "event": [
+    "data",
+    "id",
+    "monotonic_s",
+    "task_id",
+    "time",
+    "type"
+   ]
+  }
+ },
+ "<hex>/session.json": [
+  "action_format",
+  "episode_id",
+  "model",
+  "system_prompt"
+ ],
+ "<hex>/task.json": [
+  "created",
+  "id",
+  "images",
+  "instruction",
+  "model",
+  "model_label"
+ ],
+ "home-<count>.json": [
+  "after",
+  "before",
+  "phases",
+  "plan",
+  "results"
+ ],
+ "home-plan-<count>.json": [
+  "goal_target",
+  "initial_target",
+  "open_gripper",
+  "opening_seconds_estimate",
+  "operation_seconds_estimate",
+  "plan_id",
+  "start_target",
+  "trajectory_seconds"
+ ]
+}

@@ -1,0 +1,151 @@
+.camera {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  overflow: hidden;
+  box-shadow: 0 3px 8px var(--shadow-camera);
+}
+.camera-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 15px;
+  font-size: 12px;
+  font-weight: 580;
+}
+.camera-head > span {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.camera-head svg {
+  color: var(--text-muted);
+}
+.camera-live {
+  font-size: 8px;
+  letter-spacing: 1px;
+  color: var(--live-text);
+}
+.camera-live i {
+  background: var(--live);
+  width: 5px;
+  height: 5px;
+}
+.camera-live.stale {
+  color: var(--stale-text);
+}
+.camera-live.stale i {
+  background: var(--stale-dot);
+}
+.camera-image {
+  position: relative;
+  aspect-ratio: 4/3;
+  background: var(--camera-well);
+  max-height: 340px;
+  overflow: hidden;
+}
+.camera-image > img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+.camera-cross {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 15px;
+  height: 15px;
+  border: 1px solid var(--camera-cross);
+  border-radius: 50%;
+  pointer-events: none;
+}
+.camera-footer {
+  position: absolute;
+  bottom: 0;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 9px 12px;
+  background: linear-gradient(transparent, var(--camera-shade));
+  color: var(--on-solid);
+  font-size: 9px;
+  letter-spacing: 0.3px;
+}
+.camera-footer button {
+  background: var(--glass);
+  border: 1px solid var(--glass-border);
+  color: var(--on-solid);
+  border-radius: 5px;
+  padding: 5px;
+}
+.signal-overlay {
+  position: absolute;
+  inset: 0;
+  background: var(--signal-veil);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--text-quiet);
+  padding: 20px;
+  text-align: center;
+}
+.camera.large {
+  width: min(100%, 1000px);
+}
+.camera.large .camera-image {
+  max-height: 70vh;
+}
+@media (min-width: 1500px) {
+  .camera-image {
+    max-height: 360px;
+  }
+}
+@media (max-width: 1050px) {
+  .camera-head {
+    padding: 11px 10px;
+    font-size: 10px;
+  }
+  .camera-live {
+    font-size: 7px;
+  }
+}
+@media (max-width: 760px) {
+  .camera-head {
+    font-size: 9px;
+    padding: 9px 7px;
+  }
+  .camera-head svg,
+  .camera-live,
+  .camera-footer span {
+    display: none;
+  }
+  .camera-footer {
+    padding: 5px;
+  }
+  .camera-footer button {
+    padding: 3px;
+    margin-left: auto;
+  }
+  .camera-image {
+    aspect-ratio: 4/3;
+  }
+}
+@media (min-width: 1000px) {
+  .camera-head {
+    padding: 10px 13px;
+  }
+  .camera-grid .camera-image {
+    height: clamp(130px, 21vh, 240px);
+    max-height: none;
+    aspect-ratio: auto;
+  }
+  .single-camera .camera-grid .camera:not(.arm-state) .camera-image {
+    height: clamp(140px, 22vh, 280px);
+    aspect-ratio: 4/3;
+  }
+}

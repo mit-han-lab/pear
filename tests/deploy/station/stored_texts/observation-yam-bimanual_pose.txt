@@ -1,0 +1,10 @@
+{"left_arm": {"x": 25.8, "y": 30.6, "z": 17.9, "roll": -1.57, "pitch": 0.0, "yaw": 1.57}, "right_arm": {"x": 25.8, "y": -30.4, "z": 17.9, "roll": -1.57, "pitch": 0.0, "yaw": 1.57}, "left_gripper": {"width": 4.8}, "right_gripper": {"width": 4.8}}
+
+The current camera frames follow. End your response with one json block containing the next action.
+--- images: head turn-1-head.jpg, left_wrist turn-1-left_wrist.jpg, right_wrist turn-1-right_wrist.jpg
+--- with feedback:
+{"left_arm": {"x": 25.8, "y": 30.6, "z": 17.9, "roll": -1.57, "pitch": 0.0, "yaw": 1.57}, "right_arm": {"x": 25.8, "y": -30.4, "z": 17.9, "roll": -1.57, "pitch": 0.0, "yaw": 1.57}, "left_gripper": {"width": 4.8}, "right_gripper": {"width": 4.8}}
+
+The current camera frames follow. End your response with one json block containing the next action.
+
+Previous execution: an earlier execution report

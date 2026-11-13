@@ -1,0 +1,60 @@
+{
+  "turn_id": "e1f3cbbb02fc",
+  "observation_id": "59390f96-5197-49b8-bda8-0a01d44622ad",
+  "captured_monotonic_s": 149593.459065284,
+  "state": {
+    "arm": {
+      "x": 39.1,
+      "y": 0.0,
+      "z": 22.9,
+      "pitch": 0.0,
+      "roll": -0.05
+    },
+    "gripper": {
+      "width": 6.0
+    }
+  },
+  "text": "{\"arm\": {\"x\": 39.1, \"y\": 0.0, \"z\": 22.9, \"pitch\": 0.0, \"roll\": -0.05}, \"gripper\": {\"width\": 6.0}}\n\nThe current camera frame follows. End your response with one json block containing the next action.\n\nPrevious execution: {\"status\": \"completed\", \"execution_requested\": true, \"settled\": true, \"reached\": true} Use the new measured observation.",
+  "images": {
+    "wrist": "records/62b443a96da4497f8277f72aeea71a94/e1f3cbbb02fc-wrist.jpg"
+  },
+  "image_uuids": {
+    "wrist": "35d08468-46bb-479a-b6df-d3dd6b61523e"
+  },
+  "previous_result": {
+    "status": "completed",
+    "settled": true,
+    "reached": true,
+    "measured_position": [
+      7.864238999599153e-05,
+      0.0013450287539270008,
+      -0.0238753390661897,
+      0.02253031007791365,
+      -2.1912642726037537e-07,
+      1.0
+    ],
+    "tracking_error": [
+      -1.3552527156068805e-20,
+      0.0,
+      -3.469446951953614e-18,
+      3.469446951953614e-18,
+      -5.293955920339377e-23,
+      0.0
+    ],
+    "measured_state": {
+      "arm": {
+        "x": 39.1,
+        "y": 0.0,
+        "z": 22.9,
+        "pitch": 0.0,
+        "roll": -0.05
+      },
+      "gripper": {
+        "width": 6.0
+      }
+    },
+    "gripper_outcome": null,
+    "error": null,
+    "adjusted": null
+  }
+}

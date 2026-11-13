@@ -1,0 +1,83 @@
+name: Station tests
+
+# The robot station (pear/deploy/station): its tests on stand-in hardware, in the environment of its install target,
+# and its page's bundle against the page's sources. They run when the station, what it imports of the rest of PEAR or
+# its install target changes, and on main.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      - "pear/deploy/station/**"
+      - "pear/agent_loop/protocol.py"
+      - "pear/configs/station.yaml"
+      - "pear/utils/**"
+      - "tests/deploy/station/**"
+      - "tests/*.py"
+      - "scripts/install.sh"
+      - "scripts/install/common.sh"
+      - "scripts/install/download.sh"
+      - "scripts/install/versions.env"
+      - "scripts/install/station/**"
+      - "pyproject.toml"
+      - ".github/workflows/station.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# bash with -e and pipefail: a step ends at the first command that fails, inside a pipeline too
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  tests:
+    name: The station's tests, on stand-in hardware
+    # an Ubuntu release the pinned Playwright installs Chrome and its libraries on; it refuses releases it does not know
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: The station's environment and the installer's uv, from the cache when the installer and its pins are unchanged
+        id: cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ${{ runner.temp }}/pear/bin
+            ${{ runner.temp }}/pear/envs
+          key: station-env-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/install.sh', 'scripts/install/station/**', 'scripts/install/common.sh', 'scripts/install/download.sh', 'scripts/install/versions.env', 'pyproject.toml') }}
+      - name: Install it otherwise
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          WORK_DIR: ${{ runner.temp }}/pear
+        run: bash scripts/install.sh station
+      # the machine's library the RealSense binding loads, which the install target names
+      - run: sudo apt-get update && sudo apt-get install --yes libusb-1.0-0
+      # the browser the page's tests drive, with the machine's libraries it loads: Google Chrome, whose codecs play the
+      # recordings' H.264
+      - run: $RUNNER_TEMP/pear/envs/station/bin/python -m playwright install --with-deps chrome
+      # the station's tests: the directory the training environment's runners leave out
+      - run: $RUNNER_TEMP/pear/envs/station/bin/python -m pytest tests/deploy/station
+
+  bundle:
+    name: The page's bundle is the build of its sources
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: pear/deploy/station/gui/page
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: pear/deploy/station/gui/page/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run check-bundle

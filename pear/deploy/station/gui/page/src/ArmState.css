@@ -1,0 +1,51 @@
+.arm-state-body {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 20px;
+  padding: 6px 15px 14px;
+}
+.arm-state h3 {
+  font-size: 8px;
+  letter-spacing: 1.2px;
+  font-weight: 700;
+  color: var(--text-muted);
+  margin: 0 0 9px;
+  text-transform: uppercase;
+}
+.arm-state dl {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px 12px;
+  margin: 0;
+  font-size: 11px;
+  max-width: 240px;
+}
+.arm-state dt {
+  color: var(--text-muted);
+}
+.arm-state dd {
+  margin: 0;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+}
+.arm-state p {
+  font-size: 11px;
+  color: var(--text-hint);
+  margin: 0;
+}
+.format-badge {
+  font-size: 9px;
+  letter-spacing: 0.5px;
+  background: var(--soft);
+  color: var(--teal);
+  border-radius: 4px;
+  padding: 3px 7px;
+  font-weight: 650;
+}
+@media (max-width: 760px) {
+  .arm-state-body {
+    gap: 12px;
+    padding: 4px 10px 10px;
+  }
+}

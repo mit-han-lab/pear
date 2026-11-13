@@ -1,0 +1,10 @@
+# Tool config for actor_rollout_ref.rollout.multi_turn.tool_config_path: the LIBERO-plus environment family (its
+# conversation and its servers); the config dict reaches EnvironmentTool. Its variables are resolved by OmegaConf when
+# the file is loaded.
+tools:
+  - class_name: pear.envs.tool.EnvironmentTool
+    config:
+      type: native
+      env_class: pear.envs.libero_plus.env.LiberoPlusEnv  # the family: its facts and its simulator
+      # its servers: one per slot the rollout machines offer as libero (scripts/start_ray_node.sh)
+      log_dir: ${oc.env:PEAR_LOG_DIR}                     # the servers' logs and the tool's call log (the recipe: $RUN/sim)

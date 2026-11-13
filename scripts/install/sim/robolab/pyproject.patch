@@ -1,0 +1,31 @@
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -47,6 +47,10 @@
+     "fastapi",
+     "uvicorn[standard]",
+     "jinja2",
++    # PEAR: the NVRTC that compiles Isaac Lab's scripted math for a GB300, which the Apps preload (torch's own cannot),
++    # and triton by name, so that its source below applies: a source is taken for a direct dependency only
++    "nvidia-cuda-nvrtc-cu12==12.9.86; sys_platform == 'linux'",
++    "triton; sys_platform == 'linux'",
+ ]
+ 
+ [project.optional-dependencies]
+@@ -91,7 +95,7 @@
+ # which headless eval never touches, and the benchmark runs routinely on
+ # isaac50 with websockets 16. Override the pin so the lock resolves a modern
+ # websockets for the policy clients instead of being dragged down to 12.0.
+-override-dependencies = ["websockets>=14.0"]
++override-dependencies = ["websockets>=14.0", "nvidia-cuda-nvrtc-cu12==12.9.86"]
+ # warp-lang 1.13.0.dev20260418 on pypi.nvidia.com only published the macOS
+ # wheel — no Linux build — so any resolver pass that picked it would break
+ # `uv sync` on Linux. Exclude that specific version.
+@@ -116,6 +120,8 @@
+ [tool.uv.sources]
+ torch = { index = "pytorch-cu128" }
+ torchvision = { index = "pytorch-cu128" }
++# PEAR: only the PyTorch index carries the aarch64 wheels of the triton torch requires
++triton = { index = "pytorch-cu128" }
+ 
+ [tool.pytest.ini_options]
+ testpaths = ["tests"]

@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [ckpt] fix: max_ckpt_to_keep covers the checkpoints saved
+ before a resume
+
+The checkpoint manager's list of saved checkpoints starts empty in every process, so a resumed run never
+pruned the checkpoints an earlier process saved. FSDPCheckpointManager.load_checkpoint now registers the
+global_step_<k> siblings of the checkpoint it loads, up to the loaded step.
+---
+ ...heckpoint_retention_after_resume_on_cpu.py | 37 +++++++++++++++++++
+ verl/utils/checkpoint/checkpoint_manager.py   | 17 +++++++++
+ .../checkpoint/fsdp_checkpoint_manager.py     |  1 +
+ 3 files changed, 55 insertions(+)
+ create mode 100644 tests/trainer/ppo/v1/test_checkpoint_retention_after_resume_on_cpu.py
+
+diff --git a/tests/trainer/ppo/v1/test_checkpoint_retention_after_resume_on_cpu.py b/tests/trainer/ppo/v1/test_checkpoint_retention_after_resume_on_cpu.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3efb62087cd2bf21b2bdcbce31c0d0ee8edfba47
+--- /dev/null
++++ b/tests/trainer/ppo/v1/test_checkpoint_retention_after_resume_on_cpu.py
+@@ -0,0 +1,37 @@
++import os
++
++import pytest
++
++from verl.utils.checkpoint.checkpoint_manager import BaseCheckpointManager
++
++
++@pytest.fixture
++def manager():
++    manager = BaseCheckpointManager.__new__(BaseCheckpointManager)  # only the retention bookkeeping is exercised
++    manager.previous_saved_paths = []
++    return manager
++
++
++@pytest.fixture
++def make_step(tmp_path):
++    def make(step, actor=True):
++        folder = os.path.join(tmp_path, f"global_step_{step}")
++        os.makedirs(os.path.join(folder, "actor") if actor else folder)
++        open(os.path.join(folder, "data.pt"), "w").close()
++        return folder
++
++    return make
++
++
++def test_resume_registers_the_older_siblings_in_order(tmp_path, manager, make_step):
++    for step in (3, 1, 2, 5):
++        make_step(step)
++    manager.register_existing_checkpoints(os.path.join(tmp_path, "global_step_3", "actor"))
++    assert manager.previous_saved_paths == [
++        os.path.join(tmp_path, f"global_step_{step}", "actor") for step in (1, 2, 3)
++    ]
++
++
++def test_resume_ignores_paths_outside_the_step_layout(tmp_path, manager):
++    manager.register_existing_checkpoints(os.path.join(tmp_path, "somewhere", "actor"))
++    assert manager.previous_saved_paths == []
+diff --git a/verl/utils/checkpoint/checkpoint_manager.py b/verl/utils/checkpoint/checkpoint_manager.py
+index f3f6219306e65749abde988d62217c793ad20467..bb3266173ea11e1e5498ef6dfed249abf52e6ca7 100644
+--- a/verl/utils/checkpoint/checkpoint_manager.py
++++ b/verl/utils/checkpoint/checkpoint_manager.py
+@@ -148,6 +148,23 @@ class BaseCheckpointManager:
+     ):
+         raise NotImplementedError
+ 
++    def register_existing_checkpoints(self, local_path: str) -> None:
++        """On resume: track the checkpoints an earlier process saved, so the next save applies max_ckpt_to_keep to
++        them too."""
++        step_dir, name = os.path.split(os.path.normpath(local_path))  # <root>/global_step_<k>/<name>
++        root, step_name = os.path.split(step_dir)
++        if not step_name.startswith("global_step_"):
++            return
++        loaded_step = int(step_name.rsplit("_", 1)[1])
++        steps = [
++            int(d.rsplit("_", 1)[1])
++            for d in os.listdir(root)
++            if d.startswith("global_step_") and os.path.isdir(os.path.join(root, d, name))
++        ]
++        self.previous_saved_paths = [
++            os.path.join(root, f"global_step_{s}", name) for s in sorted(steps) if s <= loaded_step
++        ]
++
+     @staticmethod
+     def checkpath(local_path: str, hdfs_path: str):
+         assert local_path is not None or hdfs_path is not None, "local_path and hdfs_path cannot be both None"
+diff --git a/verl/utils/checkpoint/fsdp_checkpoint_manager.py b/verl/utils/checkpoint/fsdp_checkpoint_manager.py
+index 4ebe81973602d0a24b160823a94b57fc840705fa..102dd27695e07840b256ed064e2c30f0d5d35cee 100644
+--- a/verl/utils/checkpoint/fsdp_checkpoint_manager.py
++++ b/verl/utils/checkpoint/fsdp_checkpoint_manager.py
+@@ -188,6 +188,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
+         """
+         if local_path is None:
+             return
++        self.register_existing_checkpoints(local_path)
+ 
+         # check if the checkpoint_load_contents is valid
+         if self.should_load_model:

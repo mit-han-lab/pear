@@ -1,0 +1,164 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [fsdp] feat: hsdp_all_reduce_on_last_micro_batch, HSDP's
+ replica all-reduce once per update
+
+With FSDP2 on a 2D mesh and gradient sync on every micro-batch, fsdp_config.hsdp_all_reduce_on_last_micro_batch
+all-reduces the gradients across the replicas on the final micro-batch only; every micro-batch still
+reduce-scatters within its shard group. Off by default.
+---
+ ..._fsdp_gradient_accumulation_sync_on_cpu.py | 21 ++++++++++++++++++
+ .../config/_generated_ppo_trainer.yaml        |  3 +++
+ verl/trainer/config/engine/fsdp.yaml          |  4 ++++
+ verl/workers/config/engine.py                 |  4 ++++
+ verl/workers/engine/fsdp/transformer_impl.py  | 22 ++++++++++++++++++-
+ 5 files changed, 53 insertions(+), 1 deletion(-)
+
+diff --git a/tests/workers/test_fsdp_gradient_accumulation_sync_on_cpu.py b/tests/workers/test_fsdp_gradient_accumulation_sync_on_cpu.py
+index bb5c1896c5da15fbe31b3761a31acbb6a40dda9d..00ded8ae85938157c5d7ba6203a30d3d37e7cd9a 100644
+--- a/tests/workers/test_fsdp_gradient_accumulation_sync_on_cpu.py
++++ b/tests/workers/test_fsdp_gradient_accumulation_sync_on_cpu.py
+@@ -49,6 +49,11 @@ class _FSDP2Module:
+         self.events.append(enabled)
+ 
+ 
++class _HSDPModule(_FSDP2Module):
++    def set_requires_all_reduce(self, enabled):
++        self.events.append(("all_reduce", enabled))
++
++
+ def _make_engine(module, *, use_no_sync_for_gradient_accumulation=True):
+     engine = object.__new__(FSDPEngine)
+     engine.module = module
+@@ -106,6 +111,22 @@ def test_gradient_sync_context_keeps_sync_when_disabled(monkeypatch, version, mo
+     assert module.events == ["backward"]
+ 
+ 
++@pytest.mark.parametrize("enabled", [True, False])
++def test_gradient_sync_context_hsdp_all_reduces_on_the_last_micro_batch_only(monkeypatch, enabled):
++    module = _HSDPModule()
++    engine = _make_engine(module, use_no_sync_for_gradient_accumulation=False)
++    engine.engine_config.hsdp_all_reduce_on_last_micro_batch = enabled
++    engine.device_mesh = SimpleNamespace(ndim=2)
++    monkeypatch.setattr(transformer_impl, "fsdp_version", lambda _: 2)
++
++    for is_last_micro_batch in (False, True):
++        with engine._gradient_sync_context(is_last_micro_batch=is_last_micro_batch):
++            module.events.append("backward")
++
++    expected = [("all_reduce", False), "backward", ("all_reduce", True), "backward"] if enabled else ["backward"] * 2
++    assert module.events == expected
++
++
+ @pytest.mark.parametrize("version,module_cls", [(1, _FSDP1Module), (2, _FSDP2Module)])
+ def test_gradient_sync_context_defaults_to_deferred_sync_for_legacy_config(
+     monkeypatch,
+diff --git a/verl/trainer/config/_generated_ppo_trainer.yaml b/verl/trainer/config/_generated_ppo_trainer.yaml
+index ef206c3032e1ade3796c5c3eef43284369f7c127..64e349eeac25be6bc99acf93a45d5fa231bd57d3 100644
+--- a/verl/trainer/config/_generated_ppo_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_trainer.yaml
+@@ -45,6 +45,7 @@ actor_rollout_ref:
+       use_torch_compile: true
+       entropy_checkpointing: ${oc.select:actor_rollout_ref.actor.entropy_checkpointing,False}
+       use_no_sync_for_gradient_accumulation: false
++      hsdp_all_reduce_on_last_micro_batch: false
+       pad_to_length: ${oc.select:actor_rollout_ref.actor.pad_to_length,False}
+       pad_to_length_bucket: 1024
+       forward_only: false
+@@ -254,6 +255,7 @@ actor_rollout_ref:
+       use_torch_compile: true
+       entropy_checkpointing: ${oc.select:actor_rollout_ref.ref.entropy_checkpointing,False}
+       use_no_sync_for_gradient_accumulation: false
++      hsdp_all_reduce_on_last_micro_batch: false
+       pad_to_length: ${oc.select:actor_rollout_ref.ref.pad_to_length,False}
+       pad_to_length_bucket: ${oc.select:actor_rollout_ref.actor.fsdp_config.pad_to_length_bucket,1024}
+       forward_only: true
+@@ -576,6 +578,7 @@ critic:
+     use_torch_compile: true
+     entropy_checkpointing: false
+     use_no_sync_for_gradient_accumulation: false
++    hsdp_all_reduce_on_last_micro_batch: false
+     pad_to_length: false
+     pad_to_length_bucket: 1024
+     forward_only: false
+diff --git a/verl/trainer/config/engine/fsdp.yaml b/verl/trainer/config/engine/fsdp.yaml
+index 5ee909ace0619e92fe88e0cea9038130d69b4419..c1450dab05b6b807b39bd3495f485bf7febad923 100644
+--- a/verl/trainer/config/engine/fsdp.yaml
++++ b/verl/trainer/config/engine/fsdp.yaml
+@@ -63,6 +63,10 @@ entropy_checkpointing: false
+ # from retaining unsharded gradients outweighs the communication savings.
+ use_no_sync_for_gradient_accumulation: false
+ 
++# With HSDP (fsdp_size below the number of GPUs) and without the deferral above: all-reduce the gradients across the
++# replicas on the final micro-batch only, while every micro-batch still reduce-scatters within its shard group.
++hsdp_all_reduce_on_last_micro_batch: false
++
+ # Round every packed micro-batch up to a multiple of `pad_to_length_bucket` tokens, so the packed
+ # shape only takes a few distinct values instead of a new one per micro-batch (avoids kernel
+ # recompilation / re-autotuning). Requires use_remove_padding=True. Pad tokens are stripped before
+diff --git a/verl/workers/config/engine.py b/verl/workers/config/engine.py
+index e9f535b036b3f1bb9db56cd6dbc8869ead0b7ec1..a323cf10348bbf929d7a4a6a13461b0ae2945bfc 100644
+--- a/verl/workers/config/engine.py
++++ b/verl/workers/config/engine.py
+@@ -263,6 +263,9 @@ class FSDPEngineConfig(EngineConfig):
+         use_no_sync_for_gradient_accumulation (bool): Whether to defer FSDP gradient synchronization until the
+             final micro-batch. Disabling this reduces peak memory by synchronizing and resharding gradients after
+             every micro-batch. default True
++        hsdp_all_reduce_on_last_micro_batch (bool): With HSDP (FSDP2 on a 2D mesh) and without
++            ``use_no_sync_for_gradient_accumulation``: all-reduce the gradients across the replicas on the final
++            micro-batch only; every micro-batch still reduce-scatters within its shard group. default False
+         pad_to_length (bool): Round every packed micro-batch up to a multiple of
+             ``pad_to_length_bucket`` tokens, so the packed shape only takes a handful of distinct
+             values instead of a new one per micro-batch, which avoids repeated kernel
+@@ -297,6 +300,7 @@ class FSDPEngineConfig(EngineConfig):
+     use_torch_compile: bool = True
+     entropy_checkpointing: bool = False
+     use_no_sync_for_gradient_accumulation: bool = True
++    hsdp_all_reduce_on_last_micro_batch: bool = False
+     strategy: str = "fsdp"
+     pad_to_length: bool = False
+     pad_to_length_bucket: int = 1024
+diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
+index 0830123aefdb7ea8be86f5a1f645794754a510ad..20df342c9beaaa2185ce32f9ef9b3bee68840562 100644
+--- a/verl/workers/engine/fsdp/transformer_impl.py
++++ b/verl/workers/engine/fsdp/transformer_impl.py
+@@ -698,17 +698,37 @@ class FSDPEngine(BaseEngine):
+         reduces FSDP gradient collectives from one reduce-scatter per
+         micro-batch to a single round, at the cost of temporarily retaining
+         unsharded gradients until the final backward.
++
++        With ``hsdp_all_reduce_on_last_micro_batch`` and without that deferral,
++        HSDP (FSDP2 on a 2D mesh) still reduce-scatters every micro-batch's
++        gradients within its shard group but all-reduces them across the
++        replicas on the final micro-batch only.
+         """
+         defer_sync = getattr(
+             self.engine_config,
+             "use_no_sync_for_gradient_accumulation",
+             True,
+         )
+-        if is_last_micro_batch or not defer_sync:
++        if is_last_micro_batch:
+             yield
+             return
+ 
+         version = fsdp_version(self.module)
++        if not defer_sync:
++            if (
++                getattr(self.engine_config, "hsdp_all_reduce_on_last_micro_batch", False)
++                and version == 2
++                and self.device_mesh.ndim == 2
++            ):
++                self.module.set_requires_all_reduce(False)
++                try:
++                    yield
++                finally:
++                    self.module.set_requires_all_reduce(True)
++            else:
++                yield
++            return
++
+         if version == 1:
+             with self.module.no_sync():
+                 yield

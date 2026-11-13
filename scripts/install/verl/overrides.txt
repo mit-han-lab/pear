@@ -1,0 +1,30 @@
+# Overrides of the training environment's resolution (uv's UV_OVERRIDE), next to constraints.in: each replaces what
+# another package requires.
+
+# Triton in place of the 3.7.1 torch 2.13 requires: 3.7.1 does not order the reuse of a dead buffer's tensor memory
+# across warps on Blackwell.
+triton==3.8.0
+
+# The CuTe DSL in place of the 4.6.2 vLLM pins: cuDNN frontend 1.31's FROST engines decline below 4.7.0, and the gated
+# delta net summaries under Ulysses run on no other engine. The override replaces vLLM's whole requirement, so it names
+# the cu13 extra again: without it the CUDA 13 compiler library stays at 4.6.2 and every kernel build fails.
+nvidia-cutlass-dsl[cu13]==4.7.0
+
+# TransferQueue at the commit PEAR runs with, in place of the release verl's requirements.txt names.
+transferqueue @ git+https://github.com/Ascend/TransferQueue.git@fc33c979db6bd661802f6af458e75e850055fb20
+
+# OpenTelemetry at the versions LMCache allows (opentelemetry-api<=1.40.0, the Prometheus exporter <=0.61b0), in place
+# of the 1.43 and newer that wandb requires.
+opentelemetry-api==1.40.0
+opentelemetry-exporter-otlp==1.40.0
+opentelemetry-exporter-otlp-proto-common==1.40.0
+opentelemetry-exporter-otlp-proto-grpc==1.40.0
+opentelemetry-exporter-otlp-proto-http==1.40.0
+opentelemetry-exporter-prometheus==0.61b0
+opentelemetry-proto==1.40.0
+opentelemetry-sdk==1.40.0
+opentelemetry-semantic-conventions==0.61b0
+
+# packaging at what vcs-versioning, a tool of the LMCache build, requires (>=26.2), in place of the <26 of pyvers,
+# which tensordict requires.
+packaging==26.3

@@ -1,0 +1,2797 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [trainer, rollout] feat: score centering on the sampler's
+ top-k heads
+
+algorithm.rollout_correction.score_centering (with actor.policy_loss.rollout_correction, bypass-mode REINFORCE):
+every response token's policy-gradient term is centered by the expected score under the sampler's top-k head,
+sum_H sg[q w - alpha p] log p, where q and p are the sampler's and the trainer's probabilities of the head tokens,
+w is the rollout_is weight rule (1 without IS) and alpha = rho w(1/rho) rescales the tail. With truncated IS the
+term cancels the truncation's push toward tokens the trainer overestimates; without IS it centers the score under
+the sampler.
+
+rollout.topk_log_probs = k makes vLLM return the top-k head of every generated token (flat logprobs, no
+detokenization). The agent loops keep one head per response token, with placeholder heads for context tokens
+aligned to ContinuousTokenBuilder's edits, and pass them to the trainer through the transfer queue; the FSDP
+engine computes the trainer's log-probs at the head ids (train_head_log_probs) in the logits-processor slot, and
+the actor loss adds advantages * correction (logged as actor/sc_correction).
+
+The config check accepts fused kernels with fused_kernel_options.impl_backend=torch. The FSDP engine rejects score
+centering with fused kernels unless its fused forward returns those log-probs:
+FSDPEngineWithLMHead.support_fused_score_centering, False here, is set by an engine subclass that passes the head
+ids in and adds the centering term to the model output.
+---
+ ...t_agent_loop_extra_fields_schema_on_cpu.py | 152 ++++++++-
+ .../agent_loop/test_tool_call_id_on_cpu.py    |   2 +
+ .../ppo/test_score_centering_config_on_cpu.py | 222 +++++++++++++
+ .../ppo/test_score_centering_loss_on_cpu.py   | 194 +++++++++++
+ .../ppo/test_score_centering_on_cpu.py        | 151 +++++++++
+ .../ppo/v1/test_agent_loop_tq_on_cpu.py       |   1 +
+ ...st_agent_loop_tq_score_centering_on_cpu.py |  77 +++++
+ .../ppo/v1/test_trainer_base_on_cpu.py        |  32 +-
+ tests/utils/test_continuous_token_on_cpu.py   |  58 ++++
+ .../test_score_centering_padding_on_cpu.py    |  74 +++++
+ .../test_topk_logprobs_extract_on_cpu.py      |  61 ++++
+ .../test_llm_server_topk_heads_on_cpu.py      |  73 +++++
+ .../test_score_centering_wiring_on_cpu.py     |  71 ++++
+ verl/experimental/agent_loop/agent_loop.py    |  51 +++
+ .../agent_loop/tool_agent_loop.py             |  38 +++
+ .../_generated_ppo_megatron_trainer.yaml      |   2 +
+ .../_generated_ppo_torchtitan_trainer.yaml    |   2 +
+ .../config/_generated_ppo_trainer.yaml        |   2 +
+ .../config/_generated_ppo_veomni_trainer.yaml |   2 +
+ verl/trainer/config/algorithm.py              |  77 +++++
+ .../config/algorithm/rollout_correction.yaml  |   4 +
+ verl/trainer/config/rollout/rollout.yaml      |   5 +
+ verl/trainer/ppo/core_algos.py                |  12 +
+ verl/trainer/ppo/padding_utils.py             |   7 +
+ verl/trainer/ppo/ray_trainer.py               |   4 +
+ verl/trainer/ppo/score_centering.py           | 307 ++++++++++++++++++
+ verl/trainer/ppo/v1/agent_loop_tq.py          |   5 +
+ verl/trainer/ppo/v1/trainer_base.py           |   4 +
+ verl/utils/config.py                          |  49 +++
+ verl/utils/tokenizer/continuous_token.py      |  64 ++++
+ verl/workers/config/rollout.py                |  30 ++
+ verl/workers/engine/fsdp/transformer_impl.py  |  41 ++-
+ verl/workers/engine_workers.py                |   3 +
+ verl/workers/rollout/llm_server.py            |  16 +
+ .../sglang_rollout/async_sglang_server.py     |   2 +
+ .../trtllm_rollout/trtllm_async_server.py     |   2 +
+ verl/workers/rollout/utils.py                 |  36 ++
+ .../rollout/vllm_rollout/vllm_async_server.py |  15 +-
+ verl/workers/utils/losses.py                  |  11 +
+ verl/workers/utils/padding.py                 |   7 +
+ 40 files changed, 1949 insertions(+), 17 deletions(-)
+ create mode 100644 tests/trainer/ppo/test_score_centering_config_on_cpu.py
+ create mode 100644 tests/trainer/ppo/test_score_centering_loss_on_cpu.py
+ create mode 100644 tests/trainer/ppo/test_score_centering_on_cpu.py
+ create mode 100644 tests/trainer/ppo/v1/test_agent_loop_tq_score_centering_on_cpu.py
+ create mode 100644 tests/utils/test_score_centering_padding_on_cpu.py
+ create mode 100644 tests/workers/rollout/rollout_vllm/test_topk_logprobs_extract_on_cpu.py
+ create mode 100644 tests/workers/rollout/test_llm_server_topk_heads_on_cpu.py
+ create mode 100644 tests/workers/test_score_centering_wiring_on_cpu.py
+ create mode 100644 verl/trainer/ppo/score_centering.py
+
+diff --git a/tests/experimental/agent_loop/test_agent_loop_extra_fields_schema_on_cpu.py b/tests/experimental/agent_loop/test_agent_loop_extra_fields_schema_on_cpu.py
+index 19bf2a8cb04bc79dc6538924a82b1a31e586dfd7..2d0c054b475bf98e411888ea1725b7a3f18f4310 100644
+--- a/tests/experimental/agent_loop/test_agent_loop_extra_fields_schema_on_cpu.py
++++ b/tests/experimental/agent_loop/test_agent_loop_extra_fields_schema_on_cpu.py
+@@ -14,6 +14,7 @@
+ 
+ from __future__ import annotations
+ 
++import math
+ import warnings
+ from contextlib import nullcontext
+ from typing import Any, Optional
+@@ -165,6 +166,66 @@ def test_agent_loop_output_as_dict_promotes_teacher_fields_without_mutating_mode
+     assert output.extra_fields["teacher_logprobs"] == [-0.1, -0.2]
+ 
+ 
++def test_agent_loop_output_as_dict_promotes_rollout_topk_fields():
++    output = AgentLoopOutput(
++        prompt_ids=[1, 2, 3],
++        response_ids=[4, 5],
++        response_mask=[1, 1],
++        num_turns=2,
++        metrics=AgentLoopMetrics(),
++        extra_fields={
++            "response_topk_ids": [[4, 9], [5, 8]],
++            "response_topk_log_probs": [[-0.1, -2.0], [-0.2, -1.5]],
++        },
++    )
++
++    fields = output.as_dict()
++
++    # Unpadded full-sequence layout: row P-1+r holds response token r's head, other rows the dummy head.
++    assert fields["rollout_topk_ids"].shape == (5, 2) and fields["rollout_topk_ids"].dtype == torch.int32
++    assert fields["rollout_topk_log_probs"].shape == (5, 2) and fields["rollout_topk_log_probs"].dtype == torch.float32
++    assert fields["rollout_topk_ids"][2].tolist() == [4, 9] and fields["rollout_topk_ids"][3].tolist() == [5, 8]
++    assert fields["rollout_topk_ids"][0].tolist() == [0, 1]
++    assert fields["extra_fields"] == {}
++    assert output.extra_fields["response_topk_ids"] == [[4, 9], [5, 8]]
++
++
++def test_agent_loop_output_as_dict_lays_out_multi_turn_rollout_topk():
++    # a tool turn between two assistant turns: its tokens carry the uniform placeholder head
++    placeholder_ids, placeholder_log_probs = [0, 1], [-math.log(2)] * 2
++    output = AgentLoopOutput(
++        prompt_ids=[1],
++        response_ids=[2, 3, 4, 5],
++        response_mask=[1, 0, 0, 1],
++        num_turns=4,
++        metrics=AgentLoopMetrics(),
++        extra_fields={
++            "response_topk_ids": [[2, 9], placeholder_ids, placeholder_ids, [5, 8]],
++            "response_topk_log_probs": [[-0.1, -2.0], placeholder_log_probs, placeholder_log_probs, [-0.2, -1.5]],
++        },
++    )
++
++    fields = output.as_dict()
++
++    # row P-1+r holds response token r's head, the last row the dummy head
++    assert fields["rollout_topk_ids"].tolist() == [[2, 9], [0, 1], [0, 1], [5, 8], [0, 1]]
++    assert fields["rollout_topk_log_probs"][3].tolist() == pytest.approx([-0.2, -1.5])
++
++
++def test_agent_loop_output_as_dict_rejects_a_head_per_token_mismatch():
++    output = AgentLoopOutput(
++        prompt_ids=[1],
++        response_ids=[2, 3, 4],
++        response_mask=[1, 0, 1],
++        num_turns=4,
++        metrics=AgentLoopMetrics(),
++        extra_fields={"response_topk_ids": [[2, 9], [4, 8]], "response_topk_log_probs": [[-0.1, -2.0], [-0.2, -1.5]]},
++    )
++
++    with pytest.raises(ValueError, match="one sampler top-2 head per response token"):
++        output.as_dict()
++
++
+ @pytest.mark.asyncio
+ async def test_agent_loop_worker_passes_only_hf_model_type_through_hydra(monkeypatch):
+     captured_kwargs: dict[str, Any] = {}
+@@ -362,7 +423,7 @@ async def test_agent_loop_postprocess_accepts_read_only_routed_experts_on_cpu():
+ 
+         def __init__(self):
+             self.tokenizer = _FakeTokenizer()
+-            self.rollout_config = OmegaConf.create({"prompt_length": 4, "response_length": 4})
++            self.rollout_config = OmegaConf.create({"prompt_length": 4, "response_length": 4, "topk_log_probs": 0})
+             self.processor = None
+             self.mm_processor_kwargs = {}
+             self.reward_loop_worker_handles = None
+@@ -404,6 +465,95 @@ async def test_agent_loop_postprocess_accepts_read_only_routed_experts_on_cpu():
+     assert torch.count_nonzero(internal.routed_experts[:, 6:]) == 0
+ 
+ 
++@pytest.mark.asyncio
++async def test_agent_loop_postprocess_skips_rollout_topk_on_validate_on_cpu():
++    class _DummyWorker:
++        _compute_multi_modal_inputs = AgentLoopWorker._compute_multi_modal_inputs
++        _compute_position_ids = AgentLoopWorker._compute_position_ids
++        _get_mm_processor_kwargs = AgentLoopWorker._get_mm_processor_kwargs
++        _compute_score = AgentLoopWorker._compute_score
++        _compute_teacher_logprobs = AgentLoopWorker._compute_teacher_logprobs
++        _pad_token_ids = AgentLoopWorker._pad_token_ids
++        distillation_enabled = False
++
++        def __init__(self):
++            self.tokenizer = _FakeTokenizer()
++            self.rollout_config = OmegaConf.create({"prompt_length": 4, "response_length": 4, "topk_log_probs": 128})
++            self.processor = None
++            self.mm_processor_kwargs = {}
++            self.reward_loop_worker_handles = None
++
++    output = AgentLoopOutput(
++        prompt_ids=[101, 102],
++        response_ids=[11, 12],
++        response_mask=[1, 1],
++        metrics=AgentLoopMetrics(),
++        extra_fields={},
++    )
++
++    # Validation rollouts request no sampler head (generate_sequences sets topk_log_probs=0),
++    # so postprocess must not look for it even though the config still has topk_log_probs > 0.
++    internal = await AgentLoopWorker._agent_loop_postprocess(
++        _DummyWorker(),
++        output,
++        validate=True,
++        raw_prompt=[{"role": "user", "content": "hi"}],
++    )
++
++    assert internal.rollout_topk_ids is None
++    assert internal.rollout_topk_log_probs is None
++
++
++@pytest.mark.asyncio
++async def test_agent_loop_postprocess_lays_out_multi_turn_rollout_topk_on_cpu():
++    class _DummyWorker:
++        _compute_multi_modal_inputs = AgentLoopWorker._compute_multi_modal_inputs
++        _compute_position_ids = AgentLoopWorker._compute_position_ids
++        _get_mm_processor_kwargs = AgentLoopWorker._get_mm_processor_kwargs
++        _compute_score = AgentLoopWorker._compute_score
++        _compute_teacher_logprobs = AgentLoopWorker._compute_teacher_logprobs
++        _pad_token_ids = AgentLoopWorker._pad_token_ids
++        distillation_enabled = False
++
++        def __init__(self):
++            self.tokenizer = _FakeTokenizer()
++            self.rollout_config = OmegaConf.create({"prompt_length": 4, "response_length": 4, "topk_log_probs": 2})
++            self.processor = None
++            self.mm_processor_kwargs = {}
++            self.reward_loop_worker_handles = None
++
++    def output_with_heads(ids, log_probs):
++        return AgentLoopOutput(
++            prompt_ids=[101, 102],
++            response_ids=[11, 30, 12],
++            response_mask=[1, 0, 1],
++            num_turns=3,
++            metrics=AgentLoopMetrics(),
++            extra_fields={"response_topk_ids": ids, "response_topk_log_probs": log_probs},
++        )
++
++    # a user turn (token 30) between two assistant turns carries the uniform placeholder head
++    internal = await AgentLoopWorker._agent_loop_postprocess(
++        _DummyWorker(),
++        output_with_heads([[11, 13], [0, 1], [12, 14]], [[-0.1, -2.0], [-math.log(2)] * 2, [-0.2, -1.5]]),
++        validate=False,
++        raw_prompt=[{"role": "user", "content": "hi"}],
++    )
++
++    # prompts are left-padded to 4 and responses right-padded to 4: response token r's head sits at row 3 + r
++    assert internal.rollout_topk_ids.shape == (1, 8, 2)
++    assert internal.rollout_topk_ids[0, 3:6].tolist() == [[11, 13], [0, 1], [12, 14]]
++    assert internal.rollout_topk_ids[0, 0].tolist() == [0, 1] and internal.rollout_topk_ids[0, 6].tolist() == [0, 1]
++
++    with pytest.raises(ValueError, match="one sampler top-2 head per response token"):
++        await AgentLoopWorker._agent_loop_postprocess(
++            _DummyWorker(),
++            output_with_heads([[11, 13], [12, 14]], [[-0.1, -2.0], [-0.2, -1.5]]),
++            validate=False,
++            raw_prompt=[{"role": "user", "content": "hi"}],
++        )
++
++
+ class _FakeTokenizerCustomPad:
+     """A minimal tokenizer with a non-zero pad_token_id for testing."""
+ 
+diff --git a/tests/experimental/agent_loop/test_tool_call_id_on_cpu.py b/tests/experimental/agent_loop/test_tool_call_id_on_cpu.py
+index 52ec4e1d6ba4ed2b22b92a5afc4af6715d259dec..07e3ba983c02f65ba60fdf3ab6de03e084c95e48 100644
+--- a/tests/experimental/agent_loop/test_tool_call_id_on_cpu.py
++++ b/tests/experimental/agent_loop/test_tool_call_id_on_cpu.py
+@@ -157,6 +157,8 @@ class TestToolCallIdOnCpu(unittest.IsolatedAsyncioTestCase):
+             prompt_ids=[1, 2, 3],
+             response_mask=[],
+             response_logprobs=[],
++            response_topk_ids=None,
++            response_topk_log_probs=None,
+             image_data=None,
+             user_turns=0,
+         )
+diff --git a/tests/trainer/ppo/test_score_centering_config_on_cpu.py b/tests/trainer/ppo/test_score_centering_config_on_cpu.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a906aee0493f1bdcf782129909ff0c78f3f119b9
+--- /dev/null
++++ b/tests/trainer/ppo/test_score_centering_config_on_cpu.py
+@@ -0,0 +1,222 @@
++"""CPU coverage for the score centering config surface: dataclasses, presets and the driver cross-checks."""
++
++import pytest
++from omegaconf import OmegaConf
++
++from verl.trainer.config.algorithm import RolloutCorrectionConfig
++from verl.utils.config import _validate_score_centering_config
++from verl.workers.config.rollout import RolloutConfig
++
++
++def test_score_centering_presets_are_bypass_reinforce():
++    for cfg in (
++        RolloutCorrectionConfig.bypass_pg_sc(),
++        RolloutCorrectionConfig.bypass_pg_token_tis_sc(),
++        RolloutCorrectionConfig.bypass_pg_token_icepop_sc(),
++    ):
++        assert cfg.score_centering and cfg.bypass_mode and cfg.loss_type == "reinforce"
++    assert RolloutCorrectionConfig.bypass_pg_sc().rollout_is is None
++    assert RolloutCorrectionConfig.bypass_pg_token_tis_sc(threshold=3.0).rollout_is_threshold == 3.0
++    assert RolloutCorrectionConfig.bypass_pg_token_icepop_sc().rollout_is_threshold == "0.5_5.0"
++
++
++@pytest.mark.parametrize(
++    "kwargs",
++    [
++        dict(bypass_mode=False, loss_type="reinforce"),
++        dict(bypass_mode=True, loss_type="ppo_clip"),
++        dict(bypass_mode=True, loss_type="reinforce", rollout_is="sequence"),
++        dict(bypass_mode=True, loss_type="reinforce", rollout_is="token", rollout_is_batch_normalize=True),
++    ],
++)
++def test_score_centering_rejects_unsupported_modes(kwargs):
++    with pytest.raises(ValueError, match="score_centering"):
++        RolloutCorrectionConfig(score_centering=True, **kwargs)
++
++
++def test_topk_log_probs_requires_calculate_log_probs_and_full_support():
++    with pytest.raises(ValueError, match="calculate_log_probs"):
++        RolloutConfig(topk_log_probs=128, calculate_log_probs=False)
++    with pytest.raises(ValueError, match="top_p"):
++        RolloutConfig(topk_log_probs=128, calculate_log_probs=True, top_p=0.9)
++    with pytest.raises(ValueError, match="top_k"):
++        RolloutConfig(topk_log_probs=128, calculate_log_probs=True, top_k=50)
++
++
++def test_topk_log_probs_requires_processed_logprobs():
++    with pytest.raises(ValueError, match="processed_logprobs"):
++        RolloutConfig(name="vllm", topk_log_probs=128, calculate_log_probs=True, logprobs_mode="raw_logprobs")
++
++
++def test_topk_log_probs_rejects_negative_head_size():
++    with pytest.raises(ValueError, match="must be >= 0"):
++        RolloutConfig(name="vllm", topk_log_probs=-1, calculate_log_probs=True)
++
++
++def test_topk_log_probs_requires_vllm_rollout():
++    with pytest.raises(ValueError, match="vLLM"):
++        RolloutConfig(name="sglang", topk_log_probs=128, calculate_log_probs=True)
++
++
++def test_topk_log_probs_raises_vllm_max_logprobs():
++    cfg = RolloutConfig(name="vllm", topk_log_probs=128, calculate_log_probs=True)
++    assert cfg.engine_kwargs["vllm"]["max_logprobs"] == 128
++    cfg = RolloutConfig(
++        name="vllm", topk_log_probs=32, calculate_log_probs=True, engine_kwargs={"vllm": {"max_logprobs": 64}}
++    )
++    assert cfg.engine_kwargs["vllm"]["max_logprobs"] == 64
++    with pytest.raises(ValueError, match="max_logprobs"):
++        RolloutConfig(
++            name="vllm", topk_log_probs=128, calculate_log_probs=True, engine_kwargs={"vllm": {"max_logprobs": 20}}
++        )
++
++
++_RC = {"bypass_mode": True, "loss_type": "reinforce", "rollout_is": "token", "rollout_is_threshold": 2.0}
++
++
++def _config(
++    algorithm_sc=True,
++    actor_sc=True,
++    loss_mode="bypass_mode",
++    topk_log_probs=128,
++    use_v1=True,
++    algorithm_rc=None,
++    actor_rc=None,
++    strategy="fsdp",
++    use_fused_kernels=False,
++    fused_backend="torch",
++    distillation_enabled=False,
++):
++    policy_loss = {"loss_mode": loss_mode}
++    if actor_sc is not None:
++        policy_loss["rollout_correction"] = {**_RC, **(actor_rc or {}), "score_centering": actor_sc}
++    return OmegaConf.create(
++        {
++            "algorithm": {"rollout_correction": {**_RC, **(algorithm_rc or {}), "score_centering": algorithm_sc}},
++            "actor_rollout_ref": {
++                "actor": {"strategy": strategy, "use_fused_kernels": use_fused_kernels, "policy_loss": policy_loss},
++                "model": {"fused_kernel_options": {"impl_backend": fused_backend}},
++                "rollout": {"topk_log_probs": topk_log_probs},
++            },
++            "distillation": {"enabled": distillation_enabled},
++            "trainer": {"use_v1": use_v1},
++        }
++    )
++
++
++def test_score_centering_config_accepts_consistent_settings():
++    _validate_score_centering_config(_config())
++
++
++def test_score_centering_disabled_skips_checks():
++    _validate_score_centering_config(
++        _config(algorithm_sc=False, actor_sc=None, loss_mode="vanilla", topk_log_probs=0, strategy="megatron")
++    )
++
++
++@pytest.mark.parametrize(
++    "algorithm_sc, actor_sc",
++    [(True, None), (True, False), (False, True)],
++)
++def test_score_centering_requires_driver_and_actor_flags(algorithm_sc, actor_sc):
++    with pytest.raises(ValueError, match="actor_rollout_ref.actor.policy_loss.rollout_correction.score_centering"):
++        _validate_score_centering_config(_config(algorithm_sc=algorithm_sc, actor_sc=actor_sc))
++
++
++@pytest.mark.parametrize("strategy", ["megatron", "veomni"])
++def test_score_centering_requires_fsdp_actor(strategy):
++    with pytest.raises(ValueError, match="FSDP engine only"):
++        _validate_score_centering_config(_config(strategy=strategy))
++
++
++@pytest.mark.parametrize("strategy", ["fsdp", "fsdp2"])
++def test_score_centering_accepts_fsdp_strategies(strategy):
++    _validate_score_centering_config(_config(strategy=strategy))
++
++
++@pytest.mark.parametrize("fused_backend", ["triton", "liger"])
++def test_score_centering_rejects_fused_kernels_without_the_fp32_head(fused_backend):
++    with pytest.raises(ValueError, match="impl_backend=torch"):
++        _validate_score_centering_config(_config(use_fused_kernels=True, fused_backend=fused_backend))
++
++
++def test_score_centering_accepts_the_fp32_head():
++    _validate_score_centering_config(_config(use_fused_kernels=True, fused_backend="torch"))
++
++
++def test_score_centering_rejects_distillation():
++    with pytest.raises(ValueError, match="distillation.enabled"):
++        _validate_score_centering_config(_config(distillation_enabled=True))
++
++
++def test_score_centering_tolerates_missing_distillation_section():
++    config = _config()
++    del config["distillation"]
++
++    _validate_score_centering_config(config)
++
++
++def test_score_centering_requires_bypass_mode_loss():
++    with pytest.raises(ValueError, match="actor_rollout_ref.actor.policy_loss.loss_mode"):
++        _validate_score_centering_config(_config(loss_mode="vanilla"))
++
++
++def test_score_centering_requires_rollout_topk_log_probs():
++    with pytest.raises(ValueError, match="actor_rollout_ref.rollout.topk_log_probs"):
++        _validate_score_centering_config(_config(topk_log_probs=0))
++
++
++@pytest.mark.parametrize("use_v1", [True, False])
++def test_score_centering_accepts_both_trainers(use_v1):
++    _validate_score_centering_config(_config(use_v1=use_v1))
++
++
++def test_score_centering_tolerates_null_rollout_correction():
++    config = _config(actor_sc=None)
++    config.algorithm.rollout_correction = None
++    config.actor_rollout_ref.actor.policy_loss.rollout_correction = None
++
++    _validate_score_centering_config(config)
++
++
++def test_score_centering_accepts_actor_side_without_is_keys():
++    config = _config()
++    policy_loss = config.actor_rollout_ref.actor.policy_loss
++    policy_loss.rollout_correction = {"bypass_mode": True, "loss_type": "reinforce", "score_centering": True}
++    config.algorithm.rollout_correction.rollout_is = None
++
++    _validate_score_centering_config(config)
++
++
++@pytest.mark.parametrize(
++    "actor_rc, match",
++    [
++        ({"rollout_is": "sequence"}, "actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_is"),
++        ({"rollout_is_batch_normalize": True}, "rollout_correction.rollout_is_batch_normalize"),
++    ],
++)
++def test_score_centering_rejects_actor_side_is_settings(actor_rc, match):
++    with pytest.raises(ValueError, match=match):
++        _validate_score_centering_config(_config(actor_rc=actor_rc))
++
++
++@pytest.mark.parametrize(
++    "key, actor_value",
++    [
++        ("bypass_mode", False),
++        ("loss_type", "ppo_clip"),
++        ("rollout_is", None),
++        ("rollout_is_threshold", 3.0),
++    ],
++)
++def test_score_centering_requires_matching_actor_side(key, actor_value):
++    with pytest.raises(ValueError, match=f"rollout_correction.{key}"):
++        _validate_score_centering_config(_config(actor_rc={key: actor_value}))
++
++
++def test_score_centering_reads_missing_actor_side_rollout_is_as_none():
++    config = _config()
++    del config.actor_rollout_ref.actor.policy_loss.rollout_correction["rollout_is"]
++
++    with pytest.raises(ValueError, match=r"actor_rollout_ref\.actor\.policy_loss\.rollout_correction\.rollout_is "):
++        _validate_score_centering_config(config)
+diff --git a/tests/trainer/ppo/test_score_centering_loss_on_cpu.py b/tests/trainer/ppo/test_score_centering_loss_on_cpu.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..96658aa3b9ac27e6af4b689efe9b36002322d690
+--- /dev/null
++++ b/tests/trainer/ppo/test_score_centering_loss_on_cpu.py
+@@ -0,0 +1,194 @@
++"""CPU coverage for score centering's loss integration: REINFORCE, bypass dispatch, and the hook wrapper."""
++
++import math
++
++import pytest
++import torch
++from tensordict import TensorDict
++
++from verl.trainer.config.algorithm import RolloutCorrectionConfig
++from verl.trainer.ppo.core_algos import compute_policy_loss_bypass_mode, compute_policy_loss_reinforce
++from verl.trainer.ppo.score_centering import score_centering_logits_processor, score_centering_ppo_loss
++from verl.utils import tensordict_utils as tu
++from verl.workers.config import ActorConfig, PolicyLossConfig
++from verl.workers.utils.losses import ppo_loss
++from verl.workers.utils.padding import left_right_2_no_padding
++
++
++def _actor_config(rollout_correction):
++    config = ActorConfig(
++        strategy="fsdp",
++        rollout_n=1,
++        ppo_micro_batch_size_per_gpu=1,
++        policy_loss=PolicyLossConfig(loss_mode="bypass_mode", rollout_correction=rollout_correction),
++        loss_agg_mode="token-mean",
++    )
++    config.global_batch_info.update(dp_size=1, batch_num_tokens=None, global_batch_size=None, loss_scale_factor=None)
++    return config
++
++
++def test_reinforce_adds_advantage_times_correction():
++    torch.manual_seed(0)
++    log_prob = torch.randn(2, 4, requires_grad=True)
++    rollout_log_prob = log_prob.detach() + 0.1
++    advantages = torch.randn(2, 4)
++    mask = torch.ones(2, 4, dtype=torch.bool)
++    correction = torch.randn(2, 4, requires_grad=True)
++    config = _actor_config(RolloutCorrectionConfig.bypass_pg_sc())
++    loss_sc, metrics = compute_policy_loss_reinforce(
++        rollout_log_prob, log_prob, advantages, mask, "token-mean", config, sc_correction=correction
++    )
++    loss_plain, _ = compute_policy_loss_reinforce(rollout_log_prob, log_prob, advantages, mask, "token-mean", config)
++    torch.testing.assert_close(loss_sc, loss_plain + (advantages * correction).mean())
++    assert math.isclose(metrics["actor/sc_correction"], correction.mean().item(), rel_tol=1e-5)
++
++
++def test_bypass_mode_dispatches_correction_to_reinforce_only():
++    torch.manual_seed(1)
++    log_prob = torch.randn(2, 3, requires_grad=True)
++    old = log_prob.detach()
++    adv = torch.randn(2, 3)
++    mask = torch.ones(2, 3, dtype=torch.bool)
++    corr = torch.randn(2, 3)
++    config = _actor_config(RolloutCorrectionConfig.bypass_pg_sc())
++    loss, metrics = compute_policy_loss_bypass_mode(old, log_prob, adv, mask, "token-mean", config, sc_correction=corr)
++    assert "actor/sc_correction" in metrics
++    config = _actor_config(RolloutCorrectionConfig.bypass_ppo_clip())
++    with pytest.raises(ValueError, match="score centering"):
++        compute_policy_loss_bypass_mode(old, log_prob, adv, mask, "token-mean", config, sc_correction=corr)
++
++
++def _nested_batch(lengths, k, vocab):
++    ids = torch.nested.as_nested_tensor(
++        [torch.randint(0, vocab, (n, k), dtype=torch.int32) for n in lengths], layout=torch.jagged
++    )
++    log_probs = torch.nested.as_nested_tensor(
++        [
++            torch.log_softmax(torch.randn(n, vocab), dim=-1).gather(-1, i.long())
++            for n, i in zip(lengths, ids.unbind(), strict=False)
++        ],
++        layout=torch.jagged,
++    )
++    data = TensorDict({"rollout_topk_ids": ids, "rollout_topk_log_probs": log_probs}, batch_size=[len(lengths)])
++    return data
++
++
++def test_logits_processor_returns_per_token_scalars():
++    torch.manual_seed(2)
++    lengths, k, vocab = [3, 5], 4, 17
++    data = _nested_batch(lengths, k, vocab)
++    logits = torch.randn(1, sum(lengths), vocab, requires_grad=True)
++    config = _actor_config(RolloutCorrectionConfig.bypass_pg_sc())
++    out = score_centering_logits_processor(student_logits=logits, data=data, config=config)
++    assert set(out) == {"sc_correction", "sc_sampler_head_mass", "sc_train_head_mass"}
++    for v in out.values():
++        assert v.shape == (1, sum(lengths))
++    assert out["sc_correction"].requires_grad
++    assert (out["sc_sampler_head_mass"] <= 1.0 + 1e-6).all()
++
++
++def test_logits_processor_takes_the_head_log_probs_of_a_fused_head():
++    torch.manual_seed(5)
++    lengths, k, vocab = [3, 5], 4, 17
++    data = _nested_batch(lengths, k, vocab)
++    logits = torch.randn(1, sum(lengths), vocab)
++    config = _actor_config(RolloutCorrectionConfig.bypass_pg_sc())
++    head_ids = data["rollout_topk_ids"].values().long().unsqueeze(0)
++    expected = score_centering_logits_processor(student_logits=logits, data=data, config=config)
++    out = score_centering_ppo_loss(
++        config, data=data, train_head_log_probs=torch.log_softmax(logits, -1).gather(-1, head_ids)
++    )
++    for key in expected:
++        torch.testing.assert_close(out[key], expected[key])
++
++
++@pytest.mark.parametrize(
++    "preset, rollout_correction",
++    [
++        (RolloutCorrectionConfig.bypass_pg_sc(), {"bypass_mode": True, "loss_type": "reinforce"}),
++        (
++            RolloutCorrectionConfig.bypass_pg_token_icepop_sc(),
++            {"bypass_mode": True, "loss_type": "reinforce", "rollout_is": "token", "rollout_is_threshold": "0.5_5.0"},
++        ),
++    ],
++)
++def test_logits_processor_reads_mapping_rollout_correction(preset, rollout_correction):
++    torch.manual_seed(4)
++    lengths, k, vocab = [3, 5], 4, 17
++    data = _nested_batch(lengths, k, vocab)
++    logits = torch.randn(1, sum(lengths), vocab)
++    expected = score_centering_logits_processor(student_logits=logits, data=data, config=_actor_config(preset))
++    out = score_centering_logits_processor(
++        student_logits=logits, data=data, config=_actor_config({**rollout_correction, "score_centering": True})
++    )
++    for key in expected:
++        torch.testing.assert_close(out[key], expected[key])
++
++
++def test_score_centering_ppo_loss_routes_hook_and_final_loss(monkeypatch):
++    config = _actor_config(RolloutCorrectionConfig.bypass_pg_sc())
++    called = {}
++
++    def fake_ppo_loss(config, model_output, data, dp_group=None):
++        called["ppo"] = True
++        return torch.tensor(0.0), {}
++
++    monkeypatch.setattr("verl.trainer.ppo.score_centering.ppo_loss", fake_ppo_loss)
++    data = _nested_batch([2], 3, 9)
++    out = score_centering_ppo_loss(config, student_logits=torch.randn(1, 2, 9), data=data)
++    assert "sc_correction" in out
++    score_centering_ppo_loss(config, model_output={}, data=data)
++    assert called["ppo"]
++
++
++def test_ppo_loss_applies_score_centering_end_to_end():
++    torch.manual_seed(3)
++    prompts = torch.tensor([[0, 5, 6], [7, 8, 9]])
++    responses = torch.tensor([[11, 12, 0], [13, 14, 15]])
++    attention_mask = torch.tensor([[0, 1, 1, 1, 1, 0], [1, 1, 1, 1, 1, 1]])
++    response_mask = attention_mask[:, 3:]
++    advantages = torch.randn(2, 3)
++    data = TensorDict(
++        {
++            "prompts": prompts,
++            "responses": responses,
++            "input_ids": torch.cat([prompts, responses], dim=1),
++            "attention_mask": attention_mask,
++            "response_mask": response_mask,
++            "position_ids": (attention_mask.cumsum(-1) - 1).clamp_min(0),
++            "old_log_probs": -torch.rand(2, 3),
++            "advantages": advantages,
++        },
++        batch_size=[2],
++    )
++    tu.assign_non_tensor(data, dp_size=1, batch_num_tokens=int(response_mask.sum()), global_batch_size=2)
++    data = left_right_2_no_padding(data)
++
++    prompt_lens, response_lens = [2, 3], [2, 3]
++    full = {
++        "log_probs": [-torch.rand(4), -torch.rand(6)],
++        "sc_correction": [torch.randn(4), torch.randn(6)],
++        "sc_sampler_head_mass": [torch.rand(4), torch.rand(6)],
++        "sc_train_head_mass": [torch.rand(4), torch.rand(6)],
++    }
++    model_output = {key: torch.nested.as_nested_tensor(rows, layout=torch.jagged) for key, rows in full.items()}
++
++    def response_part(rows):
++        # response token r is predicted by sequence position prompt_len - 1 + r
++        return torch.stack(
++            [
++                torch.nn.functional.pad(row[p - 1 : p - 1 + r], (0, 3 - r))
++                for row, p, r in zip(rows, prompt_lens, response_lens, strict=True)
++            ]
++        )
++
++    config = _actor_config(RolloutCorrectionConfig.bypass_pg_sc())
++    loss, metrics = ppo_loss(config, model_output, data)
++
++    mask = response_mask.bool()
++    log_prob, correction = response_part(full["log_probs"]), response_part(full["sc_correction"])
++    expected = (-advantages * log_prob + advantages * correction)[mask].mean()
++    torch.testing.assert_close(loss, expected)
++    for key in ("sc_correction", "sc_sampler_head_mass", "sc_train_head_mass"):
++        expected_metric = response_part(full[key])[mask].mean().item()
++        assert math.isclose(metrics[f"actor/{key}"].aggregate(), expected_metric, rel_tol=1e-5)
+diff --git a/tests/trainer/ppo/test_score_centering_on_cpu.py b/tests/trainer/ppo/test_score_centering_on_cpu.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f1518c29d40a991e8fbfdf468924e0fcc45e6aeb
+--- /dev/null
++++ b/tests/trainer/ppo/test_score_centering_on_cpu.py
+@@ -0,0 +1,151 @@
++"""CPU coverage for the score centering math module."""
++
++import math
++
++import pytest
++import torch
++
++from verl.trainer.ppo.score_centering import (
++    dummy_rollout_topk,
++    pad_rollout_topk,
++    score_centering_correction,
++    score_centering_weight_fn,
++    topk_log_probs_from_logits,
++)
++
++
++def _full_vocab_centering(logits, sampler_log_probs):
++    # Exact centering term over the whole vocabulary: sum_v sg[q_v] log p_v.
++    log_p = torch.log_softmax(logits.float(), dim=-1)
++    return (sampler_log_probs.exp().detach() * log_p).sum(-1)
++
++
++def test_topk_log_probs_match_log_softmax_gather_with_gradient():
++    torch.manual_seed(0)
++    logits = torch.randn(5, 37, dtype=torch.bfloat16, requires_grad=True)
++    ids = torch.stack([torch.randperm(37)[:4] for _ in range(5)])
++    out = topk_log_probs_from_logits(logits, ids, chunk_size=2)
++    ref = torch.log_softmax(logits.float(), dim=-1).gather(-1, ids)
++    torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-5)
++    weight = torch.randn_like(out)
++    (out * weight).sum().backward()
++    grad_chunked = logits.grad.clone()
++    logits.grad = None
++    (ref * weight).sum().backward()
++    torch.testing.assert_close(grad_chunked.float(), logits.grad.float(), atol=1e-2, rtol=1e-2)
++
++
++def test_correction_is_zero_on_policy():
++    torch.manual_seed(1)
++    logits = torch.randn(3, 11)
++    log_p = torch.log_softmax(logits, dim=-1)
++    ids = torch.topk(log_p, k=4, dim=-1).indices
++    head = log_p.gather(-1, ids)
++    correction, q_mass, p_mass = score_centering_correction(head, head, score_centering_weight_fn(None, 2.0))
++    torch.testing.assert_close(correction, torch.zeros(3), atol=1e-6, rtol=0)
++    torch.testing.assert_close(q_mass, p_mass)
++
++
++def test_topk_correction_gradient_equals_full_vocab_when_k_is_vocab():
++    # With k = V the head/tail split is degenerate (rho = 0/0), so only the gradient of the
++    # correction is meaningful; it must match the exact full-vocab centering term's gradient.
++    torch.manual_seed(2)
++    vocab = 9
++    trainer_logits = torch.randn(4, vocab, requires_grad=True)
++    sampler_log_probs = torch.log_softmax(torch.randn(4, vocab), dim=-1)
++    ids = torch.arange(vocab).expand(4, vocab)
++    head = topk_log_probs_from_logits(trainer_logits, ids)
++    correction, _, _ = score_centering_correction(head, sampler_log_probs, score_centering_weight_fn(None, 2.0))
++    ref = _full_vocab_centering(trainer_logits, sampler_log_probs)
++    grad_a = torch.autograd.grad(correction.sum(), trainer_logits)[0]
++    grad_b = torch.autograd.grad(ref.sum(), trainer_logits)[0]
++    torch.testing.assert_close(grad_a, grad_b, atol=1e-5, rtol=1e-5)
++
++
++def test_topk_correction_gradient_matches_tail_model():
++    # With k < V the tail is modeled as rho * p; the expected gradient must equal
++    # the exact gradient of sum_v sg[q_hat_v] log p_v with q_hat from the paper.
++    torch.manual_seed(3)
++    vocab, k = 13, 5
++    trainer_logits = torch.randn(2, vocab, requires_grad=True)
++    sampler_log_probs = torch.log_softmax(torch.randn(2, vocab), dim=-1)
++    ids = torch.topk(sampler_log_probs, k=k, dim=-1).indices
++    head = topk_log_probs_from_logits(trainer_logits, ids)
++    correction, q_mass, p_mass = score_centering_correction(
++        head, sampler_log_probs.gather(-1, ids), score_centering_weight_fn(None, 2.0)
++    )
++    log_p = torch.log_softmax(trainer_logits, dim=-1)
++    p = log_p.exp().detach()
++    q_hat = sampler_log_probs.exp().clone()
++    in_head = torch.zeros_like(q_hat, dtype=torch.bool).scatter_(1, ids, True)
++    rho = (1 - q_mass) / (1 - p_mass)
++    q_hat = torch.where(in_head, q_hat, rho.unsqueeze(-1) * p)
++    ref = (q_hat.detach() * log_p).sum(-1)
++    grad_a = torch.autograd.grad(correction.sum(), trainer_logits)[0]
++    grad_b = torch.autograd.grad(ref.sum(), trainer_logits)[0]
++    torch.testing.assert_close(grad_a, grad_b, atol=1e-5, rtol=1e-5)
++
++
++def test_drift_cancels_under_constant_reward():
++    # Constant reward, sampler != trainer: vanilla REINFORCE has a nonzero expected gradient,
++    # score centering makes it vanish (up to the tail model, exact here with k = V).
++    torch.manual_seed(4)
++    vocab = 7
++    trainer_logits = torch.randn(1, vocab, requires_grad=True)
++    sampler_log_probs = torch.log_softmax(torch.randn(1, vocab), dim=-1)
++    ids = torch.arange(vocab).expand(1, vocab)
++    head = topk_log_probs_from_logits(trainer_logits, ids)
++    correction, _, _ = score_centering_correction(head, sampler_log_probs, score_centering_weight_fn(None, 2.0))
++    log_p = torch.log_softmax(trainer_logits, dim=-1)
++    q = sampler_log_probs.exp()
++    expected_vanilla = torch.autograd.grad((q * log_p).sum(), trainer_logits, retain_graph=True)[0]
++    expected_centered = torch.autograd.grad((q.detach() * log_p).sum() - correction.sum(), trainer_logits)[0]
++    assert expected_vanilla.abs().max() > 1e-3
++    torch.testing.assert_close(expected_centered, torch.zeros_like(expected_centered), atol=1e-6, rtol=0)
++
++
++def test_weight_fn_matches_tis_and_icepop_rules():
++    ratio = torch.tensor([0.1, 0.7, 1.0, 3.0, 9.0])
++    torch.testing.assert_close(score_centering_weight_fn(None, 2.0)(ratio), torch.ones(5))
++    torch.testing.assert_close(score_centering_weight_fn("token", 2.0)(ratio), ratio.clamp(max=2.0))
++    torch.testing.assert_close(
++        score_centering_weight_fn("token", "0.5_5.0")(ratio), torch.tensor([0.0, 0.7, 1.0, 3.0, 0.0])
++    )
++    with pytest.raises(ValueError):
++        score_centering_weight_fn("sequence", 2.0)
++
++
++def test_composed_correction_uses_alpha_rho_f_one_over_rho():
++    torch.manual_seed(5)
++    head_p = torch.log_softmax(torch.randn(2, 6), dim=-1)[:, :3]
++    head_q = torch.log_softmax(torch.randn(2, 6), dim=-1)[:, :3]
++    tis = score_centering_weight_fn("token", 2.0)
++    correction, q_mass, p_mass = score_centering_correction(head_p, head_q, tis)
++    rho = (1 - q_mass) / (1 - p_mass)
++    alpha = rho * tis(1 / rho)
++    residual = head_q.exp() * tis((head_p - head_q).exp()) - alpha.unsqueeze(-1) * head_p.exp()
++    torch.testing.assert_close(correction, (residual * head_p).sum(-1))
++
++
++def test_dummy_rows_are_finite_distributions():
++    ids, log_probs = dummy_rollout_topk(3, 4)
++    assert ids.dtype == torch.int32 and log_probs.dtype == torch.float32
++    assert ids.tolist() == [[0, 1, 2, 3]] * 3
++    torch.testing.assert_close(log_probs.exp().sum(-1), torch.ones(3))
++
++
++def test_pad_rollout_topk_places_heads_after_last_prompt_token():
++    k = 2
++    response_ids = [[10, 11], [12, 13], [14, 15]]
++    response_log_probs = [[-0.1, -2.0]] * 3
++    ids, log_probs = pad_rollout_topk(
++        response_ids, response_log_probs, k=k, prompt_width=5, response_width=4, response_length=3
++    )
++    assert ids.shape == (1, 9, k) and log_probs.shape == (1, 9, k)
++    assert ids[0, 4:7].tolist() == response_ids
++    assert ids[0, 3].tolist() == [0, 1] and ids[0, 7].tolist() == [0, 1]
++    assert math.isclose(log_probs[0, 0, 0].item(), -math.log(k), rel_tol=1e-6)
++    with pytest.raises(ValueError, match="top-2"):
++        pad_rollout_topk(
++            response_ids[:2], response_log_probs[:2], k=k, prompt_width=5, response_width=4, response_length=3
++        )
+diff --git a/tests/trainer/ppo/v1/test_agent_loop_tq_on_cpu.py b/tests/trainer/ppo/v1/test_agent_loop_tq_on_cpu.py
+index 6be2ccca6b3d076625e0d0a5a96d6c1b8f01dc83..80da7ce1171a6bacfe586e88b5e142e61d433add 100644
+--- a/tests/trainer/ppo/v1/test_agent_loop_tq_on_cpu.py
++++ b/tests/trainer/ppo/v1/test_agent_loop_tq_on_cpu.py
+@@ -72,6 +72,7 @@ def test_a_restored_group_runs_only_its_unfinished_sessions(monkeypatch):
+                     "top_p": 1.0,
+                     "top_k": -1,
+                     "calculate_log_probs": False,
++                    "topk_log_probs": 0,
+                     "agent": {"default_agent_loop": "tool_agent"},
+                 }
+             }
+diff --git a/tests/trainer/ppo/v1/test_agent_loop_tq_score_centering_on_cpu.py b/tests/trainer/ppo/v1/test_agent_loop_tq_score_centering_on_cpu.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..98c348324ceb78f08b39b4e1a8e555a95fe32994
+--- /dev/null
++++ b/tests/trainer/ppo/v1/test_agent_loop_tq_score_centering_on_cpu.py
+@@ -0,0 +1,77 @@
++import pytest
++import torch
++from omegaconf import OmegaConf
++
++import verl.trainer.ppo.v1.agent_loop_tq as agent_loop_tq_module
++from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics, AgentLoopOutput, AgentLoopWorker
++from verl.trainer.ppo.v1.agent_loop_tq import AgentLoopWorkerTQ
++
++_WorkerTQ = AgentLoopWorkerTQ.__ray_metadata__.modified_class
++
++
++class _DummyWorker:
++    _compute_multi_modal_inputs = AgentLoopWorker._compute_multi_modal_inputs
++    _compute_position_ids = AgentLoopWorker._compute_position_ids
++    _compute_score = AgentLoopWorker._compute_score
++    _compute_teacher_logprobs = AgentLoopWorker._compute_teacher_logprobs
++    distillation_enabled = False
++
++    def __init__(self, topk_log_probs: int):
++        self.rollout_config = OmegaConf.create({"topk_log_probs": topk_log_probs})
++        self.processor = None
++        self.reward_loop_worker_handles = None
++
++
++def _output(extra_fields: dict) -> AgentLoopOutput:
++    return AgentLoopOutput(
++        prompt_ids=[101, 102, 103],
++        response_ids=[11, 12],
++        response_mask=[1, 1],
++        num_turns=2,
++        metrics=AgentLoopMetrics(),
++        extra_fields=extra_fields,
++    )
++
++
++async def _postprocess(monkeypatch, worker: _DummyWorker, output: AgentLoopOutput, validate: bool):
++    captured = {}
++
++    async def async_kv_batch_put(*, keys, fields, tags, partition_id):
++        captured["fields"] = fields
++
++    monkeypatch.setattr(agent_loop_tq_module.tq, "async_kv_batch_put", async_kv_batch_put)
++    await _WorkerTQ._agent_loop_postprocess(
++        worker, output, validate, uid="u0", session_id=0, global_steps=1, raw_prompt=[{"role": "user", "content": "hi"}]
++    )
++    return captured["fields"]
++
++
++@pytest.mark.asyncio
++async def test_agent_loop_tq_postprocess_stores_unpadded_rollout_topk(monkeypatch):
++    output = _output(
++        {"response_topk_ids": [[11, 13], [12, 14]], "response_topk_log_probs": [[-0.1, -2.0], [-0.2, -1.5]]}
++    )
++
++    fields = await _postprocess(monkeypatch, _DummyWorker(topk_log_probs=2), output, validate=False)
++
++    ids, log_probs = fields["rollout_topk_ids"][0], fields["rollout_topk_log_probs"][0]
++    assert ids.shape == (5, 2) and ids.dtype == torch.int32
++    assert log_probs.shape == (5, 2) and log_probs.dtype == torch.float32
++    assert ids[2].tolist() == [11, 13] and ids[3].tolist() == [12, 14]
++    assert log_probs[2].tolist() == pytest.approx([-0.1, -2.0]) and log_probs[3].tolist() == pytest.approx([-0.2, -1.5])
++    assert ids[0].tolist() == [0, 1] and ids[4].tolist() == [0, 1]
++    assert "response_topk_ids" not in fields["extra_fields"][0]
++
++
++@pytest.mark.asyncio
++async def test_agent_loop_tq_postprocess_skips_rollout_topk_on_validate(monkeypatch):
++    fields = await _postprocess(monkeypatch, _DummyWorker(topk_log_probs=2), _output({}), validate=True)
++
++    assert "rollout_topk_ids" not in fields.keys()
++    assert "rollout_topk_log_probs" not in fields.keys()
++
++
++@pytest.mark.asyncio
++async def test_agent_loop_tq_postprocess_rejects_missing_rollout_topk(monkeypatch):
++    with pytest.raises(ValueError, match="top-k head"):
++        await _postprocess(monkeypatch, _DummyWorker(topk_log_probs=2), _output({}), validate=False)
+diff --git a/tests/trainer/ppo/v1/test_trainer_base_on_cpu.py b/tests/trainer/ppo/v1/test_trainer_base_on_cpu.py
+index a18e4a3a4775b2e07ca33ef421cf7a9e6faacb85..a5a9045eceb146197331431babd89d180775d853 100644
+--- a/tests/trainer/ppo/v1/test_trainer_base_on_cpu.py
++++ b/tests/trainer/ppo/v1/test_trainer_base_on_cpu.py
+@@ -12,8 +12,10 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+-from unittest.mock import patch
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
+ 
++import pytest
+ from omegaconf import OmegaConf
+ 
+ from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer, ReplayBufferAsync
+@@ -163,3 +165,31 @@ def test_builtin_filter_groups_warns_when_total_generation_limit_is_configured()
+         "use max_inflight_gen_batches to bound concurrent Sync DAPO generation.",
+         10,
+     )
++
++
++@pytest.mark.parametrize("score_centering", [True, False])
++def test_update_actor_passes_score_centering_flag(score_centering):
++    trainer = _StubTrainer.__new__(_StubTrainer)
++    trainer.config = OmegaConf.create(
++        {
++            "actor_rollout_ref": {
++                "actor": {
++                    "ppo_mini_batch_size": 2,
++                    "calculate_entropy": False,
++                    "entropy_coeff": 0.0,
++                    "ppo_epochs": 1,
++                    "data_loader_seed": 1,
++                    "shuffle": False,
++                    "policy_loss": {"rollout_correction": {"score_centering": score_centering}},
++                },
++                "rollout": {"n": 4, "temperature": 1.0},
++            }
++        }
++    )
++    trainer.actor_rollout_wg = MagicMock()
++    trainer.actor_rollout_wg.update_actor.return_value = {"metrics": {"mfu": 0.0}}
++    batch = SimpleNamespace(extra_info={})
++
++    trainer._update_actor(batch, {})
++
++    assert batch.extra_info["score_centering"] is score_centering
+diff --git a/tests/utils/test_continuous_token_on_cpu.py b/tests/utils/test_continuous_token_on_cpu.py
+index 8af09d67097be64cfc6fffff7b397069c07351f4..def85b3797d19423f5bcf5d85ee24a29834427f0 100644
+--- a/tests/utils/test_continuous_token_on_cpu.py
++++ b/tests/utils/test_continuous_token_on_cpu.py
+@@ -14,6 +14,7 @@
+ 
+ import logging
+ 
++import numpy as np
+ import pytest
+ 
+ from verl.utils.tokenizer.continuous_token import (
+@@ -2528,3 +2529,60 @@ def test_vl_builder_preserves_explicit_sampling_rate_over_processor_default():
+     )
+ 
+     assert builder.mm_processor_kwargs["sampling_rate"] == 24000
++
++
++def _topk_heads(count, k, start):
++    """Distinct assistant heads: row i holds ids start+i.. and log-probs -(start+i)."""
++    ids = (np.arange(count)[:, None] + start + np.arange(k)[None, :]).astype(np.int32)
++    return ids, -ids.astype(np.float32)
++
++
++def test_align_response_topk_follows_the_metadata_edits_over_a_multi_turn_episode():
++    k = 4
++    builder = create_continuous_token_builder(_TemplateTokenizer(), model_family="default")
++    turn1, turn2 = _topk_heads(3, k, start=100), _topk_heads(2, k, start=200)
++    merges = [
++        (MergeResult(token_ids=[], appended_token_count=3, kind="assistant"), turn1),
++        (MergeResult(token_ids=[], appended_token_count=2, kind="context", inserted_token_ids=[9]), None),
++        # the next assistant merge first drops one stale prefix token (the last context token)
++        (MergeResult(token_ids=[], appended_token_count=2, kind="assistant", removed_prefix_token_count=1), turn2),
++        # an aborted request: no tokens, no heads
++        (MergeResult(token_ids=[], appended_token_count=0, kind="assistant"), None),
++        (MergeResult(token_ids=[], appended_token_count=1, kind="context"), None),
++    ]
++    mask, logprobs = [], []
++    ids, log_probs = np.zeros((0, k), dtype=np.int32), np.zeros((0, k), dtype=np.float32)
++    for merge, heads in merges:
++        assistant_logprobs = heads[1][:, 0].tolist() if heads is not None else None
++        if merge.kind == "assistant" and heads is None:
++            assistant_logprobs = []
++        mask, logprobs = builder.align_response_metadata(merge, mask, logprobs, assistant_logprobs=assistant_logprobs)
++        ids, log_probs = builder.align_response_topk(
++            merge,
++            ids,
++            log_probs,
++            assistant_topk_ids=None if heads is None else heads[0],
++            assistant_topk_log_probs=None if heads is None else heads[1],
++        )
++        assert len(ids) == len(log_probs) == len(mask)
++
++    assert mask == [1, 1, 1, 0, 0, 1, 1, 0]
++    trained = np.asarray(mask, dtype=bool)
++    np.testing.assert_array_equal(ids[trained], np.concatenate([turn1[0], turn2[0]]))
++    np.testing.assert_array_equal(log_probs[trained], np.concatenate([turn1[1], turn2[1]]))
++    np.testing.assert_array_equal(ids[~trained], np.broadcast_to(np.arange(k), (int((~trained).sum()), k)))
++    np.testing.assert_allclose(log_probs[~trained], -np.log(k))
++
++
++def test_align_response_topk_rejects_missing_or_misshapen_assistant_heads():
++    k = 4
++    empty = (np.zeros((0, k), dtype=np.int32), np.zeros((0, k), dtype=np.float32))
++    merge = MergeResult(token_ids=[], appended_token_count=2, kind="assistant")
++
++    with pytest.raises(ValueError, match="required"):
++        ContinuousTokenBuilder.align_response_topk(merge, *empty)
++    ids, log_probs = _topk_heads(3, k, start=0)
++    with pytest.raises(ValueError, match="shape"):
++        ContinuousTokenBuilder.align_response_topk(
++            merge, *empty, assistant_topk_ids=ids, assistant_topk_log_probs=log_probs
++        )
+diff --git a/tests/utils/test_score_centering_padding_on_cpu.py b/tests/utils/test_score_centering_padding_on_cpu.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..039ae7b2031080d1e6b546c67864996a4f856912
+--- /dev/null
++++ b/tests/utils/test_score_centering_padding_on_cpu.py
+@@ -0,0 +1,74 @@
++import torch
++from tensordict import TensorDict
++
++from verl.trainer.ppo.padding_utils import construct_minimal_padding_template
++from verl.trainer.ppo.score_centering import pad_rollout_topk
++from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
++
++
++def test_rollout_topk_survives_no_padding_roundtrip_aligned_with_responses():
++    k, prompt_width, response_width = 2, 6, 5
++    prompt_lengths, response_lengths = [4, 6], [3, 5]
++    ids_rows, log_rows, attention, response_mask = [], [], [], []
++    for b, (p_len, r_len) in enumerate(zip(prompt_lengths, response_lengths, strict=False)):
++        heads = [[100 * b + r, 100 * b + r + 50] for r in range(r_len)]
++        log_head = [[-0.5 - r, -1.0] for r in range(r_len)]
++        ids, log_probs = pad_rollout_topk(
++            heads,
++            log_head,
++            k=k,
++            prompt_width=prompt_width,
++            response_width=response_width,
++            response_length=r_len,
++        )
++        ids_rows.append(ids)
++        log_rows.append(log_probs)
++        mask = torch.zeros(prompt_width + response_width, dtype=torch.int64)
++        mask[prompt_width - p_len : prompt_width + r_len] = 1
++        attention.append(mask)
++        rmask = torch.zeros(response_width, dtype=torch.int64)
++        rmask[:r_len] = 1
++        response_mask.append(rmask)
++    total = prompt_width + response_width
++    batch = TensorDict(
++        {
++            "input_ids": torch.randint(0, 50, (2, total)),
++            "attention_mask": torch.stack(attention),
++            "response_mask": torch.stack(response_mask),
++            "position_ids": torch.arange(total).expand(2, total).clone(),
++            "prompts": torch.randint(0, 50, (2, prompt_width)),
++            "responses": torch.randint(0, 50, (2, response_width)),
++            "rollout_topk_ids": torch.cat(ids_rows),
++            "rollout_topk_log_probs": torch.cat(log_rows),
++        },
++        batch_size=[2],
++    )
++    data = left_right_2_no_padding(batch)
++    assert data["rollout_topk_ids"].is_nested and data["rollout_topk_log_probs"].is_nested
++    padded_ids = no_padding_2_padding(data["rollout_topk_ids"], data)
++    padded_log_probs = no_padding_2_padding(data["rollout_topk_log_probs"], data)
++    assert padded_ids.shape == padded_log_probs.shape == (2, response_width, k)
++    for b, r_len in enumerate(response_lengths):
++        assert padded_ids[b, :r_len, 0].tolist() == [100 * b + r for r in range(r_len)]
++        torch.testing.assert_close(padded_log_probs[b, :r_len, 0], torch.tensor([-0.5 - r for r in range(r_len)]))
++
++
++def test_padding_template_uses_dummy_heads():
++    k = 3
++    sample = TensorDict(
++        {
++            "prompts": torch.zeros(4, dtype=torch.int64),
++            "responses": torch.zeros(2, dtype=torch.int64),
++            "input_ids": torch.zeros(6, dtype=torch.int64),
++            "attention_mask": torch.ones(6, dtype=torch.int64),
++            "response_mask": torch.ones(2, dtype=torch.int64),
++            "position_ids": torch.arange(6),
++            "rollout_topk_ids": torch.zeros(6, k, dtype=torch.int32),
++            "rollout_topk_log_probs": torch.zeros(6, k),
++        },
++        batch_size=[],
++    )
++    template, _ = construct_minimal_padding_template(sample, {}, eos_token_id=0)
++    seq_len = template["input_ids"].shape[0]
++    assert template["rollout_topk_ids"].shape == (seq_len, k)
++    torch.testing.assert_close(template["rollout_topk_log_probs"].exp().sum(-1), torch.ones(seq_len))
+diff --git a/tests/workers/rollout/rollout_vllm/test_topk_logprobs_extract_on_cpu.py b/tests/workers/rollout/rollout_vllm/test_topk_logprobs_extract_on_cpu.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f6049985eb712c3e8a1220bb2b3eb69f4e8c8ce0
+--- /dev/null
++++ b/tests/workers/rollout/rollout_vllm/test_topk_logprobs_extract_on_cpu.py
+@@ -0,0 +1,61 @@
++import numpy as np
++import pytest
++
++vllm_logprobs = pytest.importorskip("vllm.logprobs")
++
++from verl.workers.rollout.utils import extract_response_topk_logprobs  # noqa: E402
++
++K = 3
++
++
++def _vllm_positions(flat: bool):
++    """Two generated positions recorded the way vLLM's sampler records them: the sampled token, then the top-k."""
++    container = vllm_logprobs.create_sample_logprobs(flat)
++    # position 0: the sampled token 7 is the top-1 token (vLLM lists it twice)
++    vllm_logprobs.append_logprobs_for_next_position(
++        container, [7, 7, 3, 9], [-0.1, -0.1, -1.5, -2.0], [None] * 4, rank=1, num_logprobs=K
++    )
++    # position 1: the sampled token 42 is outside the head (rank 17)
++    vllm_logprobs.append_logprobs_for_next_position(
++        container, [42, 3, 7, 9], [-8.0, -0.2, -1.0, -1.9], [None] * 4, rank=17, num_logprobs=K
++    )
++    return container
++
++
++def test_extract_splits_sampled_token_and_head_by_rank():
++    sampled, ids, log_probs = extract_response_topk_logprobs(_vllm_positions(flat=True), [7, 42], K)
++
++    np.testing.assert_allclose(sampled, [-0.1, -8.0], rtol=1e-6)
++    assert ids.dtype == np.int32 and log_probs.dtype == np.float32
++    np.testing.assert_array_equal(ids, [[7, 3, 9], [3, 7, 9]])
++    np.testing.assert_allclose(log_probs, [[-0.1, -1.5, -2.0], [-0.2, -1.0, -1.9]], rtol=1e-6)
++
++
++def test_extract_matches_the_dict_layout():
++    # the per-position dicts of the default (non-flat) layout hold the same head and sampled log-prob
++    positions = _vllm_positions(flat=False)
++    sampled, ids, log_probs = extract_response_topk_logprobs(_vllm_positions(flat=True), [7, 42], K)
++
++    for i, (token_id, position) in enumerate(zip([7, 42], positions, strict=True)):
++        assert position[token_id].logprob == pytest.approx(sampled[i])
++        head = sorted((lp.rank, tid, lp.logprob) for tid, lp in position.items() if lp.rank <= K)
++        assert [tid for _, tid, _ in head] == ids[i].tolist()
++        np.testing.assert_allclose([lp for _, _, lp in head], log_probs[i], rtol=1e-6)
++
++
++def test_extract_handles_an_empty_generation():
++    sampled, ids, log_probs = extract_response_topk_logprobs(vllm_logprobs.create_sample_logprobs(True), [], K)
++
++    assert sampled == [] and ids.shape == (0, K) and log_probs.shape == (0, K)
++
++
++def test_extract_rejects_dict_logprobs():
++    with pytest.raises(TypeError):
++        extract_response_topk_logprobs(_vllm_positions(flat=False), [7, 42], K)
++
++
++def test_extract_rejects_a_sampled_token_mismatch_and_a_short_head():
++    with pytest.raises(ValueError, match="laid out"):
++        extract_response_topk_logprobs(_vllm_positions(flat=True), [7, 43], K)
++    with pytest.raises(ValueError, match="entries"):
++        extract_response_topk_logprobs(_vllm_positions(flat=True), [7, 42], K + 1)
+diff --git a/tests/workers/rollout/test_llm_server_topk_heads_on_cpu.py b/tests/workers/rollout/test_llm_server_topk_heads_on_cpu.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..977f03fc767992c3a890b7454c08be3a8a727b88
+--- /dev/null
++++ b/tests/workers/rollout/test_llm_server_topk_heads_on_cpu.py
+@@ -0,0 +1,73 @@
++import asyncio
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++
++from verl.workers.rollout import llm_server
++from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient
++from verl.workers.rollout.replica import TokenOutput
++
++K = 3
++
++
++def _heads(first: int, count: int) -> dict:
++    """Sampler top-k heads for `count` generated tokens, row i holding ids first+i.. and log-probs -(first+i)."""
++    ids = (np.arange(first, first + count)[:, None] + np.arange(K)[None, :]).astype(np.int32)
++    return {"response_topk_ids": ids, "response_topk_log_probs": -ids.astype(np.float32)}
++
++
++def _install_segments(monkeypatch: pytest.MonkeyPatch, segments: list[TokenOutput]) -> None:
++    """Script the upstream so each resume attempt returns the next segment (the base class is patched: super())."""
++    pending = iter(segments)
++
++    async def fake_generate(self, request_id, *, prompt_ids, **kwargs):
++        return next(pending)
++
++    monkeypatch.setattr(llm_server.LLMServerClient, "generate", fake_generate)
++    real_sleep = asyncio.sleep
++
++    async def no_wait(_delay, *args, **kwargs):
++        return await real_sleep(0, *args, **kwargs)
++
++    monkeypatch.setattr(llm_server.asyncio, "sleep", no_wait)
++
++
++def _generate(monkeypatch, segments: list[TokenOutput]) -> TokenOutput:
++    _install_segments(monkeypatch, segments)
++    client = FullyAsyncLLMServerClient(config=SimpleNamespace(), load_balancer_handle=None)
++    return asyncio.run(client.generate(request_id="req-0", prompt_ids=[1, 2, 3], sampling_params={}))
++
++
++def test_heads_of_every_attempt_are_concatenated(monkeypatch):
++    # two aborts (the second one empty, as an abort before any token is sampled) then completion
++    segments = [
++        TokenOutput(token_ids=[101, 102], stop_reason="aborted", extra_fields={"global_steps": 5, **_heads(100, 2)}),
++        TokenOutput(token_ids=[], stop_reason="aborted", extra_fields={"global_steps": 5}),
++        TokenOutput(
++            token_ids=[103, 104, 105], stop_reason="completed", extra_fields={"global_steps": 6, **_heads(200, 3)}
++        ),
++    ]
++    output = _generate(monkeypatch, segments)
++
++    assert output.token_ids == [101, 102, 103, 104, 105]
++    expected = np.concatenate([_heads(100, 2)["response_topk_ids"], _heads(200, 3)["response_topk_ids"]])
++    np.testing.assert_array_equal(output.extra_fields["response_topk_ids"], expected)
++    np.testing.assert_array_equal(output.extra_fields["response_topk_log_probs"], -expected.astype(np.float32))
++    assert (output.extra_fields["min_global_steps"], output.extra_fields["max_global_steps"]) == (5, 6)
++
++
++def test_no_heads_requested_adds_no_fields(monkeypatch):
++    segment = TokenOutput(token_ids=[101], stop_reason="completed", extra_fields={"global_steps": 5})
++    output = _generate(monkeypatch, [segment])
++
++    assert "response_topk_ids" not in output.extra_fields
++
++
++def test_tokens_without_heads_fail_loudly(monkeypatch):
++    segments = [
++        TokenOutput(token_ids=[101, 102], stop_reason="aborted", extra_fields={"global_steps": 5, **_heads(100, 2)}),
++        TokenOutput(token_ids=[103], stop_reason="completed", extra_fields={"global_steps": 6}),
++    ]
++    with pytest.raises(RuntimeError, match="2 sampler top-k heads for 3 generated tokens"):
++        _generate(monkeypatch, segments)
+diff --git a/tests/workers/test_score_centering_wiring_on_cpu.py b/tests/workers/test_score_centering_wiring_on_cpu.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4439cae23721df0b0b398b20e41e499731ac88ed
+--- /dev/null
++++ b/tests/workers/test_score_centering_wiring_on_cpu.py
+@@ -0,0 +1,71 @@
++"""CPU coverage for score centering's worker wiring: the actor-side config reading and the FSDP engine outputs."""
++
++from unittest.mock import patch
++
++import pytest
++import torch
++from tensordict import TensorDict
++
++from verl.utils import tensordict_utils as tu
++from verl.utils.config import omega_conf_to_dataclass
++from verl.utils.dataset.dataset_utils import DatasetPadMode
++from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead
++
++
++def test_actor_config_reads_mapping_rollout_correction():
++    # `+` overrides add the actor-side rollout_correction without a `_target_`, so it stays a dict and
++    # the worker must read the flag through the mapping interface, as init_model does.
++    config = omega_conf_to_dataclass(
++        {
++            "_target_": "verl.workers.config.ActorConfig",
++            "strategy": "fsdp",
++            "rollout_n": 1,
++            "ppo_micro_batch_size_per_gpu": 1,
++            "policy_loss": {
++                "_target_": "verl.workers.config.PolicyLossConfig",
++                "loss_mode": "bypass_mode",
++                "rollout_correction": {"bypass_mode": True, "loss_type": "reinforce", "score_centering": True},
++            },
++        }
++    )
++    assert isinstance(config.policy_loss.rollout_correction, dict)
++    assert (config.policy_loss.get("rollout_correction", None) or {}).get("score_centering", False)
++
++
++@pytest.mark.parametrize("use_remove_padding", [True, False])
++@pytest.mark.parametrize("score_centering", [True, False])
++def test_prepare_model_outputs_keeps_logits_intact_for_score_centering(use_remove_padding, score_centering):
++    """The score centering hook saves the logits and re-reads them in its backward, so the engine
++    must not run the flash-attn cross-entropy backward that writes the gradient into the logits."""
++    seq_lengths = torch.tensor([3, 2])
++    total_nnz, vocab_size = int(seq_lengths.sum()), 8
++    cu_seqlens = torch.cat([torch.tensor([0]), seq_lengths.cumsum(0)])
++    input_ids = torch.nested.nested_tensor_from_jagged(torch.randint(0, vocab_size, (total_nnz,)), offsets=cu_seqlens)
++    output = type("Output", (), {})()
++    output_args = {"input_ids_rmpad_rolled": torch.randint(0, vocab_size, (total_nnz,))}
++    if use_remove_padding:
++        output.logits = torch.randn(1, total_nnz, vocab_size)
++        output_args.update(temperature_rmpad=torch.ones(total_nnz), pad_size=0)
++    else:
++        output.logits = torch.randn(2, 3, vocab_size)
++        output_args["temperature"] = torch.ones(2)
++
++    micro_batch = TensorDict({"input_ids": input_ids}, batch_size=[])
++    tu.assign_non_tensor(
++        micro_batch,
++        use_remove_padding=use_remove_padding,
++        pad_mode=DatasetPadMode.NO_PADDING,
++        score_centering=score_centering,
++    )
++    engine = object.__new__(FSDPEngineWithLMHead)
++    engine.use_ulysses_sp = False
++
++    def logits_processor(student_logits, data):
++        return {"sc_correction": torch.zeros(student_logits.shape[:2])}
++
++    with patch(
++        "verl.workers.engine.fsdp.transformer_impl.logprobs_from_logits", return_value=torch.zeros(total_nnz)
++    ) as mock_logprobs:
++        FSDPEngineWithLMHead.prepare_model_outputs(engine, output, output_args, micro_batch, logits_processor)
++
++    assert mock_logprobs.call_args.kwargs.get("inplace_backward", True) is not score_centering
+diff --git a/verl/experimental/agent_loop/agent_loop.py b/verl/experimental/agent_loop/agent_loop.py
+index d0e3038ec30881534ca2236a4a662b4ab5324832..9ac398bce89247b66bc43c14e4ed3201f21d257f 100644
+--- a/verl/experimental/agent_loop/agent_loop.py
++++ b/verl/experimental/agent_loop/agent_loop.py
+@@ -158,6 +158,26 @@ class AgentLoopOutput(BaseModel):
+             output["teacher_ids"] = teacher_ids
+         if teacher_logprobs is not None:
+             output["teacher_logprobs"] = teacher_logprobs
++        response_topk_ids, response_topk_log_probs = (
++            extra_fields.pop("response_topk_ids", None),
++            extra_fields.pop("response_topk_log_probs", None),
++        )
++        if response_topk_ids is not None and response_topk_log_probs is not None:
++            from verl.trainer.ppo.score_centering import pad_rollout_topk
++
++            # one head per response token, multi-turn included: context tokens carry placeholder heads
++            # (ContinuousTokenBuilder.align_response_topk)
++            prompt_length, response_length = output["prompts"].size(0), output["responses"].size(0)
++            rollout_topk_ids, rollout_topk_log_probs = pad_rollout_topk(
++                response_topk_ids,
++                response_topk_log_probs,
++                k=len(response_topk_ids[0]),
++                prompt_width=prompt_length,
++                response_width=response_length,
++                response_length=response_length,
++            )
++            output["rollout_topk_ids"] = rollout_topk_ids.squeeze(0)
++            output["rollout_topk_log_probs"] = rollout_topk_log_probs.squeeze(0)
+         return output
+ 
+ 
+@@ -184,6 +204,10 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
+     """Padded log probabilities from teacher model for prompt/response tokens."""
+     teacher_ids: Optional[torch.Tensor] = None
+     """Padded token ids corresponding to the teacher log probabilities."""
++    rollout_topk_ids: Optional[torch.Tensor] = None
++    """Padded sampler top-k token ids over the full sequence, for score centering."""
++    rollout_topk_log_probs: Optional[torch.Tensor] = None
++    """Padded sampler top-k log-probs over the full sequence, for score centering."""
+     routed_experts: Optional[torch.Tensor] = None
+     """Padded routed experts for the total tokens."""
+     multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None
+@@ -593,6 +617,7 @@ class AgentLoopWorker:
+             top_k=config.top_k,
+             repetition_penalty=1.0,
+             logprobs=config.calculate_log_probs,
++            topk_log_probs=config.topk_log_probs,
+         )
+ 
+         def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
+@@ -605,6 +630,8 @@ class AgentLoopWorker:
+             sampling_params["top_p"] = config.val_kwargs.top_p
+             sampling_params["top_k"] = config.val_kwargs.top_k
+             sampling_params["temperature"] = config.val_kwargs.temperature
++            # the trainer never consumes the sampler head on validation rollouts
++            sampling_params["topk_log_probs"] = 0
+ 
+         # by default, we assume it's a single turn agent
+         if "agent_name" not in batch.non_tensor_batch:
+@@ -845,6 +872,23 @@ class AgentLoopWorker:
+                 pad_token_id=self.tokenizer.pad_token_id,
+             )
+ 
++        rollout_topk_ids = rollout_topk_log_probs = None
++        if self.rollout_config.topk_log_probs and not validate:
++            from verl.trainer.ppo.score_centering import pad_rollout_topk
++
++            # one head per response token, multi-turn included: context tokens carry placeholder heads
++            # (ContinuousTokenBuilder.align_response_topk)
++            if "response_topk_ids" not in output.extra_fields:
++                raise ValueError("rollout.topk_log_probs is set but the rollout returned no sampler top-k head.")
++            rollout_topk_ids, rollout_topk_log_probs = pad_rollout_topk(
++                output.extra_fields.pop("response_topk_ids"),
++                output.extra_fields.pop("response_topk_log_probs"),
++                k=self.rollout_config.topk_log_probs,
++                prompt_width=prompt_output["input_ids"].shape[1],
++                response_width=response_output["input_ids"].shape[1],
++                response_length=len(output.response_ids),
++            )
++
+         return _InternalAgentLoopOutput(
+             prompt_ids=prompt_output["input_ids"],
+             response_ids=response_output["input_ids"],
+@@ -859,6 +903,8 @@ class AgentLoopWorker:
+             mm_processor_kwargs=output.mm_processor_kwargs,
+             teacher_logprobs=teacher_logprobs,
+             teacher_ids=teacher_ids,
++            rollout_topk_ids=rollout_topk_ids,
++            rollout_topk_log_probs=rollout_topk_log_probs,
+             reward_score=output.reward_score,
+             num_turns=output.num_turns,
+             metrics=output.metrics,
+@@ -1076,6 +1122,11 @@ class AgentLoopWorker:
+         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
+             optional_outputs["teacher_logprobs"] = torch.cat([input.teacher_logprobs for input in inputs], dim=0)
+             optional_outputs["teacher_ids"] = torch.cat([input.teacher_ids for input in inputs], dim=0)
++        if inputs[0].rollout_topk_ids is not None:
++            optional_outputs["rollout_topk_ids"] = torch.cat([input.rollout_topk_ids for input in inputs], dim=0)
++            optional_outputs["rollout_topk_log_probs"] = torch.cat(
++                [input.rollout_topk_log_probs for input in inputs], dim=0
++            )
+         batch = TensorDict(
+             {
+                 "prompts": prompt_ids,  # [bsz, prompt_length]
+diff --git a/verl/experimental/agent_loop/tool_agent_loop.py b/verl/experimental/agent_loop/tool_agent_loop.py
+index 365159c18ffb7e3d6977485d9647ae20fd9d4d42..8e82e5771859b87475d0e621114a61e903cfdca6 100644
+--- a/verl/experimental/agent_loop/tool_agent_loop.py
++++ b/verl/experimental/agent_loop/tool_agent_loop.py
+@@ -19,6 +19,7 @@ from enum import Enum
+ from typing import Any, Optional
+ from uuid import uuid4
+ 
++import numpy as np
+ import torch
+ from PIL import Image
+ 
+@@ -84,6 +85,10 @@ class AgentData:
+         self.response_ids: list[int] = []
+         self.response_mask: list[int] = []
+         self.response_logprobs: list[float] = []
++        # Sampler top-k head of every response token (score centering), shape (len(response_mask), k); None when the
++        # rollout does not request heads
++        self.response_topk_ids: Optional[np.ndarray] = None
++        self.response_topk_log_probs: Optional[np.ndarray] = None
+         self.turn_scores: list[float] = []
+         self.tool_rewards: list[float] = []
+         self.user_turns = 0
+@@ -152,6 +157,10 @@ class ToolAgentLoop(AgentLoopBase):
+             request_id=request_id,
+             tools_kwargs=tools_kwargs,
+         )
++        topk = sampling_params.get("topk_log_probs", 0)  # 0 on validation rollouts
++        if topk:
++            agent_data.response_topk_ids = np.zeros((0, topk), dtype=np.int32)
++            agent_data.response_topk_log_probs = np.zeros((0, topk), dtype=np.float32)
+ 
+         # Per-sample tool selection: filter global tools by extra_info.tool_selection
+         extra_info = kwargs.get("extra_info", {}) or {}
+@@ -210,6 +219,14 @@ class ToolAgentLoop(AgentLoopBase):
+             extra_fields=agent_data.extra_fields,
+         )
+         output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})
++        if agent_data.response_topk_ids is not None:
++            if len(agent_data.response_topk_ids) != len(agent_data.response_mask):
++                raise RuntimeError(
++                    f"{len(agent_data.response_topk_ids)} sampler top-k heads for "
++                    f"{len(agent_data.response_mask)} response tokens"
++                )
++            output.extra_fields["response_topk_ids"] = agent_data.response_topk_ids[: self.response_length]
++            output.extra_fields["response_topk_log_probs"] = agent_data.response_topk_log_probs[: self.response_length]
+         return output
+ 
+     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
+@@ -258,6 +275,11 @@ class ToolAgentLoop(AgentLoopBase):
+         else:
+             agent_data.metrics["num_preempted"] += output.num_preempted if output.num_preempted is not None else 0
+ 
++        # Sampler top-k heads belong to this turn's tokens: they accumulate per response token, not as a first-turn
++        # extra field
++        assistant_topk_ids = output.extra_fields.pop("response_topk_ids", None)
++        assistant_topk_log_probs = output.extra_fields.pop("response_topk_log_probs", None)
++
+         if not agent_data.extra_fields:
+             agent_data.extra_fields.update(output.extra_fields)
+         else:
+@@ -282,6 +304,16 @@ class ToolAgentLoop(AgentLoopBase):
+         agent_data.response_mask = response_mask
+         if response_logprobs is not None:
+             agent_data.response_logprobs = response_logprobs
++        if agent_data.response_topk_ids is not None:
++            agent_data.response_topk_ids, agent_data.response_topk_log_probs = (
++                self.continuous_token_builder.align_response_topk(
++                    merge_result,
++                    agent_data.response_topk_ids,
++                    agent_data.response_topk_log_probs,
++                    assistant_topk_ids=assistant_topk_ids,
++                    assistant_topk_log_probs=assistant_topk_log_probs,
++                )
++            )
+ 
+         if output.routed_experts is not None:
+             agent_data.routed_experts = output.routed_experts
+@@ -397,6 +429,12 @@ class ToolAgentLoop(AgentLoopBase):
+         agent_data.response_mask = response_mask
+         if agent_data.response_logprobs:
+             agent_data.response_logprobs = response_logprobs or []
++        if agent_data.response_topk_ids is not None:
++            agent_data.response_topk_ids, agent_data.response_topk_log_probs = (
++                self.continuous_token_builder.align_response_topk(
++                    merge_result, agent_data.response_topk_ids, agent_data.response_topk_log_probs
++                )
++            )
+ 
+         # Keep original image objects for rollout and final multimodal postprocessing.
+         if new_images_this_turn:
+diff --git a/verl/trainer/config/_generated_ppo_megatron_trainer.yaml b/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
+index d220c9f9bc47f269299d240144f0919618fb30e8..5510052c390034220baf1fb204e93b49caef4462 100644
+--- a/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
+@@ -372,6 +372,7 @@ actor_rollout_ref:
+       format: hermes
+       num_repeat_rollouts: null
+     calculate_log_probs: true
++    topk_log_probs: 0
+     agent:
+       _target_: verl.workers.config.AgentLoopConfig
+       num_workers: 8
+@@ -892,6 +893,7 @@ algorithm:
+     bypass_mode: false
+     loss_type: ppo_clip
+     rollout_is_batch_normalize: false
++    score_centering: false
+   _target_: verl.trainer.config.AlgoConfig
+   gamma: 1.0
+   lam: 1.0
+diff --git a/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml b/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
+index 5cef8d26e19de8646fa0ce9da934ac017d41768d..c98cb91ce7e2ec7cbc7ba0eff642d78a75490938 100644
+--- a/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
+@@ -316,6 +316,7 @@ actor_rollout_ref:
+       format: hermes
+       num_repeat_rollouts: null
+     calculate_log_probs: true
++    topk_log_probs: 0
+     agent:
+       _target_: verl.workers.config.AgentLoopConfig
+       num_workers: 8
+@@ -787,6 +788,7 @@ algorithm:
+     bypass_mode: false
+     loss_type: ppo_clip
+     rollout_is_batch_normalize: false
++    score_centering: false
+   _target_: verl.trainer.config.AlgoConfig
+   gamma: 1.0
+   lam: 1.0
+diff --git a/verl/trainer/config/_generated_ppo_trainer.yaml b/verl/trainer/config/_generated_ppo_trainer.yaml
+index 6edb32c89c9e3a9cbdb6baad1ea6694bd7fe35c1..2151b29c52aa31d773c53893dcd346be6508ebd6 100644
+--- a/verl/trainer/config/_generated_ppo_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_trainer.yaml
+@@ -357,6 +357,7 @@ actor_rollout_ref:
+       format: hermes
+       num_repeat_rollouts: null
+     calculate_log_probs: true
++    topk_log_probs: 0
+     agent:
+       _target_: verl.workers.config.AgentLoopConfig
+       num_workers: 8
+@@ -856,6 +857,7 @@ algorithm:
+     bypass_mode: false
+     loss_type: ppo_clip
+     rollout_is_batch_normalize: false
++    score_centering: false
+   _target_: verl.trainer.config.AlgoConfig
+   gamma: 1.0
+   lam: 1.0
+diff --git a/verl/trainer/config/_generated_ppo_veomni_trainer.yaml b/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
+index 25a703c6d847909c5fe4838859bf9ca79f7ec9c1..a8fa35f8e6729673c6eb2ddd5d1965fa3c85550d 100644
+--- a/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
+@@ -338,6 +338,7 @@ actor_rollout_ref:
+       format: hermes
+       num_repeat_rollouts: null
+     calculate_log_probs: true
++    topk_log_probs: 0
+     agent:
+       _target_: verl.workers.config.AgentLoopConfig
+       num_workers: 8
+@@ -827,6 +828,7 @@ algorithm:
+     bypass_mode: false
+     loss_type: ppo_clip
+     rollout_is_batch_normalize: false
++    score_centering: false
+   _target_: verl.trainer.config.AlgoConfig
+   gamma: 1.0
+   lam: 1.0
+diff --git a/verl/trainer/config/algorithm.py b/verl/trainer/config/algorithm.py
+index a13468502624dc8a5dd72d3cbf782205704d0543..88f0a7a9d4940b9aaa23e49b3d130ae1780e28cf 100644
+--- a/verl/trainer/config/algorithm.py
++++ b/verl/trainer/config/algorithm.py
+@@ -138,6 +138,12 @@ class RolloutCorrectionConfig(BaseConfig):
+               L = -E[min(r*A, clip(r)*A)] where r = π_current / π_rollout
+             Default: "ppo_clip"
+ 
++        score_centering (bool): Subtract the expected score under the sampler from every token's
++            score, see the score centering reference below. Needs the sampler's top-k log-probs
++            from the rollout (``actor_rollout_ref.rollout.topk_log_probs``). Only with
++            ``bypass_mode=True``, ``loss_type="reinforce"`` and ``rollout_is`` None or "token".
++            Default: False
++
+     Example:
+         # Create with defaults
+         config = RolloutCorrectionConfig()
+@@ -160,6 +166,10 @@ class RolloutCorrectionConfig(BaseConfig):
+         config = RolloutCorrectionConfig.bypass_pg_geo_rs()             # REINFORCE + Geo-RS
+         config = RolloutCorrectionConfig.bypass_pg_geo_rs_seq_tis()     # REINFORCE + Geo-RS + Seq-TIS
+         config = RolloutCorrectionConfig.bypass_pg_geo_rs_token_tis()   # REINFORCE + Geo-RS + Token-TIS
++        # Score centering presets (needs rollout.topk_log_probs > 0):
++        config = RolloutCorrectionConfig.bypass_pg_sc()                 # REINFORCE + score centering
++        config = RolloutCorrectionConfig.bypass_pg_token_tis_sc()       # REINFORCE + Token-TIS + score centering
++        config = RolloutCorrectionConfig.bypass_pg_token_icepop_sc()    # REINFORCE + Token-IcePop + score centering
+ 
+         # Decoupled Geometric ratio presets (length-normalized IS ratio)
+         config = RolloutCorrectionConfig.decoupled_geo_rs_seq_tis()           # Decoupled Geo-RS + Seq-TIS
+@@ -174,6 +184,10 @@ class RolloutCorrectionConfig(BaseConfig):
+         Liu, Li, Fu, Wang, Liu, Shen (2025)
+         "When Speed Kills Stability: Demystifying RL Collapse from the Training-Inference Mismatch"
+         https://richardli.xyz/rl-collapse
++
++        Marek, Ryabinin (2026)
++        "Score Centering Stabilizes Off-policy Reinforcement Learning"
++        https://arxiv.org/abs/2609.20807
+     """
+ 
+     rollout_is: Optional[str] = "sequence"
+@@ -183,6 +197,17 @@ class RolloutCorrectionConfig(BaseConfig):
+     rollout_rs_threshold: Optional[str | float] = None
+     bypass_mode: bool = False
+     loss_type: str = "ppo_clip"
++    score_centering: bool = False
++
++    def __post_init__(self):
++        if not self.score_centering:
++            return
++        if not self.bypass_mode or self.loss_type != "reinforce":
++            raise ValueError("score_centering requires bypass_mode=True and loss_type='reinforce'.")
++        if self.rollout_is not in (None, "token"):
++            raise ValueError("score_centering requires rollout_is=None or rollout_is='token'.")
++        if self.rollout_is_batch_normalize:
++            raise ValueError("score_centering requires rollout_is_batch_normalize=False.")
+ 
+     @classmethod
+     def decoupled_token_is(cls, threshold: float = 2.0) -> "RolloutCorrectionConfig":
+@@ -396,6 +421,58 @@ class RolloutCorrectionConfig(BaseConfig):
+             loss_type="reinforce",
+         )
+ 
++    @classmethod
++    def bypass_pg_sc(cls) -> "RolloutCorrectionConfig":
++        """Bypass mode with REINFORCE loss and score centering, no IS weights.
++
++        Returns:
++            RolloutCorrectionConfig configured for bypass mode with REINFORCE + score centering
++        """
++        return cls(rollout_is=None, rollout_rs=None, bypass_mode=True, loss_type="reinforce", score_centering=True)
++
++    @classmethod
++    def bypass_pg_token_tis_sc(cls, threshold: float = 2.0) -> "RolloutCorrectionConfig":
++        """Bypass mode with REINFORCE loss, token-level TIS and score centering.
++
++        Args:
++            threshold (float): Upper threshold for IS weights. Default: 2.0
++
++        Returns:
++            RolloutCorrectionConfig configured for bypass mode with REINFORCE + token-level TIS + score centering
++        """
++        return cls(
++            rollout_is="token",
++            rollout_is_threshold=threshold,
++            rollout_rs=None,
++            bypass_mode=True,
++            loss_type="reinforce",
++            score_centering=True,
++        )
++
++    @classmethod
++    def bypass_pg_token_icepop_sc(
++        cls,
++        threshold: float = 5.0,
++        threshold_lower: float = 0.5,
++    ) -> "RolloutCorrectionConfig":
++        """Bypass mode with REINFORCE loss, token-level IcePop and score centering.
++
++        Args:
++            threshold (float): Upper IcePop bound. Default: 5.0
++            threshold_lower (float): Lower IcePop bound. Default: 0.5
++
++        Returns:
++            RolloutCorrectionConfig configured for bypass mode with REINFORCE + token-level IcePop + score centering
++        """
++        return cls(
++            rollout_is="token",
++            rollout_is_threshold=f"{threshold_lower}_{threshold}",
++            rollout_rs=None,
++            bypass_mode=True,
++            loss_type="reinforce",
++            score_centering=True,
++        )
++
+     @classmethod
+     def bypass_pg_geo_rs(
+         cls,
+diff --git a/verl/trainer/config/algorithm/rollout_correction.yaml b/verl/trainer/config/algorithm/rollout_correction.yaml
+index 60cc00e9265f8e5f8eeb44789de5cf2c6e169511..61de5add32fd20695b8e1eeaf92b6c72ac522356 100644
+--- a/verl/trainer/config/algorithm/rollout_correction.yaml
++++ b/verl/trainer/config/algorithm/rollout_correction.yaml
+@@ -26,3 +26,7 @@ loss_type: ppo_clip
+ 
+ # Batch normalize IS weights: false = raw weights, true = normalize to mean=1.0
+ rollout_is_batch_normalize: false
++
++# Score centering (bypass_mode=true, loss_type=reinforce, rollout_is null or "token").
++# Needs actor_rollout_ref.rollout.topk_log_probs > 0.
++score_centering: false
+diff --git a/verl/trainer/config/rollout/rollout.yaml b/verl/trainer/config/rollout/rollout.yaml
+index 3e97fec9c8a5d7f4848a232db2e9e72f17db3478..3c929e47c998cec2acb09b4d15f94326cad06ef3 100644
+--- a/verl/trainer/config/rollout/rollout.yaml
++++ b/verl/trainer/config/rollout/rollout.yaml
+@@ -239,6 +239,11 @@ multi_turn:
+ # "Truncated importance sampling" requires rollout log probs, set to True when turning on Truncated importance sampling
+ calculate_log_probs: True
+ 
++# Sampler top-k log-probs per generated token, needed by algorithm.rollout_correction.score_centering.
++# 0 disables; the paper uses 128. vLLM only; multi-turn loops give their context tokens
++# placeholder heads (ContinuousTokenBuilder.align_response_topk).
++topk_log_probs: 0
++
+ # [Experimental] agent loop based rollout configs
+ agent:
+ 
+diff --git a/verl/trainer/ppo/core_algos.py b/verl/trainer/ppo/core_algos.py
+index 9d08b8461a0f95d25f348c566358360bbfb72ece..a2724d4f9936e75a09ddb700c69f725fb0b799ec 100644
+--- a/verl/trainer/ppo/core_algos.py
++++ b/verl/trainer/ppo/core_algos.py
+@@ -2338,6 +2338,7 @@ def compute_policy_loss_reinforce(
+     loss_agg_mode: str = "seq-mean-token-sum",
+     config: Optional[ActorConfig] = None,
+     rollout_is_weights: Optional[torch.Tensor] = None,
++    sc_correction: Optional[torch.Tensor] = None,
+ ) -> tuple[torch.Tensor, dict[str, Any]]:
+     """Compute REINFORCE-style policy gradient loss with optional IS correction.
+ 
+@@ -2367,6 +2368,8 @@ def compute_policy_loss_reinforce(
+         config: Actor config (required for global_batch_info).
+         rollout_is_weights: Pre-computed IS weights (π_current / π_rollout).
+             Shape: (batch_size, seq_length). None to disable IS correction.
++        sc_correction: Score-centering term per token, added as ``advantages * sc_correction``
++            after the IS weighting. Shape: (batch_size, seq_length). None to disable.
+ 
+     Returns:
+         Tuple of (loss, metrics):
+@@ -2390,6 +2393,8 @@ def compute_policy_loss_reinforce(
+     else:
+         # Standard REINFORCE: L = -E[log π · A]
+         pg_losses = -advantages * log_prob
++    if sc_correction is not None:
++        pg_losses = pg_losses + advantages * sc_correction
+ 
+     # Aggregate loss
+     pg_loss = agg_loss(
+@@ -2406,6 +2411,8 @@ def compute_policy_loss_reinforce(
+     pg_metrics = {
+         "actor/ppo_kl": kl_divergence.detach().item(),
+     }
++    if sc_correction is not None:
++        pg_metrics["actor/sc_correction"] = verl_F.masked_mean(sc_correction.detach(), response_mask).item()
+ 
+     return pg_loss, pg_metrics
+ 
+@@ -2419,6 +2426,7 @@ def compute_policy_loss_bypass_mode(
+     loss_agg_mode: str = "token-mean",
+     config: Optional[ActorConfig] = None,
+     rollout_is_weights: torch.Tensor | None = None,
++    sc_correction: Optional[torch.Tensor] = None,
+ ) -> tuple[torch.Tensor, dict[str, Any]]:
+     """Bypass mode policy loss supporting both REINFORCE and PPO-clip.
+ 
+@@ -2453,6 +2461,7 @@ def compute_policy_loss_bypass_mode(
+         loss_agg_mode: Loss aggregation mode (passed to underlying loss function).
+         config: Actor config containing rollout_correction settings in policy_loss.
+         rollout_is_weights: Pre-computed IS weights (ignored, computed internally).
++        sc_correction: Score-centering term from the logits processor; only with loss_type="reinforce".
+ 
+     Config options (in config.policy_loss.rollout_correction):
+         loss_type: "ppo_clip" (default) or "reinforce"
+@@ -2524,9 +2533,12 @@ def compute_policy_loss_bypass_mode(
+             loss_agg_mode=loss_agg_mode,
+             config=config,
+             rollout_is_weights=computed_is_weights,
++            sc_correction=sc_correction,
+         )
+ 
+     elif loss_type == "ppo_clip":
++        if sc_correction is not None:
++            raise ValueError("score centering requires loss_type='reinforce' in bypass mode.")
+         # PPO-clip: The ratio π_current/π_old = π_current/π_rollout already handles IS
+         # DO NOT apply IS weights - would be double-counting!
+         # The clipping mechanism constrains the effective IS ratio
+diff --git a/verl/trainer/ppo/padding_utils.py b/verl/trainer/ppo/padding_utils.py
+index 284b7f542cb0d8cfcb155b3ee3f146e27a4f8047..6e44c9156bb5faa9536566f01179a41675bc9618 100644
+--- a/verl/trainer/ppo/padding_utils.py
++++ b/verl/trainer/ppo/padding_utils.py
+@@ -34,6 +34,7 @@ try:
+ except ImportError:
+     from verl.utils.transferqueue_utils import KVBatchMeta, tq
+ 
++from verl.trainer.ppo.score_centering import dummy_rollout_topk
+ from verl.utils.model import compute_position_id_with_mask
+ from verl.utils.tensordict_utils import list_of_dict_to_tensordict
+ 
+@@ -111,6 +112,12 @@ def construct_minimal_padding_template(
+     if teacher_logprobs is not None:
+         template_sample["teacher_logprobs"] = teacher_logprobs.new_zeros((sequence_length, *teacher_logprobs.shape[1:]))
+ 
++    rollout_topk_ids = template_sample.get("rollout_topk_ids")
++    if rollout_topk_ids is not None:
++        ids, log_probs = dummy_rollout_topk(sequence_length, rollout_topk_ids.shape[-1])
++        template_sample["rollout_topk_ids"] = ids
++        template_sample["rollout_topk_log_probs"] = log_probs
++
+     # Update the fields and remove redundant parts
+     template_sample.update(
+         prompts=prompts,
+diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
+index 9352bcfa4d56bda8e70fc7df183e588a65afb43d..ea17ee5f41b97d78c1b2ced34cb17a812be9434a 100644
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -1349,6 +1349,9 @@ class RayPPOTrainer:
+                 and not distillation_loss_cfg.use_task_rewards
+                 and not distillation_loss_cfg.use_policy_gradient
+             )
++        score_centering = bool(
++            self.config.actor_rollout_ref.actor.policy_loss.get("rollout_correction", {}).get("score_centering", False)
++        )
+         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+         ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
+@@ -1359,6 +1362,7 @@ class RayPPOTrainer:
+             calculate_entropy=calculate_entropy,
+             distillation_use_topk=distillation_use_topk,
+             distillation_only=distillation_only,
++            score_centering=score_centering,
+             global_batch_size=ppo_mini_batch_size,
+             mini_batch_size=ppo_mini_batch_size,
+             epochs=ppo_epochs,
+diff --git a/verl/trainer/ppo/score_centering.py b/verl/trainer/ppo/score_centering.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3b78aefee0ac7495e952b4f2341dd457208ff81f
+--- /dev/null
++++ b/verl/trainer/ppo/score_centering.py
+@@ -0,0 +1,307 @@
++"""Score centering for training-inference mismatch (https://arxiv.org/abs/2609.20807).
++
++The sampler's top-k head is exact; its tail is modeled as the trainer's tail rescaled to the
++sampler's tail mass, so the centering term only needs the k head log-probs of the trainer.
++"""
++
++import math
++from collections.abc import Callable
++from typing import Optional
++
++import torch
++from tensordict import TensorDict
++
++from verl.trainer.ppo.rollout_corr_helper import _parse_rollout_is_threshold
++from verl.utils.ulysses import get_ulysses_sequence_parallel_world_size, slice_input_tensor
++from verl.workers.config import ActorConfig
++from verl.workers.utils.losses import ppo_loss
++
++TOPK_LOG_PROB_CHUNK_SIZE = 4096
++
++
++def dummy_rollout_topk(
++    num_rows: int, k: int, device: Optional[torch.device] = None
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Build a uniform top-k head for rows the loss masks out (e.g. prompt or padding positions).
++
++    Args:
++        num_rows: Number of rows to fill.
++        k: Head size.
++        device: Device for the returned tensors, default None (CPU).
++
++    Returns:
++        Tuple containing:
++            ids: Token ids 0..k-1 repeated per row, shape (num_rows, k), dtype int32.
++            log_probs: Uniform log-probs -log(k), shape (num_rows, k), dtype float32.
++    """
++    ids = torch.arange(k, dtype=torch.int32, device=device).expand(num_rows, k).clone()
++    log_probs = torch.full((num_rows, k), -math.log(k), dtype=torch.float32, device=device)
++    return ids, log_probs
++
++
++def pad_rollout_topk(
++    response_topk_ids: torch.Tensor | list,
++    response_topk_log_probs: torch.Tensor | list,
++    *,
++    k: int,
++    prompt_width: int,
++    response_width: int,
++    response_length: int,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Lay the sampler's response-token heads over the padded full sequence.
++
++    Prompts are left-padded to ``prompt_width`` and responses are right-padded to
++    ``response_width``, so response token r sits at sequence column ``prompt_width + r``
++    and is predicted by the logits row ``prompt_width - 1 + r``; its sampler head goes there.
++    Rows outside the response (prompt and padding) get the uniform dummy head.
++
++    Args:
++        response_topk_ids: Sampler top-k token ids for the response tokens, shape
++            (response_length, k), array-like of ints.
++        response_topk_log_probs: Sampler top-k log-probs matching ``response_topk_ids``,
++            shape (response_length, k), array-like of floats.
++        k: Head size.
++        prompt_width: Padded prompt length.
++        response_width: Padded response length.
++        response_length: Number of real (non-padding) response tokens.
++
++    Returns:
++        Tuple containing:
++            ids: Full-sequence top-k ids, shape (1, prompt_width + response_width, k), dtype int32.
++            log_probs: Full-sequence top-k log-probs matching ``ids``, same shape, dtype float32.
++    """
++    ids = torch.as_tensor(response_topk_ids, dtype=torch.int32)[:response_length]
++    log_probs = torch.as_tensor(response_topk_log_probs, dtype=torch.float32)[:response_length]
++    if ids.shape != (response_length, k) or log_probs.shape != (response_length, k):
++        raise ValueError(
++            f"score centering needs one sampler top-{k} head per response token, "
++            f"got {tuple(ids.shape)} for {response_length} tokens"
++        )
++    full_ids, full_log_probs = dummy_rollout_topk(prompt_width + response_width, k)
++    start = prompt_width - 1
++    full_ids[start : start + response_length] = ids
++    full_log_probs[start : start + response_length] = log_probs
++    return full_ids.unsqueeze(0), full_log_probs.unsqueeze(0)
++
++
++class _TopKLogProbsFromLogits(torch.autograd.Function):
++    """log_softmax(logits).gather(ids) with a bounded fp32 workspace in forward and backward.
++
++    Only the original logits, the ids and two scalars per row are saved; the softmax is
++    recomputed per chunk in backward.
++    """
++
++    @staticmethod
++    def forward(ctx, logits, token_ids, chunk_size):
++        n = logits.shape[0]
++        chunk_size = chunk_size if chunk_size > 0 else max(n, 1)
++        output = torch.empty(token_ids.shape, device=logits.device, dtype=torch.float32)
++        maxima = torch.empty((n, 1), device=logits.device, dtype=torch.float32)
++        denominators = torch.empty_like(maxima)
++        for start in range(0, n, chunk_size):
++            end = min(start + chunk_size, n)
++            work = logits[start:end].to(dtype=torch.float32, copy=True)
++            maximum = work.max(dim=-1, keepdim=True).values
++            targets = work.gather(-1, token_ids[start:end])
++            work.sub_(maximum).exp_()
++            denominator = work.sum(dim=-1, keepdim=True)
++            output[start:end] = (targets - maximum) - denominator.log()
++            maxima[start:end] = maximum
++            denominators[start:end] = denominator
++            del work
++        ctx.save_for_backward(logits, token_ids, maxima, denominators)
++        ctx.chunk_size = chunk_size
++        return output
++
++    @staticmethod
++    @torch.autograd.function.once_differentiable
++    def backward(ctx, grad_output):
++        logits, token_ids, maxima, denominators = ctx.saved_tensors
++        n = logits.shape[0]
++        grad_input = torch.empty_like(logits)
++        for start in range(0, n, ctx.chunk_size):
++            end = min(start + ctx.chunk_size, n)
++            work = logits[start:end].to(dtype=torch.float32, copy=True)
++            work.sub_(maxima[start:end]).exp_().div_(denominators[start:end])
++            grad = grad_output[start:end].float()
++            work.mul_(-grad.sum(dim=-1, keepdim=True))
++            work.scatter_add_(-1, token_ids[start:end], grad)
++            grad_input[start:end] = work
++            del work
++        return grad_input, None, None
++
++
++def topk_log_probs_from_logits(
++    logits: torch.Tensor, token_ids: torch.Tensor, chunk_size: int = TOPK_LOG_PROB_CHUNK_SIZE
++) -> torch.Tensor:
++    """Compute full-vocab-normalized log-probs of ``logits`` at ``token_ids``, chunked for memory.
++
++    Equivalent to ``torch.log_softmax(logits, dim=-1).gather(-1, token_ids)`` but never
++    materializes the full (N, V) softmax at once: the normalizer is recomputed per chunk in
++    forward and backward, bounding the extra fp32 workspace to (chunk_size, V).
++
++    Args:
++        logits: Trainer logits, shape (N, V), any float dtype.
++        token_ids: Token ids to gather, shape (N, k), any integer dtype.
++        chunk_size: Number of rows processed per chunk. Default: 4096.
++
++    Returns:
++        Log-probs of ``token_ids`` under the full-vocab softmax of ``logits``, shape (N, k),
++        dtype float32, with gradient to ``logits``.
++    """
++    return _TopKLogProbsFromLogits.apply(logits, token_ids.long(), chunk_size)
++
++
++def score_centering_weight_fn(
++    rollout_is: Optional[str], rollout_is_threshold: str | float
++) -> Callable[[torch.Tensor], torch.Tensor]:
++    """Build the token-level IS rule as a function of a ratio, shared by the head and sampled token.
++
++    Args:
++        rollout_is: Importance-sampling mode score centering composes with: None (no IS weight)
++            or "token" (TIS or IcePop, depending on ``rollout_is_threshold``).
++        rollout_is_threshold: Threshold specification, see ``_parse_rollout_is_threshold``: a
++            single float or float-like string upper-clamps (TIS); a "lower_upper" string zeros
++            ratios outside the band (IcePop).
++
++    Returns:
++        A function mapping a ratio tensor to its weight tensor of the same shape.
++    """
++    if rollout_is is None:
++        return torch.ones_like
++    if rollout_is != "token":
++        raise ValueError(f"score centering composes with token-level IS only, got rollout_is={rollout_is!r}")
++    upper, lower = _parse_rollout_is_threshold(rollout_is_threshold)
++    if lower is None:
++        return lambda ratio: ratio.clamp(max=upper)
++    return lambda ratio: torch.where((ratio >= lower) & (ratio <= upper), ratio, torch.zeros_like(ratio))
++
++
++def score_centering_correction(
++    train_head_log_probs: torch.Tensor,
++    sampler_head_log_probs: torch.Tensor,
++    weight_fn: Callable[[torch.Tensor], torch.Tensor],
++    eps: float = 1e-6,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Compute the per-token centering term ``sum_H sg[q w - alpha p] log p`` and the head masses.
++
++    The sampler's tail (outside the top-k head H) is modeled as the trainer's tail rescaled by
++    ``alpha = rho * weight_fn(1 / rho)`` with ``rho = (1 - q_mass) / (1 - p_mass)``, so the
++    correction only needs the k head log-probs of both distributions. When the head covers the
++    whole vocabulary, ``rho`` is ill-conditioned and the correction's value is not meaningful;
++    only its gradient is (it still matches the exact full-vocabulary centering term).
++
++    Args:
++        train_head_log_probs: Trainer's full-vocab-normalized log-probs at the head ids,
++            shape (N, k), any float dtype, with gradient to the trainer logits.
++        sampler_head_log_probs: Sampler's full-vocab-normalized log-probs at the same head ids,
++            shape (N, k), any float dtype.
++        weight_fn: IS weight rule applied to the ratio p/q on the head, as returned by
++            ``score_centering_weight_fn``.
++        eps: Numerical floor for the tail masses in ``rho``. Default: 1e-6.
++
++    Returns:
++        Tuple containing:
++            correction: Centering term to subtract from the policy-gradient loss, shape (N,),
++                dtype float32, with gradient to the trainer logits.
++            sampler_head_mass: Sampler's head probability mass, shape (N,), dtype float32.
++            train_head_mass: Trainer's head probability mass, shape (N,), dtype float32.
++    """
++    train_head_log_probs = train_head_log_probs.float()
++    with torch.no_grad():
++        p = train_head_log_probs.exp()
++        q = sampler_head_log_probs.float().exp()
++        p_mass, q_mass = p.sum(-1), q.sum(-1)
++        rho = (1 - q_mass).clamp_min(eps) / (1 - p_mass).clamp_min(eps)
++        alpha = rho * weight_fn(1.0 / rho)
++        head_weights = weight_fn((train_head_log_probs - sampler_head_log_probs.float()).exp())
++        residual = q * head_weights - alpha.unsqueeze(-1) * p
++    correction = (residual * train_head_log_probs).sum(-1)
++    return correction, q_mass, p_mass
++
++
++def score_centering_logits_processor(
++    student_logits: Optional[torch.Tensor],
++    data: TensorDict,
++    config: ActorConfig,
++    data_format: str = "thd",
++    train_head_log_probs: Optional[torch.Tensor] = None,
++) -> dict[str, torch.Tensor]:
++    """Per-token centering term from the trainer logits, in the engine's logits-processor slot.
++
++    Args:
++        student_logits: Trainer logits, already temperature-scaled, shape (1, nnz/sp, V); None with
++            ``train_head_log_probs``.
++        data: Micro input batch, holding the nested ``rollout_topk_ids``/``rollout_topk_log_probs``
++            sampler heads of shape [B, j, k].
++        config: Actor configuration, used for ``policy_loss.rollout_correction``.
++        data_format: "thd" or "bshd". Only "thd" is supported.
++        train_head_log_probs: The trainer's log-probs at the head ids, shape (1, nnz/sp, k), from a fused head
++            that keeps no logits; they replace ``student_logits``.
++
++    Returns:
++        Dict with, each of shape (1, nnz/sp):
++            sc_correction: Centering term, with gradient to ``student_logits``.
++            sc_sampler_head_mass: Sampler's head probability mass, detached.
++            sc_train_head_mass: Trainer's head probability mass, detached.
++    """
++    if data_format != "thd":
++        raise NotImplementedError("score centering supports the thd (remove padding) format only.")
++    topk_ids = data["rollout_topk_ids"].values().unsqueeze(0)
++    topk_log_probs = data["rollout_topk_log_probs"].values().unsqueeze(0)
++    if get_ulysses_sequence_parallel_world_size() > 1:
++        topk_ids = slice_input_tensor(topk_ids, dim=1)
++        topk_log_probs = slice_input_tensor(topk_log_probs, dim=1)
++    trainer_outputs = student_logits if train_head_log_probs is None else train_head_log_probs
++    assert topk_ids.shape[:2] == topk_log_probs.shape[:2] == trainer_outputs.shape[:2], (
++        topk_ids.shape,
++        topk_log_probs.shape,
++        trainer_outputs.shape,
++    )
++    rollout_correction = config.policy_loss.rollout_correction
++    weight_fn = score_centering_weight_fn(
++        rollout_correction.get("rollout_is", None), rollout_correction.get("rollout_is_threshold", 2.0)
++    )
++    if train_head_log_probs is not None:
++        train_head_log_probs = train_head_log_probs.squeeze(0)
++    else:
++        train_head_log_probs = topk_log_probs_from_logits(student_logits.squeeze(0), topk_ids.squeeze(0))
++    correction, sampler_head_mass, train_head_mass = score_centering_correction(
++        train_head_log_probs, topk_log_probs.squeeze(0), weight_fn
++    )
++    return {
++        "sc_correction": correction.unsqueeze(0),
++        "sc_sampler_head_mass": sampler_head_mass.unsqueeze(0),
++        "sc_train_head_mass": train_head_mass.unsqueeze(0),
++    }
++
++
++def score_centering_ppo_loss(
++    config: ActorConfig,
++    model_output: dict = None,
++    data: TensorDict = None,
++    dp_group=None,
++    student_logits: torch.Tensor = None,
++    data_format: str = "thd",
++    train_head_log_probs: torch.Tensor = None,
++):
++    """Actor loss function used both for the logits processor and the final policy loss.
++    - student_logits or train_head_log_probs is not None, compute the centering term in the logits processor.
++    - both are None, compute the final policy loss.
++
++    Args:
++        config: Actor configuration.
++        model_output: Model output, including log_probs and sc_correction.
++        data: Micro input batch, contains the nested rollout top-k head.
++        dp_group: Data parallel group for ``ppo_loss``.
++        student_logits: (1, nnz/sp, V).
++        data_format: "thd" or "bshd". Only "thd" is supported.
++        train_head_log_probs: (1, nnz/sp, k) the trainer's head log-probs from a fused head, instead of logits.
++
++    Returns:
++        student_logits or train_head_log_probs is not None: dict from ``score_centering_logits_processor``.
++        both are None: the (loss, metrics) tuple from ``ppo_loss``.
++    """
++    if student_logits is not None or train_head_log_probs is not None:
++        return score_centering_logits_processor(student_logits, data, config, data_format, train_head_log_probs)
++    return ppo_loss(config, model_output, data, dp_group)
+diff --git a/verl/trainer/ppo/v1/agent_loop_tq.py b/verl/trainer/ppo/v1/agent_loop_tq.py
+index f950698f31aca0ceac57863afbbd79c18eb044c0..d7b8be975b46597a1dc576ac511a463e2aa51351 100644
+--- a/verl/trainer/ppo/v1/agent_loop_tq.py
++++ b/verl/trainer/ppo/v1/agent_loop_tq.py
+@@ -67,6 +67,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
+             top_k=config.top_k,
+             repetition_penalty=1.0,
+             logprobs=config.calculate_log_probs,
++            topk_log_probs=config.topk_log_probs,
+         )
+ 
+         # override sampling params for validation
+@@ -74,6 +75,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
+             sampling_params["top_p"] = config.val_kwargs.top_p
+             sampling_params["top_k"] = config.val_kwargs.top_k
+             sampling_params["temperature"] = config.val_kwargs.temperature
++            # the trainer never consumes the sampler head on validation rollouts
++            sampling_params["topk_log_probs"] = 0
+ 
+         # by default, we assume it's a single turn agent
+         if "agent_name" not in batch:
+@@ -194,6 +197,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
+ 
+             keys.append(f"{uid}_{session_id}_{i}")
+             field = output.as_dict()
++            if self.rollout_config.topk_log_probs and not validate and "rollout_topk_ids" not in field:
++                raise ValueError("rollout.topk_log_probs is set but the rollout returned no sampler top-k head.")
+             field.update(kwargs)
+             # do not store raw image/video
+             field.pop("multi_modal_data", None)
+diff --git a/verl/trainer/ppo/v1/trainer_base.py b/verl/trainer/ppo/v1/trainer_base.py
+index 58ef450407ea8d49df1e264e101bc6bf9d0eb08a..3056a9d3efb97eceb5cde5c0ffd29739c9f40187 100644
+--- a/verl/trainer/ppo/v1/trainer_base.py
++++ b/verl/trainer/ppo/v1/trainer_base.py
+@@ -1880,10 +1880,14 @@ class PPOTrainer(ABC):
+                 and not distillation_loss_cfg.use_task_rewards
+                 and not distillation_loss_cfg.use_policy_gradient
+             )
++        score_centering = bool(
++            self.config.actor_rollout_ref.actor.policy_loss.get("rollout_correction", {}).get("score_centering", False)
++        )
+         extra_info = {
+             "calculate_entropy": calculate_entropy,
+             "distillation_use_topk": distillation_use_topk,
+             "distillation_only": distillation_only,
++            "score_centering": score_centering,
+             "global_batch_size": ppo_mini_batch_size,
+             "mini_batch_size": ppo_mini_batch_size,
+             "epochs": self.config.actor_rollout_ref.actor.ppo_epochs,
+diff --git a/verl/utils/config.py b/verl/utils/config.py
+index 213d2763a9e169dd1dd5249f438d5b94c97d4e38..471b860519ff3d56817be1d9a48a6c4d195e6a5d 100644
+--- a/verl/utils/config.py
++++ b/verl/utils/config.py
+@@ -85,6 +85,54 @@ def _validate_router_replay_config(actor_config: Any, rollout_correction: Any) -
+         )
+ 
+ 
++def _validate_score_centering_config(config: DictConfig) -> None:
++    algorithm_rc = config.algorithm.get("rollout_correction") or {}
++    policy_loss = config.actor_rollout_ref.actor.policy_loss
++    actor_rc = policy_loss.get("rollout_correction") or {}
++    algorithm_sc = algorithm_rc.get("score_centering", False)
++    actor_sc = actor_rc.get("score_centering", False)
++    if not (algorithm_sc or actor_sc):
++        return
++    if not (algorithm_sc and actor_sc):
++        raise ValueError(
++            "score centering must be enabled on both algorithm.rollout_correction.score_centering and "
++            "actor_rollout_ref.actor.policy_loss.rollout_correction.score_centering."
++        )
++    actor = config.actor_rollout_ref.actor
++    if actor.get("strategy") not in ("fsdp", "fsdp2"):
++        raise ValueError(
++            "score centering is implemented for the FSDP engine only; "
++            f"got actor_rollout_ref.actor.strategy={actor.get('strategy')!r}."
++        )
++    fused_kernel_options = (config.actor_rollout_ref.get("model") or {}).get("fused_kernel_options") or {}
++    if actor.get("use_fused_kernels", False) and fused_kernel_options.get("impl_backend") != "torch":
++        raise ValueError(
++            "score centering with fused kernels needs actor_rollout_ref.model.fused_kernel_options.impl_backend=torch "
++            "and an engine whose fused forward returns the rollout head's log-probs; or set "
++            "actor_rollout_ref.actor.use_fused_kernels=False."
++        )
++    if (config.get("distillation") or {}).get("enabled", False):
++        raise ValueError("score centering cannot be combined with distillation.enabled=True.")
++    if policy_loss.get("loss_mode") != "bypass_mode":
++        raise ValueError("score centering requires actor_rollout_ref.actor.policy_loss.loss_mode=bypass_mode.")
++    if config.actor_rollout_ref.rollout.get("topk_log_probs", 0) <= 0:
++        raise ValueError("score centering requires actor_rollout_ref.rollout.topk_log_probs > 0.")
++    actor_prefix = "actor_rollout_ref.actor.policy_loss.rollout_correction"
++    if actor_rc.get("rollout_is", None) not in (None, "token"):
++        raise ValueError(f"score centering requires {actor_prefix}.rollout_is=None or 'token'.")
++    if actor_rc.get("rollout_is_batch_normalize", False):
++        raise ValueError(f"score centering requires {actor_prefix}.rollout_is_batch_normalize=False.")
++    # The actor reads its own subtree with these defaults, so it must agree with the driver's.
++    defaults = {"bypass_mode": False, "loss_type": "ppo_clip", "rollout_is": None, "rollout_is_threshold": 2.0}
++    for key, default in defaults.items():
++        actor_value, algorithm_value = actor_rc.get(key, default), algorithm_rc.get(key, default)
++        if actor_value != algorithm_value:
++            raise ValueError(
++                f"score centering requires {actor_prefix}.{key} ({actor_value!r}) to match "
++                f"algorithm.rollout_correction.{key} ({algorithm_value!r})."
++            )
++
++
+ def validate_config(
+     config: DictConfig,
+     use_reference_policy: bool,
+@@ -164,6 +212,7 @@ def validate_config(
+     actor_config = omega_conf_to_dataclass(config.actor_rollout_ref.actor)
+     actor_config.validate(n_gpus, config.data.train_batch_size, config.actor_rollout_ref.model)
+     _validate_router_replay_config(actor_config, config.algorithm.get("rollout_correction", None))
++    _validate_score_centering_config(config)
+ 
+     if not config.actor_rollout_ref.actor.use_dynamic_bsz:
+         if use_reference_policy:
+diff --git a/verl/utils/tokenizer/continuous_token.py b/verl/utils/tokenizer/continuous_token.py
+index 3eb915fdaeebb161e924f803ca8bab7e2c23615d..9098869b8b1588d86ee1bc507dd7655c1e526088 100644
+--- a/verl/utils/tokenizer/continuous_token.py
++++ b/verl/utils/tokenizer/continuous_token.py
+@@ -20,6 +20,8 @@ import logging
+ from dataclasses import dataclass, field
+ from typing import Any, Literal
+ 
++import numpy as np
++
+ from .chat_template import apply_chat_template
+ from .tokenizer import build_multimodal_processor_inputs, normalize_token_ids
+ 
+@@ -418,6 +420,68 @@ class ContinuousTokenBuilder:
+ 
+         return aligned_mask, aligned_logprobs
+ 
++    @staticmethod
++    def align_response_topk(
++        merge_result: MergeResult,
++        response_topk_ids: np.ndarray,
++        response_topk_log_probs: np.ndarray,
++        *,
++        assistant_topk_ids: np.ndarray | None = None,
++        assistant_topk_log_probs: np.ndarray | None = None,
++    ) -> tuple[np.ndarray, np.ndarray]:
++        """Apply the edits of ``align_response_metadata`` to the sampler top-k heads of the response tokens.
++
++        Every response token carries one head (its sampler's top-k ids and log-probs, shape (k,)): model-generated
++        assistant tokens get their sampler's heads, while tokens the model did not sample (inserted boundary tokens and
++        context tokens) get a uniform placeholder head, which the loss masks out with the response mask.
++
++        Args:
++            merge_result: The merge whose edits to apply.
++            response_topk_ids: Heads of the response tokens so far, shape (n, k), dtype int32.
++            response_topk_log_probs: Log-probs matching ``response_topk_ids``, shape (n, k), dtype float32.
++            assistant_topk_ids: Heads of the appended assistant tokens, shape (appended_token_count, k); required for
++                an assistant merge.
++            assistant_topk_log_probs: Log-probs matching ``assistant_topk_ids``.
++
++        Returns:
++            Tuple containing the aligned ``(topk_ids, topk_log_probs)``.
++        """
++        k = response_topk_ids.shape[1]
++        ids, log_probs = response_topk_ids, response_topk_log_probs
++
++        # the same edits, in the same order, as align_response_metadata
++        if merge_result.removed_prefix_token_count:
++            ids = ids[: -merge_result.removed_prefix_token_count]
++            log_probs = log_probs[: -merge_result.removed_prefix_token_count]
++        placeholder_count = len(merge_result.inserted_token_ids)
++        if merge_result.kind == "assistant":
++            if assistant_topk_ids is None or assistant_topk_log_probs is None:
++                if merge_result.appended_token_count:
++                    raise ValueError("assistant top-k heads are required for an assistant Continuous Token merge")
++                # an aborted request returns no tokens and no heads
++                assistant_topk_ids = np.zeros((0, k), dtype=np.int32)
++                assistant_topk_log_probs = np.zeros((0, k), dtype=np.float32)
++            if assistant_topk_ids.shape != (merge_result.appended_token_count, k) or (
++                assistant_topk_log_probs.shape != assistant_topk_ids.shape
++            ):
++                raise ValueError(
++                    f"assistant top-k heads must have shape ({merge_result.appended_token_count}, {k}), "
++                    f"got {assistant_topk_ids.shape} and {assistant_topk_log_probs.shape}"
++                )
++        elif merge_result.kind == "context":
++            placeholder_count += merge_result.appended_token_count
++        else:
++            raise ValueError(f"Unknown Continuous Token merge kind: {merge_result.kind!r}")
++
++        # uniform placeholder heads: distinct ids and finite log-probs keep the loss finite before masking
++        placeholder_ids = np.broadcast_to(np.arange(k, dtype=np.int32), (placeholder_count, k))
++        placeholder_log_probs = np.full((placeholder_count, k), -np.log(k), dtype=np.float32)
++        ids_parts, log_prob_parts = [ids, placeholder_ids], [log_probs, placeholder_log_probs]
++        if merge_result.kind == "assistant":
++            ids_parts.append(assistant_topk_ids.astype(np.int32, copy=False))
++            log_prob_parts.append(assistant_topk_log_probs.astype(np.float32, copy=False))
++        return np.concatenate(ids_parts), np.concatenate(log_prob_parts)
++
+     # === Multimodal hooks (VL subclasses override these) ===
+ 
+     @classmethod
+diff --git a/verl/workers/config/rollout.py b/verl/workers/config/rollout.py
+index fa8441c77a74e84c99a157027bfc8e22d5d89667..1b85532ab1d32f386f748aa778477d4507a5f7b4 100644
+--- a/verl/workers/config/rollout.py
++++ b/verl/workers/config/rollout.py
+@@ -218,6 +218,9 @@ class RolloutConfig(BaseConfig):
+ 
+     calculate_log_probs: bool = False
+ 
++    # Sampler top-k log-probs per generated token for score centering; 0 disables.
++    topk_log_probs: int = 0
++
+     agent: AgentLoopConfig = field(default_factory=AgentLoopConfig)
+ 
+     trace: TraceConfig = field(default_factory=TraceConfig)
+@@ -342,3 +345,30 @@ class RolloutConfig(BaseConfig):
+             raise ValueError(
+                 f"rollout.disaggregation.enabled=True requires rollout.name in ('sglang', 'vllm'); got {self.name!r}."
+             )
++
++        if self.topk_log_probs < 0:
++            raise ValueError(f"rollout.topk_log_probs must be >= 0, got {self.topk_log_probs}.")
++        if self.topk_log_probs > 0:
++            if not self.calculate_log_probs:
++                raise ValueError("rollout.topk_log_probs requires rollout.calculate_log_probs=True.")
++            if self.temperature <= 0 or self.top_p != 1.0 or self.top_k != -1:
++                raise ValueError(
++                    "rollout.topk_log_probs requires temperature > 0, top_p=1.0 and top_k=-1 so the returned "
++                    "head is the sampling distribution."
++                )
++            if self.logprobs_mode != "processed_logprobs":
++                raise ValueError(
++                    "rollout.topk_log_probs requires logprobs_mode='processed_logprobs' so the returned head is "
++                    "the sampling distribution."
++                )
++            if self.name != "vllm":
++                raise ValueError("rollout.topk_log_probs is supported by the vLLM rollout only.")
++            vllm_kwargs = self.engine_kwargs.setdefault("vllm", {})
++            max_logprobs = vllm_kwargs.get("max_logprobs")
++            if max_logprobs is None:
++                vllm_kwargs["max_logprobs"] = self.topk_log_probs
++            elif max_logprobs < self.topk_log_probs:
++                raise ValueError(
++                    f"engine_kwargs.vllm.max_logprobs ({max_logprobs}) must be >= rollout.topk_log_probs "
++                    f"({self.topk_log_probs})."
++                )
+diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
+index e9dba7a477c58894d46d6a96ca5747f75477de27..dc4cbdd386f74277911d77a2262719156e94eb24 100644
+--- a/verl/workers/engine/fsdp/transformer_impl.py
++++ b/verl/workers/engine/fsdp/transformer_impl.py
+@@ -1146,15 +1146,21 @@ class EngineTrainModeCtx(BaseEngineCtx):
+ 
+ @EngineRegistry.register(model_type="language_model", backend=["fsdp", "fsdp2"], device=["cuda", "npu"])
+ class FSDPEngineWithLMHead(FSDPEngine):
++    # Whether score centering works with the fused forward, which keeps no logits: true in a subclass whose fused
++    # forward returns the log-probs at the rollout's top-k ids instead and which adds the centering term from them.
++    support_fused_score_centering = False
++
+     def prepare_model_inputs(self, micro_batch: TensorDict):
+-        if self.pad_to_length and tu.get_non_tensor_data(data=micro_batch, key="distillation_use_topk", default=False):
+-            # Every top-K path re-derives the teacher tensors' layout from the *unpadded* packed
+-            # length and slices them with the Ulysses rule only, which does not know about the
+-            # static pad, so teacher and student token streams would silently misalign.
++        distillation_use_topk = tu.get_non_tensor_data(data=micro_batch, key="distillation_use_topk", default=False)
++        score_centering = tu.get_non_tensor_data(data=micro_batch, key="score_centering", default=False)
++        if self.pad_to_length and (distillation_use_topk or score_centering):
++            # Every top-K path re-derives the teacher/rollout tensors' layout from the *unpadded*
++            # packed length and slices them with the Ulysses rule only, which does not know about
++            # the static pad, so the token streams would silently misalign.
+             raise RuntimeError(
+-                "pad_to_length is not supported with top-K distillation: the teacher tensors are "
+-                "sliced with the Ulysses pad rule, which does not know about the static pad. "
+-                "Disable pad_to_length for distillation runs."
++                "pad_to_length is not supported with top-K distillation or score centering: the "
++                "teacher/rollout top-k tensors are sliced with the Ulysses pad rule, which does "
++                "not know about the static pad. Disable pad_to_length for these runs."
+             )
+ 
+         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
+@@ -1343,12 +1349,18 @@ class FSDPEngineWithLMHead(FSDPEngine):
+         )
+         distillation_use_topk = tu.get_non_tensor_data(data=micro_batch, key="distillation_use_topk", default=False)
+         distillation_only = tu.get_non_tensor_data(data=micro_batch, key="distillation_only", default=False)
++        score_centering = tu.get_non_tensor_data(data=micro_batch, key="score_centering", default=False)
+ 
+         if calculate_sum_pi_squared and use_fused_kernels:
+             raise NotImplementedError(
+                 "calculate_sum_pi_squared=True is not supported with use_fused_kernels=True: "
+                 "fused kernels do not materialize the full logits tensor needed for Σπ²."
+             )
++        if score_centering and use_fused_kernels and not self.support_fused_score_centering:
++            raise NotImplementedError(
++                "score_centering=True is not supported with use_fused_kernels=True: "
++                "fused kernels do not materialize the full logits tensor score centering needs."
++            )
+ 
+         model_output = {}
+ 
+@@ -1413,7 +1425,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
+                         )
+ 
+                 # logits_processor_func return tensors with shape (1, total_nnz/sp_size)
+-                if distillation_use_topk:
++                if distillation_use_topk or score_centering:
+                     outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
+                     cu_seqlens = input_ids.offsets()
+                     for k, v in outputs.items():
+@@ -1426,9 +1438,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
+ 
+                 if not distillation_only:
+                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
+-                    inplace_backward = True
+-                    if calculate_entropy:
+-                        inplace_backward = False
++                    # entropy and the score centering hook reuse the logits in their backward
++                    inplace_backward = not (calculate_entropy or score_centering)
+                     log_probs = logprobs_from_logits(
+                         logits=logits_rmpad,
+                         labels=input_ids_rmpad_rolled,
+@@ -1512,7 +1523,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
+                     # (log_probs is also not gathered) and pad_size is only
+                     # populated in output_args along the use_remove_padding=True
+                     # path of prepare_model_inputs.
+-                    if distillation_use_topk:
++                    if distillation_use_topk or score_centering:
+                         outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
+                         for k, v in outputs.items():
+                             v = v.squeeze(0)
+@@ -1523,7 +1534,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
+ 
+                     log_probs = None
+                     if not distillation_only:
+-                        log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
++                        log_probs = logprobs_from_logits(
++                            logits=logits_rmpad,
++                            labels=input_ids_rmpad_rolled,
++                            inplace_backward=not score_centering,
++                        )
+ 
+                     # (bsz, j1), for each sample, length of each sample: [real_prompt_length + real_response_length]
+                     if not distillation_only:
+diff --git a/verl/workers/engine_workers.py b/verl/workers/engine_workers.py
+index b55d4ce637e4654f01e5956a0934e90116d909f9..aa8f31c1fa650469601e47ae12f0e2c46411b1c0 100644
+--- a/verl/workers/engine_workers.py
++++ b/verl/workers/engine_workers.py
+@@ -32,6 +32,7 @@ from verl.checkpoint_engine import CheckpointEngineRegistry
+ from verl.single_controller.base import Worker
+ from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
+ from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
++from verl.trainer.ppo.score_centering import score_centering_ppo_loss
+ from verl.utils import tensordict_utils as tu
+ from verl.utils.config import omega_conf_to_dataclass
+ from verl.utils.device import get_device_name, get_torch_device, set_expandable_segments
+@@ -639,6 +640,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+                 self.loss_fn = partial(
+                     distillation_ppo_loss, config=actor_config, distillation_config=distillation_config
+                 )
++            elif (actor_config.policy_loss.get("rollout_correction", None) or {}).get("score_centering", False):
++                self.loss_fn = partial(score_centering_ppo_loss, config=actor_config)
+             else:
+                 self.loss_fn = partial(ppo_loss, config=actor_config)
+             self.actor = self.actor_worker_cls(config=actor_training_config)
+diff --git a/verl/workers/rollout/llm_server.py b/verl/workers/rollout/llm_server.py
+index a5c573185b778995a6c5ab9ca8e470dc36f93195..5b878337596efad7bd218b8af9ef7636fffd7d8e 100644
+--- a/verl/workers/rollout/llm_server.py
++++ b/verl/workers/rollout/llm_server.py
+@@ -285,6 +285,9 @@ class FullyAsyncLLMServerClient(LLMServerClient):
+         # must carry it forward explicitly or the consumer sees 0. Take the first
+         # (initial-prompt) prefill's hit count, matching single-prefill semantics.
+         num_cached_tokens = None
++        # The sampler's top-k heads (score centering) belong to the generated tokens: one (ids, log-probs) part per
++        # attempt, concatenated like the log-probs
++        topk_parts = []
+ 
+         while True:
+             # 1. generate tokens
+@@ -312,6 +315,10 @@ class FullyAsyncLLMServerClient(LLMServerClient):
+                     final_output.routed_experts = np.concatenate(
+                         [final_output.routed_experts, output.routed_experts[-len(output.token_ids) :]]
+                     )
++            if "response_topk_ids" in output.extra_fields:
++                topk_parts.append(
++                    (output.extra_fields["response_topk_ids"], output.extra_fields["response_topk_log_probs"])
++                )
+             if output.num_preempted is not None:
+                 final_output.num_preempted += output.num_preempted
+             final_output.stop_reason = output.stop_reason
+@@ -348,6 +355,15 @@ class FullyAsyncLLMServerClient(LLMServerClient):
+         final_output.extra_fields["min_global_steps"] = min_global_steps
+         final_output.extra_fields["max_global_steps"] = max_global_steps
+         final_output.extra_fields["num_cached_tokens"] = num_cached_tokens
++        if topk_parts:
++            topk_ids = np.concatenate([ids for ids, _ in topk_parts])
++            if len(topk_ids) != len(final_output.token_ids):
++                raise RuntimeError(
++                    f"{len(topk_ids)} sampler top-k heads for {len(final_output.token_ids)} generated tokens "
++                    f"across {len(topk_parts)} attempts"
++                )
++            final_output.extra_fields["response_topk_ids"] = topk_ids
++            final_output.extra_fields["response_topk_log_probs"] = np.concatenate([lps for _, lps in topk_parts])
+         return final_output
+ 
+ 
+diff --git a/verl/workers/rollout/sglang_rollout/async_sglang_server.py b/verl/workers/rollout/sglang_rollout/async_sglang_server.py
+index 2543318e44869eb9fa724c72109e64bc879fb510..0cb051d2869e47db25f2046921e5ac3e348a0f70 100644
+--- a/verl/workers/rollout/sglang_rollout/async_sglang_server.py
++++ b/verl/workers/rollout/sglang_rollout/async_sglang_server.py
+@@ -581,6 +581,8 @@ class SGLangHttpServer:
+         )
+         sampling_params["max_new_tokens"] = max_new_tokens
+         return_logprob = sampling_params.pop("logprobs", False)
++        if sampling_params.pop("topk_log_probs", 0):
++            raise NotImplementedError("rollout.topk_log_probs (score centering) is supported by the vLLM rollout only.")
+ 
+         # vLLM-style "prompt_logprobs=K" from the distillation teacher: request
+         # input-token logprobs for every position (top-K when K>0, sampled-token
+diff --git a/verl/workers/rollout/trtllm_rollout/trtllm_async_server.py b/verl/workers/rollout/trtllm_rollout/trtllm_async_server.py
+index 296d560b8143d2874485b1ca19a8fccc8b04d14c..33770b243b8eb31adfa0bc850496cbb2f1d3037e 100644
+--- a/verl/workers/rollout/trtllm_rollout/trtllm_async_server.py
++++ b/verl/workers/rollout/trtllm_rollout/trtllm_async_server.py
+@@ -335,6 +335,8 @@ class TRTLLMHttpServer:
+         sampling_params["max_tokens"] = max_tokens
+         # TorchSampler: logprobs=0 means sampled-token logprob; TRTLLMSampler: logprobs=1
+         _want_logprobs = sampling_params.pop("logprobs", False)
++        if sampling_params.pop("topk_log_probs", 0):
++            raise NotImplementedError("rollout.topk_log_probs (score centering) is supported by the vLLM rollout only.")
+         if self._use_torch_sampler:
+             sampling_params["logprobs"] = 0 if _want_logprobs else None
+         else:
+diff --git a/verl/workers/rollout/utils.py b/verl/workers/rollout/utils.py
+index 257381bb2fecb61b4b763311c30c50a3ad65e8b1..ffda2573a53c1ea107ee803df04f1d0833fab1d8 100644
+--- a/verl/workers/rollout/utils.py
++++ b/verl/workers/rollout/utils.py
+@@ -138,6 +138,42 @@ def get_vision_placeholder_token_ids(processor) -> list[int]:
+     return token_ids
+ 
+ 
++def extract_response_topk_logprobs(
++    logprobs, token_ids: list[int], k: int
++) -> tuple[list[float], np.ndarray, np.ndarray]:
++    """Split vLLM ``FlatLogprobs`` of a generated sequence into the sampled tokens' log-probs and the top-k heads.
++
++    vLLM records every position as the sampled token followed by the top-k candidates by rank (``k + 1`` entries; the
++    sampled token appears twice when it is inside the head), so the flat lists reshape to ``(n, k + 1)`` without a
++    per-token Python loop.
++
++    Args:
++        logprobs: ``RequestOutput.outputs[0].logprobs`` of a request made with ``logprobs=k, flat_logprobs=True``.
++        token_ids: The generated token ids, one per position.
++        k: Head size.
++
++    Returns:
++        Tuple containing:
++            sampled_log_probs: Log-prob of each generated token, list of floats.
++            topk_ids: Head token ids by rank, shape (n, k), dtype int32.
++            topk_log_probs: Head log-probs matching ``topk_ids``, shape (n, k), dtype float32.
++    """
++    if not hasattr(logprobs, "start_indices"):
++        raise TypeError("the sampler top-k head expects vLLM FlatLogprobs (a request with flat_logprobs=True).")
++    n = len(token_ids)
++    if len(logprobs.token_ids) != n * (k + 1) or not np.array_equal(
++        np.asarray(logprobs.start_indices, dtype=np.int64), np.arange(0, n * (k + 1), k + 1)
++    ):
++        raise ValueError(f"expected {k + 1} logprob entries at each of the {n} generated positions")
++    ids = np.asarray(logprobs.token_ids, dtype=np.int64).reshape(n, k + 1)
++    log_probs = np.asarray(logprobs.logprobs, dtype=np.float32).reshape(n, k + 1)
++    ranks = np.asarray(logprobs.ranks, dtype=np.int64).reshape(n, k + 1)
++    sampled_first = np.array_equal(ids[:, 0], np.asarray(token_ids, dtype=np.int64))
++    if not sampled_first or (ranks[:, 1:] != np.arange(1, k + 1)).any():
++        raise ValueError("vLLM logprobs are not laid out as the sampled token followed by the top-k by rank.")
++    return log_probs[:, 0].tolist(), ids[:, 1:].astype(np.int32), np.ascontiguousarray(log_probs[:, 1:])
++
++
+ def _get_rollout_targets(config_file: str, server_addresses: list[str]) -> list[str]:
+     """Merge new rollout server addresses into the existing Prometheus rollout targets."""
+     try:
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+index ca5a3ddecd43579ffaa0bfdc21ee294cd23b7e0a..961c4594765be6754bc396f694307c0bb46de6ea 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -55,6 +55,7 @@ from verl.utils.vllm.vllm_quant_utils import apply_vllm_quant_patches
+ from verl.workers.config import HFModelConfig, RolloutConfig
+ from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
+ from verl.workers.rollout.utils import (
++    extract_response_topk_logprobs,
+     get_max_position_embeddings,
+     get_vision_placeholder_token_ids,
+     qwen2_5_vl_dedup_image_tokens,
+@@ -619,7 +620,13 @@ class vLLMHttpServer:
+         assert 1 <= max_tokens <= max_possible_tokens, (
+             f"max_tokens {max_tokens} not in valid range [1, {max_possible_tokens}]"
+         )
+-        sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
++        topk_log_probs = sampling_params.pop("topk_log_probs", 0)
++        sampling_params["logprobs"] = (topk_log_probs or 0) if sampling_params.pop("logprobs", False) else None
++        if sampling_params["logprobs"]:
++            # the top-k head: flat lists instead of k + 1 Python objects per token, and no detokenization of the
++            # candidates (the rollout reads token ids only)
++            sampling_params["flat_logprobs"] = True
++            sampling_params["detokenize"] = False
+         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
+         sampling_params.setdefault("ignore_eos", self.config.get("ignore_eos", False))
+         # Inject per-request seed for deterministic sampling when full_determinism is enabled.
+@@ -712,7 +719,11 @@ class vLLMHttpServer:
+         )
+         token_ids = final_res.outputs[0].token_ids
+         log_probs = None
+-        if sampling_params.logprobs is not None:
++        if sampling_params.logprobs:
++            log_probs, extra_fields["response_topk_ids"], extra_fields["response_topk_log_probs"] = (
++                extract_response_topk_logprobs(final_res.outputs[0].logprobs, token_ids, sampling_params.logprobs)
++            )
++        elif sampling_params.logprobs is not None:
+             log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
+ 
+         routed_experts = None
+diff --git a/verl/workers/utils/losses.py b/verl/workers/utils/losses.py
+index ebaa4e4d8b759db980f62bf96f83be305f54847e..94684c0552c167f3603469b767afc671713f17d3 100644
+--- a/verl/workers/utils/losses.py
++++ b/verl/workers/utils/losses.py
+@@ -60,6 +60,11 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
+     entropy = model_output.get("entropy", None)
+     if entropy is not None:
+         entropy = no_padding_2_padding(entropy, data)
++    sc_outputs = {
++        key: no_padding_2_padding(model_output[key], data)
++        for key in ("sc_correction", "sc_sampler_head_mass", "sc_train_head_mass")
++        if key in model_output
++    }
+ 
+     # global batch info for loss aggregation
+     config.global_batch_info["dp_size"] = data["dp_size"]
+@@ -101,6 +106,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
+     loss_mode = config.policy_loss.get("loss_mode", "vanilla")
+ 
+     policy_loss_fn = get_policy_loss_fn(loss_mode)
++    policy_loss_kwargs = {"sc_correction": sc_outputs["sc_correction"]} if sc_outputs else {}
+     pg_loss, pg_metrics = policy_loss_fn(
+         old_log_prob=old_log_prob,
+         log_prob=log_prob,
+@@ -109,6 +115,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
+         loss_agg_mode=loss_agg_mode,
+         config=config,
+         rollout_is_weights=rollout_is_weights,
++        **policy_loss_kwargs,
+     )
+ 
+     # AggregationType.MEAN for pg metrics: assumes policy_loss_fn normalizes by local_bsz/local_tokens
+@@ -117,6 +124,10 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
+ 
+     metrics.update(pg_metrics)
+     metrics["actor/pg_loss"] = Metric(value=pg_loss, aggregation=metric_aggregation)
++    if sc_outputs:
++        for key in ("sc_sampler_head_mass", "sc_train_head_mass"):
++            value = masked_mean(sc_outputs[key], response_mask)
++            metrics[f"actor/{key}"] = Metric(value=value, aggregation=AggregationType.MEAN)
+     policy_loss = pg_loss
+ 
+     # add entropy loss
+diff --git a/verl/workers/utils/padding.py b/verl/workers/utils/padding.py
+index f45d74aff493a771e1fe0082bfcc0c37d9f5bdb4..dde3d3bd5e7fba2cd2851c6ab1e6266ddf35b7eb 100644
+--- a/verl/workers/utils/padding.py
++++ b/verl/workers/utils/padding.py
+@@ -91,6 +91,13 @@ def left_right_2_no_padding(data: TensorDict) -> TensorDict:
+         data["teacher_logprobs"] = teacher_logprobs_nested
+         data["teacher_ids"] = teacher_ids_nested
+ 
++    # (bsz, seqlen, k) sampler top-k heads for score centering
++    for key in ("rollout_topk_ids", "rollout_topk_log_probs"):
++        value = data.get(key, None)
++        if value is not None and not value.is_nested:
++            value_rmpad = index_first_axis(value.unsqueeze(-1).flatten(0, 1), indices)
++            data[key] = torch.nested.nested_tensor_from_jagged(value_rmpad.squeeze(-1), offsets=cu_seqlens)
++
+     return data
+ 
+ 

@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [trainer] test: the transfer queue tests start Ray
+ themselves, with the CPUs its actors take
+
+tq.init() creates a controller and two storage units, which take one CPU of Ray's each, and waits until they are up.
+The fixtures let it start Ray implicitly, sized by the machine: on a machine with two cores the second storage unit
+is never scheduled and tq.init() waits forever. They now start, and shut down, a cluster of three CPUs.
+---
+ tests/trainer/ppo/v1/test_reissue_inflight_on_cpu.py | 5 +++++
+ tests/trainer/ppo/v1/test_replay_buffer_on_cpu.py    | 5 +++++
+ 2 files changed, 10 insertions(+)
+
+diff --git a/tests/trainer/ppo/v1/test_reissue_inflight_on_cpu.py b/tests/trainer/ppo/v1/test_reissue_inflight_on_cpu.py
+index fece90c65bb6e24fbedaadfab0da85b3ec6106bc..17a1dd10faed03ed63f74461694030ce4e6e4e4d 100644
+--- a/tests/trainer/ppo/v1/test_reissue_inflight_on_cpu.py
++++ b/tests/trainer/ppo/v1/test_reissue_inflight_on_cpu.py
+@@ -35,6 +35,7 @@ round-trip that backs checkpoint consistency (matching ``_save_checkpoint``/
+ import uuid
+ 
+ import pytest
++import ray
+ import torch
+ import transfer_queue as tq
+ from omegaconf import OmegaConf
+@@ -47,9 +48,13 @@ from verl.utils import tensordict_utils as tu
+ 
+ @pytest.fixture(scope="module")
+ def tq_init():
++    # A cluster of this module's own, with the CPUs TransferQueue's actors take (the controller and the two storage
++    # units, one each): on a machine with fewer cores, a cluster sized by the machine leaves tq.init() waiting forever.
++    ray.init(num_cpus=3)
+     tq.init()
+     yield
+     tq.close()
++    ray.shutdown()
+ 
+ 
+ @pytest.fixture
+diff --git a/tests/trainer/ppo/v1/test_replay_buffer_on_cpu.py b/tests/trainer/ppo/v1/test_replay_buffer_on_cpu.py
+index 96755da7e5ab13649cd7fa0aec0154bb74d933ec..83c2cc8ba4b2ade01306de4a376978dadf766ecd 100644
+--- a/tests/trainer/ppo/v1/test_replay_buffer_on_cpu.py
++++ b/tests/trainer/ppo/v1/test_replay_buffer_on_cpu.py
+@@ -25,6 +25,7 @@ import uuid
+ from dataclasses import dataclass, field
+ 
+ import pytest
++import ray
+ import torch
+ import transfer_queue as tq
+ from transfer_queue import KVBatchMeta
+@@ -37,9 +38,13 @@ POLL_INTERVAL = 0.05
+ 
+ @pytest.fixture(scope="module")
+ def tq_init():
++    # A cluster of this module's own, with the CPUs TransferQueue's actors take (the controller and the two storage
++    # units, one each): on a machine with fewer cores, a cluster sized by the machine leaves tq.init() waiting forever.
++    ray.init(num_cpus=3)
+     tq.init()
+     yield
+     tq.close()
++    ray.shutdown()
+ 
+ 
+ @pytest.fixture

@@ -1,0 +1,10 @@
+{
+  "id": "62b443a96da4497f8277f72aeea71a94",
+  "instruction": "Pick up the red cube.",
+  "created": 1794473310.8578985,
+  "model": "demo",
+  "model_label": "Demo Policy \u00b7 pose5 (test only)",
+  "backend": "fake",
+  "action_format": "pose5",
+  "images": []
+}

@@ -1,0 +1,52 @@
+==== system ====
+You are controlling a robot. Each turn you see the robot's current state and its camera images, and you respond with the next action.
+
+## OBSERVATION
+
+The robot is made of named parts, and each part has named quantities you can set. Every turn begins with the current value of every such quantity, grouped by part, followed by the camera images:
+
+{"<part>": {"<quantity>": <value>, ...}, ...}
+
+Lengths are in centimeters and angles in radians; any other quantity is a plain number. Nothing beyond these names is given about what each quantity corresponds to.
+
+## ACTION
+
+The action changes the listed quantities by these amounts:
+
+{"<part>": {"<quantity>": <change>, ...}, ...}
+
+Write the change of every quantity; 0 leaves a quantity as it is.
+
+## EXECUTION
+
+The action ends once every target is reached and the robot is at rest. If something keeps a target from being reached, the robot stops there and the action ends. Either way, you then receive the next observation.
+
+## RESPONSE FORMAT
+
+End your response with exactly one fenced json block containing the action, and nothing after it:
+
+```json
+<action>
+```
+
+## ENVIRONMENT
+
+- agentview: a fixed camera.
+- wrist: a camera on the gripper; with the gripper pointing straight down at yaw 0, +x points toward the top of its image and +y toward its right.
+- the episode ends by itself as soon as the task is done: while observations keep coming, the task is not done yet.
+
+## TASK
+
+put the black bowl on the plate
+
+==== user ====
+---- text ----
+{"arm": {"x": 0.0, "y": 0.0, "z": 0.0, "roll": 0.0, "pitch": 0.0, "yaw": 0.0}, "gripper": {"width": 0.0}}
+
+The current camera frames follow. End your response with one json block containing the next action.
+---- text ----
+[agentview]
+---- image ----
+---- text ----
+[wrist]
+---- image ----

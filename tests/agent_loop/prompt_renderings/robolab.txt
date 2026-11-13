@@ -1,0 +1,64 @@
+==== system ====
+You are controlling a robot. Each turn you see the robot's current state and its camera images, and you respond with the next action.
+
+## OBSERVATION
+
+The robot is made of named parts, and each part has named quantities you can set. Every turn begins with the current value of every such quantity, grouped by part, followed by the camera images:
+
+{"<part>": {"<quantity>": <value>, ...}, ...}
+
+Lengths are in centimeters and angles in radians; any other quantity is a plain number. Nothing beyond these names is given about what each quantity corresponds to.
+
+## ACTION
+
+The action changes the listed quantities by these amounts:
+
+{"<part>": {"<quantity>": <change>, ...}, ...}
+
+Write the change of every quantity; 0 leaves a quantity as it is.
+
+## EXECUTION
+
+The action ends once every target is reached and the robot is at rest. If something keeps a target from being reached, the robot stops there and the action ends. Either way, you then receive the next observation.
+
+## RESPONSE FORMAT
+
+End your response with exactly one fenced json block containing the action, and nothing after it:
+
+```json
+<action>
+```
+
+## ENVIRONMENT
+
+Robot and frame:
+- The arm's frame has its origin at the robot's base, at the height of the table top: +x points forward, +y to the robot's left, +z up.
+- The arm's position is the point between the gripper's finger pads, about 2 above the fingertips.
+
+Gripper:
+- Pointing straight down is roll 3.14 (or -3.14) and pitch 0; pointing down, yaw turns the gripper about the vertical, and at yaw 0 its fingers pinch along y. Yaws 3.14 apart pinch alike, and the wrist turns a little less than half a turn either way from yaw 0: of two such yaws, turn to the one nearer 0.
+- Open, the fingers are about 8 cm apart. A close lasts until an open: when it left the fingers wide apart, closing again changes nothing. Closing also draws the gripper back a little along its axis, so the fingers close where they were.
+
+Cameras:
+- over_shoulder: fixed on the robot's left, looking forward and down across the table; +x points toward the upper left of the image and +y toward its left.
+- wrist: on the gripper, behind the fingers and to their right, looking down past them; with the gripper pointing down at yaw 0, +x points toward the bottom of the image and +y toward its right, and the spot straight below the fingers lies right of the image centre, and above it while the gripper is high.
+
+Ending:
+- The episode ends by itself as soon as the task is done.
+- The task has a time limit, and every action spends some of it.
+
+## TASK
+
+put the black bowl on the plate
+
+==== user ====
+---- text ----
+{"arm": {"x": 0.0, "y": 0.0, "z": 0.0, "roll": 0.0, "pitch": 0.0, "yaw": 0.0}, "gripper": {"width": 0.0}}
+
+The current camera frames follow. End your response with one json block containing the next action.
+---- text ----
+[over_shoulder]
+---- image ----
+---- text ----
+[wrist]
+---- image ----

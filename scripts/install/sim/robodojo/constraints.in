@@ -1,0 +1,22 @@
+# The versions of the packages of the Ray environment of RoboDojo's simulator machines, which
+# scripts/install/sim/robodojo/install.sh installs. Ray and numpy: the training environment's, whose cluster it joins.
+# scripts/install/compile_constraints.sh writes constraints.txt from it: the same versions with their files' hashes.
+attrs==26.1.0
+certifi==2026.10.19
+charset-normalizer==3.5.2
+click==8.5.0
+filelock==4.2.4
+idna==3.20
+jsonschema==4.26.0
+jsonschema-specifications==2025.9.1
+msgpack==1.2.3
+numpy==2.2.6
+packaging==26.3
+protobuf==7.36.2
+pyyaml==6.0.3
+ray==2.58.0
+referencing==0.37.0
+requests==2.34.2
+rpds-py==2026.9.1
+typing-extensions==4.16.0
+urllib3==2.8.0

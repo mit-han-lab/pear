@@ -1,0 +1,145 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [fsdp] fix: all-reduce on the HSDP replicate group while the
+ device memory is still free
+
+An FSDP2 training engine on a 2D mesh all-reduces one element and a tensor of its largest unit's gradient shard
+size on the replicate group right after sharding, before the optimizer is built. NCCL then sets up the group's
+communicator and buffers there, not at the first update's all-reduce.
+---
+ ..._fsdp_gradient_accumulation_sync_on_cpu.py | 62 +++++++++++++++++++
+ verl/workers/engine/fsdp/transformer_impl.py  | 28 +++++++++
+ 2 files changed, 90 insertions(+)
+
+diff --git a/tests/workers/test_fsdp_gradient_accumulation_sync_on_cpu.py b/tests/workers/test_fsdp_gradient_accumulation_sync_on_cpu.py
+index 00ded8ae85938157c5d7ba6203a30d3d37e7cd9a..b76adfacc3f27e426696717976c5216b28219cb4 100644
+--- a/tests/workers/test_fsdp_gradient_accumulation_sync_on_cpu.py
++++ b/tests/workers/test_fsdp_gradient_accumulation_sync_on_cpu.py
+@@ -12,7 +12,9 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import json
+ from contextlib import contextmanager, nullcontext
++from pathlib import Path
+ from types import SimpleNamespace
+ 
+ import pytest
+@@ -127,6 +129,18 @@ def test_gradient_sync_context_hsdp_all_reduces_on_the_last_micro_batch_only(mon
+     assert module.events == expected
+ 
+ 
++@pytest.mark.parametrize("forward_only,strategy,ndim", [(True, "fsdp2", 2), (False, "fsdp", 2), (False, "fsdp2", 1)])
++def test_replicate_group_warm_up_skips_all_but_fsdp2_training_on_a_2d_mesh(monkeypatch, forward_only, strategy, ndim):
++    engine = _make_engine(None)
++    engine.engine_config.forward_only = forward_only
++    engine.engine_config.strategy = strategy
++    engine.device_mesh = SimpleNamespace(ndim=ndim, get_group=lambda name: None)
++    monkeypatch.setattr(transformer_impl, "get_device_id", lambda: "cpu")
++    monkeypatch.setattr(dist, "all_reduce", lambda *args, **kwargs: pytest.fail("all-reduced on the replicate group"))
++
++    engine._warm_up_replicate_group(torch.nn.Linear(2, 2))
++
++
+ @pytest.mark.parametrize("version,module_cls", [(1, _FSDP1Module), (2, _FSDP2Module)])
+ def test_gradient_sync_context_defaults_to_deferred_sync_for_legacy_config(
+     monkeypatch,
+@@ -274,3 +288,51 @@ def test_distributed_accumulation_matches_per_micro_batch_sync(tmp_path):
+         nprocs=world_size,
+         join=True,
+     )
++
++
++def _replicate_warm_up_worker(rank, world_size, rendezvous_file, out_dir):
++    dist.init_process_group(
++        backend="gloo",
++        init_method=f"file://{rendezvous_file}",
++        rank=rank,
++        world_size=world_size,
++    )
++    try:
++        mesh = init_device_mesh("cpu", (2, world_size // 2), mesh_dim_names=("ddp", "fsdp"))
++        model = torch.nn.Sequential(torch.nn.Linear(4, 8), torch.nn.GELU(), torch.nn.Linear(8, 2))
++        for layer in (model[0], model[2]):
++            fully_shard(layer, mesh=mesh)
++        fully_shard(model, mesh=mesh)
++        engine = _make_engine(model)
++        engine.engine_config.forward_only = False
++        engine.engine_config.strategy = "fsdp2"
++        engine.device_mesh = mesh
++        calls = []
++        all_reduce = dist.all_reduce
++
++        def recording_all_reduce(tensor, group=None, **kwargs):
++            calls.append([tensor.numel(), dist.get_process_group_ranks(group)])
++            return all_reduce(tensor, group=group, **kwargs)
++
++        dist.all_reduce = recording_all_reduce
++        transformer_impl.get_device_id = lambda: "cpu"
++        transformer_impl.log_gpu_memory_usage = lambda *args, **kwargs: None  # it queries CUDA even without a GPU
++        engine._warm_up_replicate_group(model)
++        (Path(out_dir) / f"{rank}.json").write_text(json.dumps(calls))
++    finally:
++        dist.destroy_process_group()
++
++
++def test_replicate_group_warm_up_all_reduces_one_element_and_the_largest_unit_shard(tmp_path):
++    world_size = 4
++    mp.spawn(
++        _replicate_warm_up_worker,
++        args=(world_size, str(tmp_path / "rdzv"), str(tmp_path)),
++        nprocs=world_size,
++        join=True,
++    )
++
++    for rank in range(world_size):
++        replicas = [rank % 2, rank % 2 + 2]
++        # the largest unit is the first Linear: its 8 x 4 weight and 8 biases, half of each on every fsdp rank
++        assert json.loads((tmp_path / f"{rank}.json").read_text()) == [[1, replicas], [20, replicas]]
+diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
+index 20df342c9beaaa2185ce32f9ef9b3bee68840562..ccbec03058141e483e82863b487d7156b163af89 100644
+--- a/verl/workers/engine/fsdp/transformer_impl.py
++++ b/verl/workers/engine/fsdp/transformer_impl.py
+@@ -612,6 +612,7 @@ class FSDPEngine(BaseEngine):
+         log_gpu_memory_usage("Before FSDP", logger=None)
+         module = self._build_fsdp_module(module)
+         log_gpu_memory_usage("After FSDP", logger=None)
++        self._warm_up_replicate_group(module)
+ 
+         if not self.engine_config.forward_only:
+             # Initialize optimizer with model parameters and config settings
+@@ -626,6 +627,33 @@ class FSDPEngine(BaseEngine):
+         self.optimizer = optimizer
+         self.lr_scheduler = lr_scheduler
+ 
++    def _warm_up_replicate_group(self, module):
++        """All-reduce on an HSDP training engine's replicate group while the device memory is still free."""
++        # NCCL sets up a group's communicator and buffers at its first collective, outside PyTorch's allocator, which
++        # may hold the whole device by then: the first update's gradient all-reduce across the replicas, which only
++        # FSDP2 training on a 2D mesh does
++        config = self.engine_config
++        if config.forward_only or config.strategy != "fsdp2" or self.device_mesh.ndim != 2:
++            return
++
++        largest = 0
++        for unit in module.modules():
++            if isinstance(unit, FSDPModule):
++                nested = {
++                    id(p)
++                    for sub in unit.modules()
++                    if sub is not unit and isinstance(sub, FSDPModule)
++                    for p in sub.parameters()
++                }
++                largest = max(largest, sum(p.to_local().numel() for p in unit.parameters() if id(p) not in nested))
++
++        # one element sets up the connections of small messages, the largest unit's gradient shard (fp32, the default
++        # reduce dtype) those of large ones: the update's all-reduces then allocate nothing
++        group = self.device_mesh.get_group("ddp")
++        for numel in (1, largest):
++            torch.distributed.all_reduce(torch.zeros(numel, dtype=torch.float32, device=get_device_id()), group=group)
++        log_gpu_memory_usage("After the HSDP replicate group's warm-up", logger=None)
++
+     def train_mode(self, **kwargs):
+         """
+         Return a context manager that switches to training mode with FSDP-specific handling.

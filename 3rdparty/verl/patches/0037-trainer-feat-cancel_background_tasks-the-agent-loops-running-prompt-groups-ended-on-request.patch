@@ -1,0 +1,115 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [trainer] feat: cancel_background_tasks, the agent loops'
+ running prompt groups ended on request
+
+A run that ends leaves the workers' fire-and-forget prompt groups running: their sessions keep calling the rollout
+servers while the process that owns those goes away, and each call then fails as an error of its group. A worker's
+cancel_background_tasks cancels its groups, returns once their sessions are over, cleanup included, and says how
+many groups there were; the manager's calls it on every worker. Nothing calls either by default.
+---
+ .../ppo/v1/test_agent_loop_tq_on_cpu.py       | 64 +++++++++++++++++++
+ verl/trainer/ppo/v1/agent_loop_tq.py          | 13 ++++
+ 2 files changed, 77 insertions(+)
+
+diff --git a/tests/trainer/ppo/v1/test_agent_loop_tq_on_cpu.py b/tests/trainer/ppo/v1/test_agent_loop_tq_on_cpu.py
+index 71d0478edc1a4ea25d3a7c47bd9031813c498c82..f9429dbbe34a41448decce0ef665cfa7feab9d96 100644
+--- a/tests/trainer/ppo/v1/test_agent_loop_tq_on_cpu.py
++++ b/tests/trainer/ppo/v1/test_agent_loop_tq_on_cpu.py
+@@ -139,3 +139,67 @@ def test_a_restored_group_runs_only_its_unfinished_sessions(monkeypatch):
+ 
+     assert sorted(sessions) == [("a", 5, 1), ("a", 5, 3), ("b", 5, 0)] + [("c", 7, i) for i in range(4)]
+     assert sorted(statuses) == sorted([(uid, "running") for uid in "abc"] + [(uid, "finished") for uid in "abc"])
++
++
++def test_cancel_background_tasks_returns_after_the_running_sessions_cleaned_up(monkeypatch):
++    """Cancelling a worker's background tasks cancels every session of its running groups and returns their number, only
++    after the sessions' cleanup; the cancelled groups publish no terminal status."""
++    from omegaconf import OmegaConf
++    from tensordict import TensorDict
++
++    from verl.trainer.ppo.v1 import agent_loop_tq
++    from verl.trainer.ppo.v1.agent_loop_tq import AgentLoopWorkerTQ
++    from verl.utils import tensordict_utils as tu
++
++    statuses, running, cleaned = [], [], []
++
++    async def async_kv_put(*, key, partition_id, tag):
++        statuses.append((key, tag["status"]))
++
++    async def run_agent_loop(sampling_params, *, trajectory, trace, session_id, **prompt):
++        running.append((prompt["uid"], session_id))
++        try:
++            await asyncio.Event().wait()  # a session that only a cancellation ends
++        finally:
++            await asyncio.sleep(0.01)  # a cleanup that takes a while, as closing an environment does
++            cleaned.append((prompt["uid"], session_id))
++
++    monkeypatch.setattr(agent_loop_tq.tq, "async_kv_put", async_kv_put)
++    worker_class = AgentLoopWorkerTQ.__ray_metadata__.modified_class
++    worker = worker_class.__new__(worker_class)
++    worker.config = OmegaConf.create(
++        {
++            "actor_rollout_ref": {
++                "rollout": {
++                    "n": 2,
++                    "val_kwargs": {"n": 1},
++                    "temperature": 1.0,
++                    "top_p": 1.0,
++                    "top_k": -1,
++                    "calculate_log_probs": False,
++                    "topk_log_probs": 0,
++                    "agent": {"default_agent_loop": "tool_agent"},
++                }
++            }
++        }
++    )
++    worker.background_tasks = set()
++    worker._run_agent_loop = run_agent_loop
++    batch = TensorDict({"index": torch.tensor([0, 1])}, batch_size=2)
++    tu.assign_non_tensor_stack(batch, "uid", ["a", "b"])
++    tu.assign_non_tensor_data(batch, "global_steps", 5)
++
++    async def run():
++        await worker.generate_sequences(batch)
++        while len(running) < 4:
++            await asyncio.sleep(0)
++        cancelled_groups = await worker.cancel_background_tasks()
++        return cancelled_groups, sorted(cleaned)
++
++    cancelled_groups, cleaned_at_return = asyncio.run(run())
++
++    sessions = [(uid, session_id) for uid in "ab" for session_id in range(2)]
++    assert cancelled_groups == 2
++    assert sorted(running) == sessions
++    assert cleaned_at_return == sessions
++    assert sorted(statuses) == [("a", "running"), ("b", "running")]
+diff --git a/verl/trainer/ppo/v1/agent_loop_tq.py b/verl/trainer/ppo/v1/agent_loop_tq.py
+index d7b8be975b46597a1dc576ac511a463e2aa51351..5651de58f9894d96e9213c644d18783c96310e12 100644
+--- a/verl/trainer/ppo/v1/agent_loop_tq.py
++++ b/verl/trainer/ppo/v1/agent_loop_tq.py
+@@ -152,6 +152,14 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
+                 await _settle_session_tasks(tasks)
+             await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "failure"})
+ 
++    async def cancel_background_tasks(self) -> int:
++        """Cancel the prompt groups still running, wait until their sessions are over and return how many groups."""
++        tasks = list(self.background_tasks)
++        for task in tasks:
++            task.cancel()
++        await asyncio.gather(*tasks, return_exceptions=True)
++        return len(tasks)
++
+     async def _agent_loop_postprocess(
+         self, output: AgentLoopOutput | list[AgentLoopOutput], validate, **kwargs
+     ) -> None:
+@@ -262,3 +270,8 @@ class AgentLoopManagerTQ(AgentLoopManager):
+                 for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=False)
+             ]
+         )
++
++    def cancel_background_tasks(self) -> int:
++        """Cancel every worker's running prompt groups and return how many: no session calls a rollout server once
++        this returns."""
++        return sum(ray.get([worker.cancel_background_tasks.remote() for worker in self.agent_loop_workers]))

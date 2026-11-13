@@ -1,0 +1,4 @@
+interrupted: The previous inference was interrupted; no action was executed. Observe again.
+completed move: {"status": "completed", "execution_requested": true, "settled": true, "reached": true} Use the new measured observation.
+out of reach: {"status": "rejected", "moved": false, "error": {"code": "out_of_reach", "message": "Nothing moved: the whole action was discarded (arm and gripper). The target is out of reach. Along the requested change the arm can go at most 2% (x +4.6 of +200, z 0.0 of +0.3)."}} Use the new measured observation.
+gripper closing: {"status": "completed", "execution_requested": true, "settled": true, "reached": true, "gripper": "closed"} Use the new measured observation.

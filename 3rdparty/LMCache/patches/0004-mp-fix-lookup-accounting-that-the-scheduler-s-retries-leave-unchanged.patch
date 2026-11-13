@@ -1,0 +1,281 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [mp] fix: lookup accounting that the scheduler's retries
+ leave unchanged
+
+After LMCache pull request #4520, "[Bugfix][MP] Make lookup accounting retry-safe"
+(https://github.com/LMCache/LMCache/pull/4520, issue #4508), at its revision
+9555c667cef3142fd053001940ff85df9fe404a5, ported onto the commit of UPSTREAM with pull request #4955.
+
+get_num_new_matched_tokens added the lookup hit to the tracker's num_stored_tokens on every call, and vLLM calls it
+again on every scheduler step for a waiting request whose block allocation failed. The watermark then ends far past
+the request's length, and no later chunk of the request is staged for a STORE: what the request computes after a
+resume never reaches the tier, and the next lookup of the conversation is short by about a turn.
+
+What the port takes and changes:
+- LMCacheMPRequestTracker.account_lookup_result and _accounted_lookup_tokens are the pull request's, with the
+  parameter named num_hit_tokens and the comments rewritten.
+- The lookup's share is also reset in the connector's branch that bypasses LMCache after a failed asynchronous load.
+- Both hit counters are recorded before the early return of an LMCache miss, which the pull request removes: the
+  store's upper bound counts computed tokens from the larger of the two.
+- The pull request's sentence in get_num_new_matched_tokens' docstring is left out.
+- The tests (tests/v1/test_mp_connector_lookup_retry.py, four cases) are the port's own, not the pull request's.
+---
+ .../integration/vllm/lmcache_mp_connector.py  |  26 ++--
+ .../integration/vllm/lmcache_mp_metadata.py   |  23 +++
+ tests/v1/test_mp_connector_lookup_retry.py    | 144 ++++++++++++++++++
+ 3 files changed, 183 insertions(+), 10 deletions(-)
+ create mode 100644 tests/v1/test_mp_connector_lookup_retry.py
+
+diff --git a/lmcache/integration/vllm/lmcache_mp_connector.py b/lmcache/integration/vllm/lmcache_mp_connector.py
+index 5b396b61fcc8613a5ca84542cdbbc940ffa42504..032693b47023ee3a50f0ab057a628179f8346903 100644
+--- a/lmcache/integration/vllm/lmcache_mp_connector.py
++++ b/lmcache/integration/vllm/lmcache_mp_connector.py
+@@ -1051,6 +1051,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+             self.scheduler_adapter.cleanup_lookup_result(request.request_id)
+             tracker.allocated_block_ids.clear()
+             tracker.num_stored_tokens = 0
++            tracker._accounted_lookup_tokens = 0
+             tracker.num_vllm_hit_tokens = 0
+             tracker.num_lmcache_hit_tokens = 0
+             tracker.state = LMCacheMPRequestState.BYPASS_LMCACHE
+@@ -1067,18 +1068,20 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+         if ret is None:
+             return None, True
+ 
+-        if ret == 0:
+-            return 0, False
+-
+         assert ret % self.scheduler_adapter.lmcache_tokens_per_chunk == 0
+ 
+-        # Update num stored tokens for the tracker
+-        tracker.increase_num_stored_tokens(ret)
+-
+-        # Save the vllm and lmcache hit tokens. The vLLM hit count is
+-        # rounded down to a boundary aligned for every engine group (e.g.
+-        # a full-prompt APC hit reports ``num_prompt_tokens - 1``), so the
+-        # retrieve-skip range stays paged-chunk-aligned in all groups.
++        # This method runs again for a waiting request whose block allocation
++        # failed, with the same cached lookup result, so everything it records
++        # must be idempotent: account the latest result (zero included)
++        # instead of adding the hit on every call.
++        tracker.account_lookup_result(ret)
++
++        # Save the vllm and lmcache hit tokens, also when LMCache misses: the
++        # store upper bound counts computed tokens from the larger of the two.
++        # The vLLM hit count is rounded down to a boundary aligned for every
++        # engine group (e.g. a full-prompt APC hit reports
++        # ``num_prompt_tokens - 1``), so the retrieve-skip range stays
++        # paged-chunk-aligned in all groups.
+         tracker.num_vllm_hit_tokens = (
+             num_computed_tokens
+             // self._hit_alignment_tokens
+@@ -1086,6 +1089,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+         )
+         tracker.num_lmcache_hit_tokens = ret
+ 
++        if ret == 0:
++            return 0, False
++
+         need_to_load = max(0, ret - num_computed_tokens)
+ 
+         # In full-prompt-hit case, we need to recompute the last token.
+diff --git a/lmcache/integration/vllm/lmcache_mp_metadata.py b/lmcache/integration/vllm/lmcache_mp_metadata.py
+index c378850023dd798d432af123c11d459cf0aaf0cf..bc2fff416e521e0c048b8a4926054537199b1f07 100644
+--- a/lmcache/integration/vllm/lmcache_mp_metadata.py
++++ b/lmcache/integration/vllm/lmcache_mp_metadata.py
+@@ -65,6 +65,10 @@ class LMCacheMPRequestTracker:
+     # requests.
+     num_stored_tokens: int = 0
+ 
++    # Prefix tokens of the latest lookup result that are included in
++    # num_stored_tokens (see account_lookup_result).
++    _accounted_lookup_tokens: int = 0
++
+     # Staging load operation -- save vllm and lmcache hit tokens during lookup
+     num_vllm_hit_tokens: int = 0
+     num_lmcache_hit_tokens: int = 0
+@@ -84,6 +88,7 @@ class LMCacheMPRequestTracker:
+         self.all_token_ids = request.all_token_ids
+         self.allocated_block_ids = {}
+         self.num_stored_tokens = 0
++        self._accounted_lookup_tokens = 0
+         self.num_vllm_hit_tokens = 0
+         self.num_lmcache_hit_tokens = 0
+         self.state = LMCacheMPRequestState.PREFETCHING
+@@ -123,6 +128,24 @@ class LMCacheMPRequestTracker:
+     def increase_num_scheduled_tokens(self, num_new_tokens: int):
+         self.num_scheduled_tokens += num_new_tokens
+ 
++    def account_lookup_result(self, num_hit_tokens: int) -> None:
++        """Replace the lookup's contribution to the stored-token watermark.
++
++        The scheduler calls ``get_num_new_matched_tokens`` again for a waiting
++        request whose block allocation failed, and the adapter then returns the
++        same cached lookup result (or a changed one, including a downgrade to
++        zero). Only the difference from the previously accounted result is
++        applied, so the watermark stays at the hit however often the scheduler
++        retries; adding the hit on every call pushed it past the request's
++        length and no later chunk of the request was ever stored
++        (LMCache issue #4508, PR #4520).
++
++        Args:
++            num_hit_tokens: Prefix token count of the latest completed lookup.
++        """
++        self.num_stored_tokens += num_hit_tokens - self._accounted_lookup_tokens
++        self._accounted_lookup_tokens = num_hit_tokens
++
+     def increase_num_stored_tokens(self, num_new_tokens: int):
+         """Increase the number of stored tokens for the current request
+         This function will be called when processing the cached requests.
+diff --git a/tests/v1/test_mp_connector_lookup_retry.py b/tests/v1/test_mp_connector_lookup_retry.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f4dabb13b73aa3e6d53cb345685548a692282d90
+--- /dev/null
++++ b/tests/v1/test_mp_connector_lookup_retry.py
+@@ -0,0 +1,144 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Scheduler retries of ``get_num_new_matched_tokens`` must not move the store watermark.
++
++vLLM asks the connector again for a waiting request whose block allocation
++failed; the adapter returns the same cached lookup result until
++``update_state_after_alloc`` cleans it up. Adding the hit on every call put
++``num_stored_tokens`` past the request's length, so the request never stored
++another chunk (LMCache issue #4508): under GPU memory pressure every resumed
++or queued request lost what it computed.
++"""
++
++# Standard
++from typing import Any
++
++# Third Party
++import pytest
++
++pytest.importorskip("vllm", reason="MP connector imports vLLM at module top")
++
++# Third Party
++from vllm.v1.request import RequestStatus  # noqa: E402
++from vllm.v1.utils import ConstantList  # noqa: E402
++
++# First Party
++from lmcache.integration.vllm.lmcache_mp_connector import (  # noqa: E402
++    LMCacheMPConnector,
++)
++from lmcache.integration.vllm.lmcache_mp_metadata import (  # noqa: E402
++    LMCacheMPRequestMetadata,
++    LMCacheMPRequestTracker,
++)
++
++CHUNK = 4
++
++
++class _FakeRequest:
++    def __init__(self, token_ids: list[int], status: RequestStatus) -> None:
++        self.request_id = "req-0"
++        self.cache_salt = ""
++        self.prompt_token_ids = list(token_ids[:4])
++        self._token_ids = list(token_ids)
++        self.all_token_ids = ConstantList(self._token_ids)
++        self.mm_features = []
++        self.status = status
++        self.num_computed_tokens = 0
++
++
++class _CachedLookupAdapter:
++    """Returns one finished lookup result until it is cleaned up, as the real adapter does."""
++
++    lmcache_tokens_per_chunk = CHUNK
++
++    def __init__(self, results: list[int | None]) -> None:
++        self._results = list(results)
++        self.submitted = 0
++
++    def maybe_submit_lookup_request(
++        self,
++        request_id: str,
++        token_ids: list[int],
++        cache_salt: str,
++        request_configs: dict[str, Any] | None = None,
++    ) -> None:
++        del request_id, token_ids, cache_salt, request_configs
++        self.submitted += 1
++
++    def check_lookup_result(self, request_id: str) -> int | None:
++        del request_id
++        return self._results.pop(0) if len(self._results) > 1 else self._results[0]
++
++
++def _make_connector(adapter: _CachedLookupAdapter) -> LMCacheMPConnector:
++    connector = object.__new__(LMCacheMPConnector)
++    connector.request_trackers = {}
++    connector.scheduler_adapter = adapter
++    connector._hit_alignment_tokens = CHUNK
++    return connector
++
++
++def _store_range(tracker: LMCacheMPRequestTracker) -> tuple[int, int] | None:
++    meta = LMCacheMPRequestMetadata.GetStoreMetadata(tracker, CHUNK, [CHUNK])
++    return None if meta is None else (meta.op.start, meta.op.end)
++
++
++@pytest.mark.parametrize("status", [RequestStatus.WAITING, RequestStatus.PREEMPTED])
++@pytest.mark.parametrize("retries", [1, 2, 7])
++def test_retried_lookup_keeps_the_watermark_at_the_hit(
++    status: RequestStatus, retries: int
++) -> None:
++    request = _FakeRequest(list(range(24)), status)
++    connector = _make_connector(_CachedLookupAdapter([8]))
++
++    for _ in range(retries):
++        assert connector.get_num_new_matched_tokens(request, 0) == (8, True)
++
++    tracker = connector.request_trackers[request.request_id]
++    assert tracker.num_stored_tokens == 8
++    assert tracker.num_lmcache_hit_tokens == 8
++
++
++def test_chunks_computed_after_a_retried_lookup_are_stored() -> None:
++    """The consequence that matters: the chunk right after the hit is staged for STORE."""
++    request = _FakeRequest(list(range(24)), RequestStatus.PREEMPTED)
++    connector = _make_connector(_CachedLookupAdapter([8]))
++    for _ in range(5):  # four failed allocations, then the one that is admitted
++        connector.get_num_new_matched_tokens(request, 0)
++
++    tracker = connector.request_trackers[request.request_id]
++    tracker.append_block_ids(([10, 11, 12, 13, 14, 15],))
++    tracker.increase_num_scheduled_tokens(8)  # tokens 8..15 are computed in this step
++
++    assert _store_range(tracker) == (8, 16)
++    tracker.increase_num_scheduled_tokens(8)
++    assert _store_range(tracker) == (16, 24)
++
++
++def test_lookup_downgraded_to_zero_on_retry_stores_from_the_start() -> None:
++    """A retry may return less (the server turned unhealthy): nothing is assumed stored then."""
++    request = _FakeRequest(list(range(24)), RequestStatus.WAITING)
++    connector = _make_connector(_CachedLookupAdapter([8, 0]))
++
++    assert connector.get_num_new_matched_tokens(request, 0) == (8, True)
++    assert connector.get_num_new_matched_tokens(request, 0) == (0, False)
++
++    tracker = connector.request_trackers[request.request_id]
++    assert tracker.num_stored_tokens == 0
++    assert tracker.num_lmcache_hit_tokens == 0
++    tracker.append_block_ids(([10, 11, 12, 13, 14, 15],))
++    tracker.increase_num_scheduled_tokens(24)
++    assert _store_range(tracker) == (0, 24)
++
++
++def test_lmcache_miss_still_counts_the_local_prefix_hit_as_computed() -> None:
++    """With no LMCache hit the GPU prefix hit bounds what is computed, so its chunks are stored at once."""
++    request = _FakeRequest(list(range(24)), RequestStatus.WAITING)
++    connector = _make_connector(_CachedLookupAdapter([0]))
++
++    assert connector.get_num_new_matched_tokens(request, 17) == (0, False)
++
++    tracker = connector.request_trackers[request.request_id]
++    assert tracker.num_vllm_hit_tokens == 16  # rounded down to the chunk-aligned boundary
++    tracker.append_block_ids(([10, 11, 12, 13, 14, 15],))
++    tracker.increase_num_scheduled_tokens(1)  # the first step only computes token 17
++    assert _store_range(tracker) == (0, 16)

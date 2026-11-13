@@ -1,0 +1,6 @@
+# Overrides of the station environment's resolution (uv's UV_OVERRIDE), next to constraints.in: each replaces what
+# another package requires.
+
+# packaging at what openai-codex requires (>=26.2), in place of the <26 of lerobot, which parses only the versions of
+# its datasets with it: the station loads none.
+packaging==26.3

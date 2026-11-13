@@ -1,0 +1,142 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [model] feat: model.liger_kwargs, keyword arguments for
+ Liger's kernel patching
+
+The FSDP engine passes model.liger_kwargs to Liger's _apply_liger_kernel_to_instance on top of its own
+fused_linear_cross_entropy=False and swiglu=True; rms_norm: false, for example, keeps the model's own RMSNorm.
+---
+ verl/trainer/config/_generated_ppo_megatron_trainer.yaml   | 2 ++
+ verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml | 2 ++
+ verl/trainer/config/_generated_ppo_trainer.yaml            | 2 ++
+ verl/trainer/config/_generated_ppo_veomni_trainer.yaml     | 2 ++
+ verl/trainer/config/model/hf_model.yaml                    | 3 +++
+ verl/workers/config/model.py                               | 1 +
+ verl/workers/engine/fsdp/transformer_impl.py               | 7 ++-----
+ 7 files changed, 14 insertions(+), 5 deletions(-)
+
+diff --git a/verl/trainer/config/_generated_ppo_megatron_trainer.yaml b/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
+index d0242ba96751f914c4be304473626540c4d72672..f33766e04ed60c365b1189cafbdbdf0fcf96b427 100644
+--- a/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
+@@ -468,6 +468,7 @@ actor_rollout_ref:
+     exclude_modules: null
+     lora_adapter_path: null
+     use_liger: false
++    liger_kwargs: {}
+     use_fused_kernels: false
+     fused_kernel_options:
+       impl_backend: torch
+@@ -732,6 +733,7 @@ critic:
+     exclude_modules: null
+     lora_adapter_path: null
+     use_liger: false
++    liger_kwargs: {}
+     use_fused_kernels: false
+     fused_kernel_options:
+       impl_backend: torch
+diff --git a/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml b/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
+index da8d625a48e8fcd604b5ab6d305708eca8caa33a..492bdaed89c84d7e22824c4867feeeeb3800f284 100644
+--- a/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
+@@ -412,6 +412,7 @@ actor_rollout_ref:
+     exclude_modules: null
+     lora_adapter_path: null
+     use_liger: false
++    liger_kwargs: {}
+     use_fused_kernels: false
+     fused_kernel_options:
+       impl_backend: torch
+@@ -627,6 +628,7 @@ critic:
+     exclude_modules: null
+     lora_adapter_path: null
+     use_liger: false
++    liger_kwargs: {}
+     use_fused_kernels: false
+     fused_kernel_options:
+       impl_backend: torch
+diff --git a/verl/trainer/config/_generated_ppo_trainer.yaml b/verl/trainer/config/_generated_ppo_trainer.yaml
+index dce58b9652eb2deb0fe99c370df3b6ba15710f74..8807ca937a751564e60f50fe0e5947bbb40618c0 100644
+--- a/verl/trainer/config/_generated_ppo_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_trainer.yaml
+@@ -457,6 +457,7 @@ actor_rollout_ref:
+     exclude_modules: null
+     lora_adapter_path: null
+     use_liger: false
++    liger_kwargs: {}
+     use_fused_kernels: false
+     fused_kernel_options:
+       impl_backend: torch
+@@ -702,6 +703,7 @@ critic:
+     exclude_modules: null
+     lora_adapter_path: null
+     use_liger: false
++    liger_kwargs: {}
+     use_fused_kernels: false
+     fused_kernel_options:
+       impl_backend: torch
+diff --git a/verl/trainer/config/_generated_ppo_veomni_trainer.yaml b/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
+index 93828695e9bcd7a07967e363f6ac7d5c6bda116e..d6174d5408201256aa3b880362f3a9a245759221 100644
+--- a/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
++++ b/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
+@@ -434,6 +434,7 @@ actor_rollout_ref:
+     exclude_modules: null
+     lora_adapter_path: null
+     use_liger: false
++    liger_kwargs: {}
+     use_fused_kernels: false
+     fused_kernel_options:
+       impl_backend: torch
+@@ -667,6 +668,7 @@ critic:
+     exclude_modules: null
+     lora_adapter_path: null
+     use_liger: false
++    liger_kwargs: {}
+     use_fused_kernels: false
+     fused_kernel_options:
+       impl_backend: torch
+diff --git a/verl/trainer/config/model/hf_model.yaml b/verl/trainer/config/model/hf_model.yaml
+index 6e37fb5e2f3f3efcb1ac8f6395846163386812ee..38d57d690741c986589fae0fd2f596d7cb345073 100644
+--- a/verl/trainer/config/model/hf_model.yaml
++++ b/verl/trainer/config/model/hf_model.yaml
+@@ -62,6 +62,9 @@ lora_adapter_path: null
+ # whether to use liger. Only valid when we use hf model definition
+ use_liger: False
+ 
++# keyword arguments for liger's apply_liger_kernel_to_<model_type>, e.g. rms_norm: False keeps the model's own RMSNorm
++liger_kwargs: {}
++
+ # whether to use fused kernels.
+ use_fused_kernels: False
+ 
+diff --git a/verl/workers/config/model.py b/verl/workers/config/model.py
+index f7baab8b843798facaf6c9492a62bc4bd90201b2..5f7d517b0dd7fe1777a565bb807da57260f6f2ca 100644
+--- a/verl/workers/config/model.py
++++ b/verl/workers/config/model.py
+@@ -135,6 +135,7 @@ class HFModelConfig(BaseConfig):
+     # path to pre-trained LoRA adapter to load for continued training
+     lora_adapter_path: Optional[str] = None
+     use_liger: bool = False
++    liger_kwargs: dict = field(default_factory=dict)
+ 
+     use_fused_kernels: bool = False
+     fused_kernel_options: dict = field(default_factory=dict)
+diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
+index b0ca36bcfe9bdc36777cec09dcead66611c6c582..639611178d594c132ca01d8868f913b306e7cd9d 100644
+--- a/verl/workers/engine/fsdp/transformer_impl.py
++++ b/verl/workers/engine/fsdp/transformer_impl.py
+@@ -309,11 +309,8 @@ class FSDPEngine(BaseEngine):
+             if use_liger:
+                 from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
+ 
+-                _apply_liger_kernel_to_instance(
+-                    model=module,
+-                    fused_linear_cross_entropy=False,
+-                    swiglu=True,
+-                )
++                liger_kwargs = {"fused_linear_cross_entropy": False, "swiglu": True, **self.model_config.liger_kwargs}
++                _apply_liger_kernel_to_instance(model=module, **liger_kwargs)
+ 
+             fused_kernel_options = self.model_config.fused_kernel_options
+             fused_kernels_backend = (

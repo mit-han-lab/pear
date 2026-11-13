@@ -1,0 +1,43 @@
+name: verl tests
+
+# verl's own CPU tests for the files the patches touch, on the patched checkout. They run when the patches or the pinned
+# commit change, and on main.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "3rdparty/verl/**"
+      - "3rdparty/patched_checkout.sh"
+      - "scripts/**"
+      - ".github/actions/training-env/**"
+      - ".github/workflows/verl.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "3rdparty/verl/**"
+      - "3rdparty/patched_checkout.sh"
+      - "scripts/**"
+      - ".github/actions/training-env/**"
+      - ".github/workflows/verl.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# bash with -e and pipefail: a step ends at the first command that fails, inside a pipeline too
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  verl:
+    name: The verl tests the patches touch
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/training-env
+      - run: PYTHON=$PEAR_PYTHON bash 3rdparty/verl/scripts/run_patched_verl_tests.sh cpu
