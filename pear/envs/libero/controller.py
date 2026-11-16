@@ -85,7 +85,9 @@ class MotionController:
         self.stall_step_n = self.slow_stall_step_n = 0
         self.is_stopping = False
 
-    def move(self, budget: int) -> tuple[dict[str, np.ndarray], list[list[float]], list[float], bool, str]:
+    def move(
+        self, budget: int, *, stop_on_success: bool = True
+    ) -> tuple[dict[str, np.ndarray], list[list[float]], list[float], bool, str]:
         """Native actions toward the targets until they are reached at rest, the robot stops short of them, the task
         ends, or the episode's ``budget`` or the action's cap runs out: the last observation, the actions, their
         rewards, whether the episode ended and the outcome (reached | stopped | done | budget | timeout)."""
@@ -97,7 +99,8 @@ class MotionController:
             self.observation, reward, done, _ = self.scene.step(native_action)
             actions.append(native_action.tolist())
             rewards.append(float(reward))
-            if done:
+            # The pinned LIBERO sets done to its task success predicate.
+            if done and stop_on_success:
                 return self.observation, actions, rewards, True, "done"
             outcome = self._step_outcome()
             if outcome is not None:

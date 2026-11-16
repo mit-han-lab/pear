@@ -18,6 +18,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+from pear.agent_loop.protocol import JsonBlockProtocol
 from pear.envs.libero.controller import MotionController
 from pear.sim.env import StatelessEnv
 from pear.sim.process import SimulatorProcess
@@ -62,14 +63,18 @@ class LiberoEnv(StatelessEnv):
     # the family's conversation (EnvironmentTool)
     SCHEMA = MotionController.SCHEMA
     CAMERAS = ("agentview", "wrist")  # the frames of an observation, in this order
-    ENVIRONMENT_PROMPT = Path(__file__).with_name("environment_prompt.md").read_text().strip()
+    POLICY_FINISH_ENVIRONMENT_PROMPT = Path(__file__).with_name("environment_prompt.md").read_text().strip()
+    ENVIRONMENT_PROMPT = (
+        POLICY_FINISH_ENVIRONMENT_PROMPT
+        + "\n- the episode ends by itself as soon as the task is done: while observations keep coming, the task is not done yet."
+    )
     # beyond this the simulator process is hung, even in a replay of the longest episode (520 steps)
     ROLLOUT_TIMEOUT_S = 180.0
 
     # LIBERO benchmark object per suite (instruction, bddl file, init states), process-wide
     _benchmark_by_suite: dict[str, Any] = {}
 
-    def __init__(self, suite: str, task_id: int, trial_id: int) -> None:
+    def __init__(self, suite: str, task_id: int, trial_id: int, policy_finish: bool = False) -> None:
         if suite not in self.MAX_STEP_N_BY_SUITE:
             raise ValueError(f"unknown suite {suite!r}; known: {sorted(self.MAX_STEP_N_BY_SUITE)}")
         assert 0 <= int(trial_id) < self.TRIALS_PER_TASK, (
@@ -79,6 +84,7 @@ class LiberoEnv(StatelessEnv):
         self.suite = suite
         self.task_id = int(task_id)
         self.trial_id = int(trial_id)
+        self.policy_finish = policy_finish
 
         self.scene: Any = None  # the OffScreenRenderEnv of the current call
         self._render_cache: dict[tuple, Any] = {}
@@ -147,10 +153,16 @@ class LiberoEnv(StatelessEnv):
             outcome = None
             done = len(history) >= max_step_n  # nothing left to execute: the budget is already spent
             if action is not None and not done:
-                with self._no_render():  # the controller steps the scene and reads only proprioception
-                    observation, actions, rewards, done, outcome = MotionController(
-                        self.scene, observation, action
-                    ).move(max_step_n - len(history))
+                if self.policy_finish and JsonBlockProtocol.is_finish(action):
+                    done, outcome = True, "finish"
+                else:
+                    with self._no_render():  # the controller steps the scene and reads only proprioception
+                        observation, actions, rewards, done, outcome = MotionController(
+                            self.scene, observation, action
+                        ).move(max_step_n - len(history), stop_on_success=not self.policy_finish)
+
+            if self.policy_finish and len(history) + len(actions) >= max_step_n:
+                done, outcome = True, "budget"
 
             result: EnvResult = {
                 "images": None,  # the frames come below, while the episode goes on
@@ -159,13 +171,15 @@ class LiberoEnv(StatelessEnv):
                 "rewards": rewards,
                 "done": done,
                 "executed": len(actions),
-                "outcome": outcome,  # reached | stopped | done | budget | timeout
+                "outcome": outcome,  # reached | stopped | done | budget | timeout | finish
                 "instruction": re.sub(
                     r"\b(left|right)\b",
                     lambda match: self.MIRRORED_SIDE_BY_SIDE[match.group(1)],
                     str(self._benchmark().get_task(self.task_id).language),
                 ),
             }
+            if self.policy_finish and done:
+                result["task_success"] = outcome == "finish" and bool(self.scene.check_success())
             if not done:
                 if len(history) or actions:  # the reset rendered its last step, the replay and the action nothing
                     observation = self.scene.env._get_observations(force_update=True)

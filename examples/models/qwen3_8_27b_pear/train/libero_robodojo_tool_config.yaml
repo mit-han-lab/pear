@@ -5,6 +5,7 @@ tools:
     config:
       type: native
       env_class: pear.envs.libero.env.LiberoEnv  # the family: its facts and its simulator
+      policy_finish: false  # true lets the model finish the episode
       # its servers: one per slot the rollout machines offer as libero (scripts/start_ray_node.sh)
       log_dir: ${oc.env:PEAR_LOG_DIR}            # the servers' logs and the tool's call log (the recipe: $RUN/sim)
   - class_name: pear.envs.tool.EnvironmentTool
