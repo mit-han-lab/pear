@@ -10,7 +10,7 @@ a Post-training Engine for Agentic Robotics
 </h3>
 
 <p align="center">
-| <a href="https://mit-han-lab.github.io/pear-blog/"><b>Blog</b></a> | <a href="https://mit-han-lab.github.io/pear-blog/paper.pdf"><b>Paper</b></a> | <a href="https://huggingface.co/collections/mit-han-lab/pear"><b>Model</b></a> | <a href="docs/README.md"><b>Documentation</b></a> |
+| <a href="https://mit-han-lab.github.io/pear-blog/"><b>Blog</b></a> | <a href="https://arxiv.org/abs/2611.18562"><b>Paper</b></a> | <a href="https://huggingface.co/collections/mit-han-lab/pear"><b>Model</b></a> | <a href="docs/README.md"><b>Documentation</b></a> |
 </p>
 
 ---
