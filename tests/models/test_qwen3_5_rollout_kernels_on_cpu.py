@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import tomllib
 import torch
-from vllm.config import get_current_vllm_config
+from vllm.config import CacheConfig, get_current_vllm_config
 from vllm.config.compilation import CompilationConfig, CUDAGraphMode
 from vllm.model_executor.layers.mamba.abstract import get_mamba_prefill_checkpoint_alignment
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import QwenGatedDeltaNetAttention
@@ -383,9 +383,7 @@ def graph_manager(
     prefill_sizes = compilation_config["prefill_cudagraph_capture_token_sizes"]
 
     manager = manager_cls.__new__(manager_cls)
-    manager.vllm_config = types.SimpleNamespace(
-        uniform_decode_query_len=1, cache_config=types.SimpleNamespace(use_kda_recoverssm=False)
-    )
+    manager.vllm_config = types.SimpleNamespace(uniform_decode_query_len=1, cache_config=CacheConfig())
     manager.compilation_config = types.SimpleNamespace(
         prefill_cudagraph_capture_token_sizes=prefill_sizes,
         decode_cudagraph_capture_request_sizes=compilation_config.get(
