@@ -9,6 +9,8 @@ from pear.models.qwen3_5.rollout.hopper.cudagraph import HopperCudaGraphManager,
 from pear.models.qwen3_5.rollout.hopper.extension import HopperExtension
 from pear.models.qwen3_5.rollout.hopper.gdn import HopperGDNAttention, HopperGDNBackend
 from pear.models.qwen3_5.rollout.hopper.model import HopperQwen3_5ForConditionalGeneration
+from pear.models.qwen3_5.rollout.hopper.mtp import HopperQwen3_5MTP
+from pear.models.qwen3_5.rollout.nonfinite_logits import NonfiniteCheckedOutput
 
 
 class HopperRolloutGpuBackend(RolloutGpuBackend):
@@ -18,6 +20,7 @@ class HopperRolloutGpuBackend(RolloutGpuBackend):
     generation = GpuGeneration.HOPPER
     tensor_parallel_size = AllReduceNorm.TP_SIZE  # 6 query heads per KV head on a rank, 4-rank reductions
     model_cls = HopperQwen3_5ForConditionalGeneration
+    draft_model_cls = HopperQwen3_5MTP
     # under torch.compile (VLLM_USE_BREAKABLE_CUDAGRAPH=0) the Inductor settings make every fresh compile produce the
     # same kernels (verl compiles afresh at every start)
     INDUCTOR_COMPILE_CONFIG = {
@@ -45,5 +48,9 @@ class HopperRolloutGpuBackend(RolloutGpuBackend):
         register_backend(MambaAttentionBackendEnum.GDN_ATTN, is_mamba=True)(HopperGDNBackend)
         register_backend(AttentionBackendEnum.FLASH_ATTN)(HopperFlashAttentionBackend)
 
-        # what vLLM offers no extension point for: FULL graphs of the mixed steps beside the FULL decode graphs
-        HopperCudaGraphManager.install()
+        # what vLLM offers no extension point for: the step output that raises on the NaN and +inf logits the sampler
+        # counts; FULL graphs of the mixed steps beside the FULL decode graphs, without a drafter: a drafter's mixed
+        # step gives its GDN layers its verify rows' count and prefill tokens on the host, which a graph would keep
+        NonfiniteCheckedOutput.install()
+        if vllm_config.speculative_config is None:
+            HopperCudaGraphManager.install()

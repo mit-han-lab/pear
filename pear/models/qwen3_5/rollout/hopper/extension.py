@@ -8,4 +8,4 @@ class HopperExtension(CudaExtension):
     # torch adds the C++ standard its headers need
     OP_NAMESPACE = "pear_rollout_hopper"
     CUDA_FLAGS = ("-O3", "--expt-relaxed-constexpr", "--expt-extended-lambda", "-lineinfo", "-DNDEBUG")
-    LINK_FLAGS = ()
+    LINK_FLAGS = ("-lcublasLt",)  # the drafter's GEMMs (csrc/draft_gemm.cpp)

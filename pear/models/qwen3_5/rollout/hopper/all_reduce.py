@@ -15,24 +15,25 @@ from pear.models.qwen3_5.rollout.hopper.cudagraph import HopperMixedStepGraphs
 
 class AllReduceNorm:
     """A Hopper decoder layer's all-reduce of a row-parallel output, residual add and RMSNorm, as the op
-    torch.ops.pear_rollout_hopper.ar_add_rmsnorm: in a pure decode step two kernels on an MNNVL workspace of their own
-    (csrc/ar_norm.cu) with the residual stream in fp32, else FlashInfer's fused kernel on the bf16 residual up to the
-    largest mixed-step graph, above it vLLM's all-reduce and FlashInfer's fused add + Gemma RMSNorm."""
+    torch.ops.pear_rollout_hopper.ar_add_rmsnorm: in a uniform decode step (a pure decode or a verify step) two kernels
+    on an MNNVL workspace of their own (csrc/ar_norm.cu) with the residual stream in fp32, else FlashInfer's fused kernel
+    on the bf16 residual up to the largest mixed-step graph, above it vLLM's all-reduce and FlashInfer's fused add +
+    Gemma RMSNorm."""
 
     # As in vLLM's Qwen3.5 on CUDA (vllm/models/qwen3_5/nvidia), a norm takes the preceding row-parallel output's
     # all-reduce and adds it into the bf16 residual. The op picks its kernels in Python at every call, opaque to
     # torch.compile; a CUDA graph keeps the choice of its capture
     TP_SIZE = 4  # the ranks the kernels reduce over (csrc/ar_norm.cu WS)
-    MAX_DECODE_TOKENS = 128  # rows of a pure decode step at most (the replica's max_num_seqs)
     ELTS = 8  # bf16 per thread (csrc/ar_norm.cu ELTS)
     MAX_THREADS = 1024  # threads of a thread block at most
     RANDOM_SEED_BYTES = 16  # the seed of the Python RNG while the workspace is made
     NORM_BIAS = 1.0  # Qwen3.5's RMSNorm scales by 1 + w (the kernels' weight_bias)
     library = None  # the op's registration, held for the process
-    workspace = None  # the decode kernels' MNNVL workspace
+    workspace = None  # the uniform decode steps' MNNVL workspace
     flags = None
-    stream32 = None  # [MAX_DECODE_TOKENS, hidden_size] fp32: a decode step's residual stream
-    is_pure_decode = False  # whether the forward computes a pure decode step (a CUDA graph keeps its capture's)
+    max_rows = 0  # rows of a uniform decode step at most: max_num_seqs x the decode query length (1 + drafts)
+    stream32 = None  # [max_rows, hidden_size] fp32: a uniform decode step's residual stream
+    is_uniform_decode = False  # whether the forward computes a uniform decode step (a CUDA graph keeps its capture's)
 
     @classmethod
     def register_op(cls) -> None:
@@ -47,14 +48,13 @@ class AllReduceNorm:
         )
 
     @classmethod
-    def create_workspace(cls, model) -> None:
-        """Every rank, after the load (collectives): the decode kernels' MNNVL workspace and fp32 stream, and vLLM's
-        workspace of FlashInfer's fused kernel."""
+    def create_workspace(cls, hidden_size: int, max_rows: int) -> None:
+        """Every rank, after the load (collectives): the uniform decode steps' MNNVL workspace and fp32 stream of
+        max_rows rows, and vLLM's workspace of FlashInfer's fused kernel."""
         if cls.workspace is not None:
             return
 
         group = get_tp_group()
-        hidden_size = model.config.get_text_config().hidden_size
         if group.world_size != cls.TP_SIZE:
             raise NotImplementedError(f"the decode all-reduce runs at TP {cls.TP_SIZE}, not {group.world_size}")
         if hidden_size % cls.ELTS or hidden_size // cls.ELTS > cls.MAX_THREADS:
@@ -71,7 +71,7 @@ class AllReduceNorm:
                 backend="mnnvl",
                 world_size=group.world_size,
                 rank=group.rank_in_group,
-                max_token_num=cls.MAX_DECODE_TOKENS,
+                max_token_num=max_rows,
                 hidden_dim=hidden_size,
                 dtype=torch.bfloat16,
                 comm_backend=TorchDistBackend(group=group.cpu_group),
@@ -107,12 +107,13 @@ class AllReduceNorm:
 
         cls.workspace = workspace
         cls.flags = workspace.buffer_flags.view(torch.int32)
-        cls.stream32 = torch.zeros(cls.MAX_DECODE_TOKENS, hidden_size, dtype=torch.float32, device="cuda")
+        cls.max_rows = max_rows
+        cls.stream32 = torch.zeros(max_rows, hidden_size, dtype=torch.float32, device="cuda")
 
     @classmethod
-    def begin_step(cls, is_pure_decode: bool) -> None:
-        """A forward begins: whether it computes (or a decode graph's capture records) a pure decode step."""
-        cls.is_pure_decode = is_pure_decode
+    def begin_step(cls, is_uniform_decode: bool) -> None:
+        """A forward begins: whether it computes (or a decode graph's capture records) a uniform decode step."""
+        cls.is_uniform_decode = is_uniform_decode
 
     @staticmethod
     def apply(x: torch.Tensor, residual: torch.Tensor, norm, starts_stream: bool) -> tuple[torch.Tensor, torch.Tensor]:
@@ -126,9 +127,9 @@ class AllReduceNorm:
     def ar_add_rmsnorm(
         x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float, starts_stream: bool
     ) -> None:
-        """x <- RMSNorm(all-reduce(x) + residual) * (1 + weight), residual <- all-reduce(x) + residual (a pure decode
+        """x <- RMSNorm(all-reduce(x) + residual) * (1 + weight), residual <- all-reduce(x) + residual (a uniform decode
         step adds into the fp32 stream instead)."""
-        if AllReduceNorm.is_pure_decode and x.shape[0] <= AllReduceNorm.MAX_DECODE_TOKENS:
+        if AllReduceNorm.is_uniform_decode and x.shape[0] <= AllReduceNorm.max_rows:
             # the normed rows into x, as FlashInfer writes them
             workspace = AllReduceNorm.workspace
             torch.ops.pear_rollout_hopper.ar_norm(

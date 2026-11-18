@@ -1,5 +1,5 @@
+from pear.models.qwen3_5.rollout.gdn import GDNProjection
 from pear.models.qwen3_5.rollout.hopper.all_reduce import AllReduceNorm
-from pear.models.qwen3_5.rollout.hopper.gdn import GDNProjection
 from pear.models.qwen3_5.rollout.hopper.model_state import HopperRolloutModelState
 from pear.models.qwen3_5.rollout.model import (
     Qwen3_5RolloutDecoderLayer,
@@ -15,8 +15,8 @@ class HopperQwen3_5DecoderLayer(Qwen3_5RolloutDecoderLayer):
     reduce_results = False
 
     def forward(self, hidden_states, residual, positions=None, **kwargs):
-        # the first layer's input is the whole embedding, normed alone; its post-attention norm starts a decode step's
-        # fp32 residual stream from it
+        # the first layer's input is the whole embedding, normed alone; its post-attention norm starts a uniform decode
+        # step's fp32 residual stream from it
         starts_stream = residual is None
         if starts_stream:
             residual = hidden_states
@@ -66,6 +66,11 @@ class HopperQwen3_5ForConditionalGeneration(Qwen3_5RolloutForConditionalGenerati
     model_state_cls = HopperRolloutModelState
 
     def process_weights_after_loading(self) -> None:
-        # every rank after every load (collectives): the merged GDN projections and the all-reduces' workspaces
+        # every rank after every load (collectives): the merged GDN projections and the all-reduces' workspaces, for
+        # the widest uniform decode step (every request with its drafts)
         GDNProjection.check(self)
-        AllReduceNorm.create_workspace(self)
+        vllm_config = self.language_model.vllm_config
+        AllReduceNorm.create_workspace(
+            self.config.get_text_config().hidden_size,
+            vllm_config.scheduler_config.max_num_seqs * vllm_config.uniform_decode_query_len,
+        )
