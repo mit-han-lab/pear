@@ -1,12 +1,24 @@
 import subprocess
 
 import pytest
+from omegaconf import OmegaConf
 
 from repository import REPO
+from verl.workers.rollout.vllm_rollout.utils import build_cli_args_from_config
+from vllm_serve import ServeCommandLine
 
 MODEL_FILE = REPO / "examples/models/qwen3_8_27b_pear/qwen3_8_27b.sh"
 # what a recipe sets before it sources the file
 SETTINGS = "MODEL=/model RUN=/run MAX_MODEL_LEN=260096"
+# the configs whose engine arguments every replica of a training takes
+REPLICA_CONFIGS = (REPO / "pear/configs/base.yaml", REPO / "pear/models/qwen3_5/config.yaml")
+# the engine settings these configs pin where vLLM's default differs
+PINNED_FIELDS = (
+    "prefix_cache_retention_interval",
+    "enable_extensible_kv_cache",
+    "mm_device_do_normalize",
+    "numa_bind",
+)
 
 
 def sourced(gpu: str, command: str, settings: str = "") -> subprocess.CompletedProcess:
@@ -48,3 +60,19 @@ def test_an_unknown_gpu_ends_the_recipe():
 
     assert process.returncode == 1
     assert process.stdout == "unknown GPU a100 (gb300 | h100)\n"
+
+
+@pytest.mark.parametrize("gpu", ["gb300", "h100"])
+def test_the_general_evaluation_s_servers_take_the_training_replicas_engine_settings(gpu):
+    # the replicas' engine arguments of base.yaml and the family's config, as verl writes them on their command line
+    engine_kwargs = {}
+    for config in REPLICA_CONFIGS:
+        rollout = OmegaConf.to_container(OmegaConf.load(config))["actor_rollout_ref"]["rollout"]
+        engine_kwargs.update(rollout["engine_kwargs"]["vllm"])
+    server_args = sourced(gpu, 'printf "%s\\n" "${MODEL_SERVER_ARGS[@]}"').stdout.splitlines()
+
+    replica = ServeCommandLine.values(build_cli_args_from_config(engine_kwargs), PINNED_FIELDS)
+    server = ServeCommandLine.values(server_args, PINNED_FIELDS)
+
+    # every boundary's state kept, the KV cache from vLLM's estimate, the pixels normalized on the CPU, no NUMA binding
+    assert server == replica == dict(zip(PINNED_FIELDS, (None, False, False, False), strict=True))

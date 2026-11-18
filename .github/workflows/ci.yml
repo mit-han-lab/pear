@@ -49,5 +49,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: ./.github/actions/training-env
-      # without the robot station's directory, whose conftest imports the station's packages: station.yml runs it
-      - run: $PEAR_PYTHON -m pytest tests --ignore=tests/deploy/station --ignore-glob='*_on_gpu.py' -m "not integration"
+      # without the robot station's directory, whose conftest imports the station's packages: station.yml runs it; and
+      # without the model server's test, which imports the server environment's vLLM: server.yml runs it
+      - run: >-
+          $PEAR_PYTHON -m pytest tests --ignore=tests/deploy/station --ignore=tests/deploy/test_deploy_server_on_cpu.py
+          --ignore-glob='*_on_gpu.py' -m "not integration"

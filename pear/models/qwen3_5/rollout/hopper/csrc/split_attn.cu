@@ -1,6 +1,6 @@
 // Split-KV paged decode attention for sm_90: the decode rows of a step (one query token per sequence), a GQA group of
-// HQ query heads per KV head, head dim HD, over the KV cache in vLLM's FlashAttention layout (per page of PAGE tokens:
-// [token][kv head][K | V] bf16)
+// HQ query heads per KV head, head dim HD, over the KV cache in vLLM's FlashAttention layout (per page of the cache's
+// block size: [token][kv head][K | V] bf16)
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -39,8 +39,8 @@ struct Params {
   float* part_o;       // [slots][HQ][HD]
   float* part_ml;      // [slots][HQ][2]
   int* counters;       // [MAX_SEQS] partials merged per sequence (zero between calls)
-  int page;            // tokens per page
-  int tiles_per_page;
+  int page;            // tokens per page: the KV cache's block size
+  int tiles_per_page;  // the last one partial unless the page is a multiple of the tile
   float scale_log2;    // softmax scale * log2(e)
 };
 
@@ -93,15 +93,14 @@ __device__ __forceinline__ uint32_t pack_bf16(float lo, float hi) {
   return *reinterpret_cast<uint32_t*>(&v);
 }
 
-template <int PAGE, int TILE_>
-__device__ __forceinline__ int tiles_of(int len) {
-  constexpr int TPP = (PAGE + TILE_ - 1) / TILE_;
-  const int full = len / PAGE, rem = len - full * PAGE;
-  return full * TPP + (rem + TILE_ - 1) / TILE_;
+template <int TILE_>
+__device__ __forceinline__ int tiles_of(int len, int page, int tiles_per_page) {
+  const int full = len / page, rem = len - full * page;
+  return full * tiles_per_page + (rem + TILE_ - 1) / TILE_;
 }
 
 // prefix sums of the decode rows' tile counts into s_start[0..D] (all NTHREADS threads of the block take part)
-template <int PAGE, int TILE_, int NTHREADS>
+template <int TILE_, int NTHREADS>
 __device__ __forceinline__ void tile_prefix(const Params& p, int D, int* s_start, int* s_warp) {
   const int tid = threadIdx.x;
   constexpr int PER = (MAX_SEQS + NTHREADS - 1) / NTHREADS;
@@ -110,7 +109,7 @@ __device__ __forceinline__ void tile_prefix(const Params& p, int D, int* s_start
 #pragma unroll
   for (int j = 0; j < PER; ++j) {
     int i = tid * PER + j;
-    v[j] = i < D ? tiles_of<PAGE, TILE_>(__ldg(p.seq_lens + i)) : 0;
+    v[j] = i < D ? tiles_of<TILE_>(__ldg(p.seq_lens + i), p.page, p.tiles_per_page) : 0;
     tot += v[j];
   }
   // inclusive warp scan of tot
@@ -161,14 +160,14 @@ __device__ __forceinline__ uint32_t movmatrix_t(uint32_t x) {
 // a persistent grid streams the batch's KV with TMA into a STAGES-deep ring of TILE-token tiles (16, 32 or 64), the
 // batch's tiles split evenly over the CTAs in sequence order: one producer warp issues the loads, NCW consumer warps
 // own 16-row slices (with TILE = 16 every warp takes every fourth tile and one warp consumes each stage)
-template <int HQ, int PAGE, int TILE_, int STAGES, int NCW, int NS, bool PLO>
+template <int HQ, int TILE_, int STAGES, int NCW, int NS, bool PLO>
 __global__ void __launch_bounds__((NCW + 1) * 32, 1) decode_attn_kernel(const __grid_constant__ CUtensorMap tmap, Params p) {
   static_assert(HQ <= 8, "heads of a GQA group in the 8 columns of an n8 fragment");
   constexpr int NTHREADS = (NCW + 1) * 32;
   constexpr int SL = 16 * NS;             // rows per warp and tile (NS 16-row slices, interleaved for ILP)
   constexpr int WPT = TILE_ / SL;         // warps per tile
   constexpr int NGROUPS = NCW / WPT;      // tile groups (a warp takes the tiles j = its group mod NGROUPS)
-  constexpr int TPP = (PAGE + TILE_ - 1) / TILE_;
+  const int page = p.page, tpp = p.tiles_per_page;
   constexpr int BOXB = TILE_ * BOX_COLS * 2;  // bytes per box
   constexpr int STB = NBOX * BOXB;            // bytes per stage
   extern __shared__ uint8_t smem_raw[];
@@ -199,7 +198,7 @@ __global__ void __launch_bounds__((NCW + 1) * 32, 1) decode_attn_kernel(const __
     }
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
-  tile_prefix<PAGE, TILE_, NTHREADS>(p, D, s_start, s_warp);  // includes __syncthreads
+  tile_prefix<TILE_, NTHREADS>(p, D, s_start, s_warp);  // includes __syncthreads
   if (D == 0) return;
   const int T = s_start[D];
   const int P = min((int)gridDim.x, T), c = blockIdx.x;  // every working CTA gets at least one tile
@@ -215,8 +214,8 @@ __global__ void __launch_bounds__((NCW + 1) * 32, 1) decode_attn_kernel(const __
       int nxt_block = 0, nxt_row = 0;
       auto locate = [&](int t) {
         while (t >= s_start[s + 1]) { ++s; lt = 0; }
-        const int pg = lt / TPP;
-        nxt_row = (lt - pg * TPP) * TILE_;
+        const int pg = lt / tpp;
+        nxt_row = (lt - pg * tpp) * TILE_;
         nxt_block = __ldg(p.block_table + (int64_t)s * p.bt_stride + pg);
         ++lt;
       };
@@ -274,9 +273,9 @@ __global__ void __launch_bounds__((NCW + 1) * 32, 1) decode_attn_kernel(const __
     for (; t < b; t += NGROUPS) {
       const int jj = t - t0;
       const int lt = t - s_start[s];
-      const int pg = lt / TPP;
-      const int row0 = (lt - pg * TPP) * TILE_;
-      const int nvalid = min(TILE_, min(PAGE - row0, len - pg * PAGE - row0)) - wr0;  // valid rows of this warp's SL
+      const int pg = lt / tpp;
+      const int row0 = (lt - pg * tpp) * TILE_;
+      const int nvalid = min(TILE_, min(page - row0, len - pg * page - row0)) - wr0;  // valid rows of this warp's SL
       const int st = jj % STAGES;
       while (stage_tile[st] != jj) {
       }
@@ -553,8 +552,7 @@ static size_t smem_bytes() {
 constexpr int STAGES = 3;
 constexpr int NCW = 8;
 constexpr int NS = 1;
-constexpr int HQ = 6;      // query heads per KV head (Qwen3.5 at TP4)
-constexpr int PAGE = 784;  // tokens per KV cache page (the replica's block size)
+constexpr int HQ = 6;  // query heads per KV head (Qwen3.5 at TP4)
 
 void decode_attention(const at::Tensor& q, const at::Tensor& kv, const at::Tensor& block_table,
                       const at::Tensor& seq_lens, const at::Tensor& num_dec, at::Tensor& out, at::Tensor& part_o,
@@ -568,7 +566,7 @@ void decode_attention(const at::Tensor& q, const at::Tensor& kv, const at::Tenso
   TORCH_CHECK(part_o.scalar_type() == at::kFloat && part_ml.scalar_type() == at::kFloat);
   TORCH_CHECK(part_o.numel() >= (nctas + max_dec) * q.size(1) * HD && part_ml.numel() >= (nctas + max_dec) * q.size(1) * 2);
   TORCH_CHECK(max_dec <= MAX_SEQS && max_dec >= 1 && nctas >= 1 && nctas <= MAX_CTAS_ALLOWED);
-  TORCH_CHECK(q.size(1) == HQ && kv.size(1) == PAGE, "HQ 6, page 784 only");
+  TORCH_CHECK(q.size(1) == HQ, "HQ 6 only");
   const at::cuda::CUDAGuard guard(q.device());
   const CUtensorMap map = make_map(kv, TILE);
   Params p;
@@ -586,11 +584,11 @@ void decode_attention(const at::Tensor& q, const at::Tensor& kv, const at::Tenso
   p.part_ml = part_ml.data_ptr<float>();
   TORCH_CHECK(counters.scalar_type() == at::kInt && counters.numel() >= MAX_SEQS, "counters [MAX_SEQS] int32, zeroed");
   p.counters = counters.data_ptr<int>();
-  p.page = PAGE;
-  p.tiles_per_page = (PAGE + TILE - 1) / TILE;
+  p.page = (int)kv.size(1);
+  p.tiles_per_page = (p.page + TILE - 1) / TILE;
   p.scale_log2 = (float)(scale * 1.4426950408889634);
 
-  auto kern = decode_attn_kernel<HQ, PAGE, TILE, STAGES, NCW, NS, true>;
+  auto kern = decode_attn_kernel<HQ, TILE, STAGES, NCW, NS, true>;
   const size_t smem = smem_bytes<HQ, TILE, STAGES>();
   static bool configured = false;
   if (!configured) {

@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [model] fix: attention retention finds Qwen3.5's attention
+ layers by block_type
+
+retain_attention_in_checkpoints passes over a checkpointed layer whose layer_type is not full_attention, since a
+linear-attention layer runs no FlashAttention to retain. From transformers 5.16 a Qwen3.5 decoder layer holds its
+type as block_type (modeling_qwen3_5.py:747 in 5.16.1, :852 in 5.22.0), so every decoder layer read as full
+attention and the linear-attention layers got the retaining checkpoint too: on each of their forwards a cache
+context that nothing fills. The type is now read from block_type before layer_type, as the decoder forward reads it.
+---
+ .../models/test_attention_retention_on_cpu.py | 32 +++++++++++++++++++
+ .../transformers/attention_retention.py       |  4 ++-
+ 2 files changed, 35 insertions(+), 1 deletion(-)
+ create mode 100644 tests/models/test_attention_retention_on_cpu.py
+
+diff --git a/tests/models/test_attention_retention_on_cpu.py b/tests/models/test_attention_retention_on_cpu.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..90ce8ca8542785c6b0a894a2c556ef60e0849f02
+--- /dev/null
++++ b/tests/models/test_attention_retention_on_cpu.py
+@@ -0,0 +1,32 @@
++from functools import partial
++from types import SimpleNamespace
++
++import pytest
++import torch
++from torch.utils.checkpoint import checkpoint
++
++from verl.models.transformers.attention_retention import retain_attention_in_checkpoints
++
++
++class _CheckpointedLayer(torch.nn.Module):
++    """A decoder layer under gradient checkpointing whose type is held under the given attribute name."""
++
++    def __init__(self, type_name, layer_type):
++        super().__init__()
++        setattr(self, type_name, layer_type)
++        self.gradient_checkpointing = True
++        self._gradient_checkpointing_func = partial(checkpoint, use_reentrant=False)
++
++
++@pytest.mark.parametrize("type_name", ["block_type", "layer_type"])  # transformers 5.16 and later, 5.12
++def test_only_the_full_attention_layers_retain_their_attention(type_name):
++    linear_layer = _CheckpointedLayer(type_name, "linear_attention")
++    full_layer = _CheckpointedLayer(type_name, "full_attention")
++    linear_checkpoint = linear_layer._gradient_checkpointing_func
++    model = torch.nn.Sequential(linear_layer, full_layer)
++    model.config = SimpleNamespace(_attn_implementation="sdpa")  # no FlashAttention forward to wrap
++
++    retain_attention_in_checkpoints(model)
++
++    assert linear_layer._gradient_checkpointing_func is linear_checkpoint
++    assert "context_fn" in full_layer._gradient_checkpointing_func.keywords
+diff --git a/verl/models/transformers/attention_retention.py b/verl/models/transformers/attention_retention.py
+index eb4b903670c130846d6298ed02055ccca38ce717..023aa397fc4bec100b78185f149965467e65390d 100644
+--- a/verl/models/transformers/attention_retention.py
++++ b/verl/models/transformers/attention_retention.py
+@@ -69,7 +69,9 @@ def retain_attention_in_checkpoints(model: torch.nn.Module):
+     for layer in model.modules():
+         if not getattr(layer, "gradient_checkpointing", False):
+             continue
+-        if getattr(layer, "layer_type", "full_attention") != "full_attention":  # linear attention: nothing to retain
++        # a decoder layer's type is its block_type from transformers 5.16, its layer_type before
++        block_type = getattr(layer, "block_type", getattr(layer, "layer_type", "full_attention"))
++        if block_type != "full_attention":  # linear attention: nothing to retain
+             continue
+         original = layer._gradient_checkpointing_func
+         # the checkpoint calls context_fn afresh for every forward: a cache lives for one forward and its backward

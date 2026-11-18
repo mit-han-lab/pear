@@ -1,3 +1,4 @@
+import atexit
 import collections
 
 import torch
@@ -9,7 +10,7 @@ from pear.models.qwen3_5.trainer.ieee_fp32 import IEEEFp32
 class BlackwellDeltaRule(torch.autograd.Function):
     """The gated delta rule over packed local tokens on cuDNN's FROST kernels, with Ulysses context parallelism."""
 
-    PLAN = "gdn_frost"  # cuDNN's FROST engines for the forward and the backward (CuTe DSL, nvidia-cutlass-dsl >= 4.7)
+    PLAN = "gdn_frost"  # cuDNN's FROST engines for the forward and the backward (CuTe DSL kernels, nvidia-cutlass-dsl)
     # span lengths the summaries run at: unlike the forward and backward plans they compile a kernel per length and a
     # boundary span is rarely a length seen before; zero operands, log decay and beta leave the state as it is (to the
     # kernels' fp32 rounding, whose order depends on length)
@@ -226,40 +227,36 @@ class BlackwellDeltaRule(torch.autograd.Function):
 
 
 class CudnnGDNGraphs:
-    """cuDNN's Gated DeltaNet ops with their graph caches bounded and a workspace per execution."""
+    """cuDNN's Gated DeltaNet ops with their graph caches bounded and emptied at the process's exit."""
 
     # graphs each of cuDNN's Gated DeltaNet forward and backward caches keeps: a micro-batch's layers share one shape,
     # so its forward, recompute and backward need one or two per cache; the rest keep recent shapes that recur
     GRAPHS_PER_CACHE = 8
     SUMMARY_GRAPHS = 64  # summary graphs kept, one per span bucket and direction
 
-    # cuDNN frontend keeps one graph per problem shape (total tokens, sequences) without a bound, and each graph its own
-    # grow-only workspace: every micro-batch of a new shape would keep another set of them for the rest of the process
+    # cuDNN frontend keeps one graph per problem shape (total tokens, sequences) without a bound: every micro-batch of a
+    # new shape would keep another one for the rest of the process (an execution's workspace is its own allocation)
     @classmethod
     def install(cls) -> None:
-        """Register the ops as torch.ops.cudnn and bound their graphs in this process."""
-        from cudnn.linear_attention.ops import common, gdn
-
-        for module in (common, gdn):
-            module.graph_workspace = cls.graph_workspace
+        """Register the ops as torch.ops.cudnn, bound their graphs in this process and empty them at its exit."""
+        from cudnn.linear_attention.ops import gdn
 
         for name in ("fprop_cache", "bprop_cache"):
             setattr(gdn, name, LRUCache(cls.GRAPHS_PER_CACHE))
 
         gdn.summary_cache = LRUCache(cls.SUMMARY_GRAPHS)
 
-    @staticmethod
-    def graph_workspace(graph, device):
-        """The graph's workspace for one execution, its plans built first; the caching allocator reuses the memory."""
-        if not graph._is_built:
-            if not graph._planning_done:
-                graph.create_execution_plans()
-            if graph.selected_engine is None:
-                graph.build()
-            else:
-                graph.build_plans()
+        # the module can be freed before the interpreter clears its globals, which then keep the graphs past the
+        # teardown, and nanobind reports their cuDNN objects still alive at exit: the caches are emptied while the
+        # interpreter is intact, by one handler per process however often the ops are installed
+        atexit.unregister(cls.release)
+        atexit.register(cls.release, gdn)
 
-        return torch.empty(max(graph.get_workspace_size(), 1), dtype=torch.uint8, device=device)
+    @staticmethod
+    def release(gdn) -> None:
+        """Empty the graph caches of cuDNN's Gated DeltaNet ops (gdn, their module)."""
+        for cache in (gdn.fprop_cache, gdn.bprop_cache, gdn.summary_cache):
+            cache.clear()
 
 
 class LRUCache(collections.OrderedDict):

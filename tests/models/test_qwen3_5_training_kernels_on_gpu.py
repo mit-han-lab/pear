@@ -1,5 +1,7 @@
 import copy
 import itertools
+import subprocess
+import sys
 
 import pytest
 import torch
@@ -41,6 +43,38 @@ SUMMARY_TOKENS = 8192  # a rank's boundary sequence in the summary test
 SUMMARY_DECAY = 1e-3
 SUMMARY_GAIN = 4  # the transition's error below FLA's at least by this factor
 TF32_ROUNDING = 2**-10  # TF32's relative rounding error: 10 explicit mantissa bits, fp32 operands truncated on Hopper
+# a process of its own that runs the delta rule's forward and backward once, its graphs left in cuDNN's caches; cuDNN's
+# GDN module imported only by the kernels, as in a trainer
+DELTA_RULE_PROCESS = """
+import itertools
+
+import torch
+import torch.nn.functional as F
+
+from pear.models.qwen3_5.trainer.blackwell.delta_rule import BlackwellDeltaRule, CudnnGDNGraphs
+
+
+def main():
+    CudnnGDNGraphs.install()
+    lengths = {lengths}
+    cu = torch.tensor([0, *itertools.accumulate(lengths)], device="cuda", dtype=torch.long)
+    q, k = (
+        F.normalize(torch.randn(1, sum(lengths), {heads}, {dim}, device="cuda"), dim=-1).bfloat16().requires_grad_()
+        for _ in range(2)
+    )
+    v = torch.randn(1, sum(lengths), {value_heads}, {dim}, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    g = (-torch.rand(1, sum(lengths), {value_heads}, device="cuda")).requires_grad_()
+    beta = torch.rand(1, sum(lengths), {value_heads}, device="cuda").requires_grad_()
+    out, _ = BlackwellDeltaRule.apply_packed(q, k, v, g, beta, cu, cu.cpu(), None, None, None, None, 0)
+    out.float().sum().backward()
+
+    from cudnn.linear_attention.ops import gdn
+
+    assert gdn.fprop_cache and gdn.bprop_cache, "the step left no graph in cuDNN's caches"
+
+
+main()
+"""
 
 
 @pytest.fixture(scope="module")
@@ -233,7 +267,7 @@ def fp64_gated_delta_net(mixer, x):
             state = state + k[t][:, :, None] * update[:, None, :]
             outputs.append(torch.einsum("hk,hkv->hv", q[t], state))
     o = torch.stack(outputs)
-    y = o * (o.pow(2).mean(-1, keepdim=True) + mixer.norm.eps).rsqrt() * mixer.norm.weight * F.silu(z)
+    y = o * (o.pow(2).mean(-1, keepdim=True) + mixer.norm.variance_epsilon).rsqrt() * mixer.norm.weight * F.silu(z)
     return F.linear(y.reshape(T, -1), mixer.out_proj.weight)[None]
 
 
@@ -438,13 +472,24 @@ def test_the_delta_rule_holds_no_memory_per_packing():
     step(LENGTHS)
     torch.cuda.synchronize()
     resident = torch.cuda.memory_allocated()
-    # more packings than any graph cache keeps; cuDNN's own caches would hold a graph and its workspace for each
+    # more packings than any graph cache keeps; cuDNN's own caches would hold a graph for each
     for extra in range(1, 3 * CudnnGDNGraphs.GRAPHS_PER_CACHE + 1):
         step([length + extra for length in LENGTHS])
     torch.cuda.synchronize()
     assert torch.cuda.memory_allocated() <= resident
     assert all(len(cache) <= CudnnGDNGraphs.GRAPHS_PER_CACHE for cache in (gdn.fprop_cache, gdn.bprop_cache))
     assert len(gdn.summary_cache) <= CudnnGDNGraphs.SUMMARY_GRAPHS
+
+
+@BLACKWELL
+def test_the_delta_rule_s_graphs_are_gone_before_the_process_exits():
+    # nanobind reports the cuDNN objects still alive when the interpreter exits
+    code = DELTA_RULE_PROCESS.format(lengths=LENGTHS, heads=GDN_HEADS, value_heads=GDN_VALUE_HEADS, dim=GDN_DIM)
+
+    process = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+
+    assert process.returncode == 0, process.stderr
+    assert "nanobind: leaked" not in process.stderr, process.stderr
 
 
 @BLACKWELL

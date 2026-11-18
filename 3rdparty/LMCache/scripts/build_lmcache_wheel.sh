@@ -24,8 +24,9 @@ export CPATH="$CUDA_HOME/include${CPATH:+:$CPATH}"
 
 bash "$PROJECT_DIR/scripts/checkout_lmcache.sh"
 mkdir -p "$WHEEL_DIR"
-# a uv environment has no pip, and the build runs through pip wheel
-uv pip install -q --python "$PYTHON" pip setuptools_scm ninja
+# a uv environment has no pip, and the build runs through pip wheel; grpcio-tools generates the gRPC modules the build
+# packages
+uv pip install -q --python "$PYTHON" pip setuptools_scm ninja grpcio-tools
 cd "$LMCACHE_SRC"
 SETUPTOOLS_SCM_PRETEND_VERSION=$LMCACHE_VERSION "$PYTHON" -m pip wheel . --no-deps --no-build-isolation -w "$WHEEL_DIR"
 ls -la "$WHEEL_DIR"/lmcache-*.whl

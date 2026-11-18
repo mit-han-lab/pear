@@ -9,7 +9,8 @@ class RtxBlackwellNvfp4Extension(CudaExtension):
 
     OP_NAMESPACE = "pear_deploy_rtx_blackwell_nvfp4"
     # no fast math: the kernel reproduces the lowerings of the kernels it replaces
-    CUDA_FLAGS = ("-O3", "-std=c++17", "-lineinfo", "--expt-relaxed-constexpr")
+    # no -std: torch adds the C++ standard its headers need
+    CUDA_FLAGS = ("-O3", "-lineinfo", "--expt-relaxed-constexpr")
     LINK_FLAGS = ()
 
     @staticmethod

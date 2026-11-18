@@ -11,7 +11,6 @@ from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadata,
     GDNAttentionMetadataBuilder,
 )
-from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
 
 from pear.models.qwen3_5.rollout.gdn import RolloutGDNAttention, RolloutGDNMetadataBuilder
 from pear.models.qwen3_5.rollout.gdn_dims import GDNDims
@@ -88,20 +87,16 @@ class GDNLayout(StagedBuffer):
         self.T = self.D = self.N = self.P = 0
 
     @classmethod
-    def of_step(cls, vllm_config, m) -> "GDNLayout":
-        """A mixed step's layout from vLLM's common metadata, in the process's layout."""
+    def of_step(cls, vllm_config, m, num_decodes: int) -> "GDNLayout":
+        """A mixed step's layout from vLLM's common metadata and its leading decode rows, in the process's layout."""
         qsl_all = m.query_start_loc_cpu[: m.num_reqs + 1].numpy().astype(np.int64)
         query_lens = np.diff(qsl_all)
         n = int(np.count_nonzero(query_lens))  # CUDA graph padding requests are empty and last
         qsl = qsl_all[: n + 1]
-
-        # the decode rows: the leading one-token requests (vLLM orders decodes first)
-        prefill_rows = np.flatnonzero(query_lens[:n] != 1)
-        D = int(prefill_rows[0]) if len(prefill_rows) else n
         layout = cls.of_engine(vllm_config, m.query_start_loc.device)
 
-        seq_lens = (m._seq_lens_cpu if m._seq_lens_cpu is not None else m.seq_lens.cpu())[:n].numpy()
-        layout.fill(qsl, D, (seq_lens - query_lens[:n] > 0).astype(np.int32))
+        seq_lens = m.seq_lens_cpu_upper_bound[:n].numpy()
+        layout.fill(qsl, num_decodes, (seq_lens - query_lens[:n] > 0).astype(np.int32))
 
         return layout
 
@@ -360,13 +355,8 @@ class GDNProjection:
 
     @staticmethod
     def eligible(layer, hidden_states) -> bool:
-        """The fused-norm path vLLM takes for this replica, on a merged weight."""
-        return (
-            getattr(layer, "qkvzba_weight", None) is not None
-            and layer.enable_fused_gdn_decode
-            and hidden_states.dtype == torch.bfloat16
-            and layer.norm.weight.dtype in (torch.bfloat16, torch.float32)
-        )
+        """A merged weight, and activations the layer's core computes."""
+        return getattr(layer, "qkvzba_weight", None) is not None and layer.computes_core(hidden_states)
 
     @staticmethod
     def check(model) -> None:
@@ -440,8 +430,9 @@ class HopperGDNAttention(RolloutGDNAttention):
         return self.fused_core(mixed_qkvz, ba, core_attn_out)
 
     def _forward_core_fused_norm_packed(self, mixed_qkvz, ba, core_attn_out):
-        context = get_forward_context()
-        md = context.attn_metadata[self.prefix] if context.attn_metadata is not None else None
+        # no metadata of the layer (a profiling run leaves the GDN groups out): vLLM's warm-up of its prefill kernels
+        attn_metadata = get_forward_context().attn_metadata
+        md = attn_metadata.get(self.prefix) if isinstance(attn_metadata, dict) else None
         layout = getattr(md, "_pear_layout", None)
 
         if layout is not None:
@@ -476,9 +467,6 @@ class HopperGDNMetadataBuilder(RolloutGDNMetadataBuilder):
         # this group's state slots in a mixed step, at the address its FULL mixed-step graphs read
         self.mixed_step_slots = torch.zeros(vllm_config.scheduler_config.max_num_seqs, dtype=torch.int32, device=device)
 
-        # as vLLM's Mamba builders: a speculative step's draft-token arguments do not carry over to another group
-        self.supports_update_block_table = not self.use_spec_decode
-
     def build(
         self,
         common_prefix_len,
@@ -487,46 +475,39 @@ class HopperGDNMetadataBuilder(RolloutGDNMetadataBuilder):
         num_decode_draft_tokens_cpu=None,
         fast_build=False,
     ):
+        # a step with prefill rows on the mixed-step layout, whichever graph replays it; a pure decode step and a
+        # drafter's steps as vLLM builds them (vLLM's V2 runner hands every GDN build the draft-token arguments, None
+        # without a drafter)
         m = common_attn_metadata
-        if self.use_spec_decode or m.max_query_len <= 1:
-            md = super().build(
-                common_prefix_len,
-                m,
-                num_accepted_tokens=num_accepted_tokens,
-                num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
-                fast_build=fast_build,
-            )
-            md._pear_layout, md._pear_common_attn_metadata = None, m
-            return md
+        num_decodes = self.num_decodes(m)
+        if num_decode_draft_tokens_cpu is None and num_decodes < m.num_reqs:
+            layout = GDNLayout.of_step(self.vllm_config, m, num_decodes)
+            return self.mixed_step_metadata(m.block_table_tensor, m.num_actual_tokens, layout)
 
-        return self.mixed_step_metadata(m, GDNLayout.of_step(self.vllm_config, m))
+        return super().build(common_prefix_len, m, num_accepted_tokens, num_decode_draft_tokens_cpu, fast_build)
 
     def build_for_cudagraph_capture(self, common_attn_metadata):
+        # a decode graph's batch (one token per request) as vLLM builds it; a mixed-step graph over the layout without
+        # tokens: a replay touches nothing until a step fills it
         m = common_attn_metadata
         if self.use_spec_decode or m.max_query_len <= 1:
             return super().build_for_cudagraph_capture(m)
 
-        # a mixed-step graph is captured over the layout without tokens: a replay touches nothing until a step fills it
         layout = GDNLayout.of_engine(self.vllm_config, m.query_start_loc.device)
         layout.fill(np.zeros(1, dtype=np.int64), 0, np.zeros(0, dtype=np.int32))
 
-        return self.mixed_step_metadata(m, layout)
+        return self.mixed_step_metadata(m.block_table_tensor, m.num_actual_tokens, layout)
 
     def update_block_table(self, metadata, blk_table, slot_mapping):
-        common_attn_metadata = self.group_common_metadata(metadata._pear_common_attn_metadata, blk_table, slot_mapping)
+        layout = getattr(metadata, "_pear_layout", None)
+        if layout is None:
+            return super().update_block_table(metadata, blk_table, slot_mapping)
 
-        if metadata._pear_layout is None:
-            return self.build(0, common_attn_metadata)
-        return self.mixed_step_metadata(common_attn_metadata, metadata._pear_layout)
+        return self.mixed_step_metadata(blk_table, metadata.num_actual_tokens, layout)
 
-    def mixed_step_metadata(self, m, layout: GDNLayout) -> GDNAttentionMetadata:
+    def mixed_step_metadata(self, block_table, num_actual_tokens: int, layout: GDNLayout) -> GDNAttentionMetadata:
         """vLLM's GDN metadata of a mixed step with its layout and this group's state slots."""
-        # each sequence's state block (under mamba_cache_mode align, the block of its last token)
-        n = layout.N
-        slots = mamba_get_block_table_tensor(
-            m.block_table_tensor[:n], m.seq_lens[:n], self.kv_cache_spec, self.vllm_config.cache_config.mamba_cache_mode
-        )[:, 0]
-        self.mixed_step_slots[:n].copy_(slots)
+        self.mixed_step_slots[: layout.N].copy_(self.state_slots(block_table, layout.N))
 
         md = GDNAttentionMetadata(
             num_prefills=layout.P,
@@ -535,11 +516,11 @@ class HopperGDNMetadataBuilder(RolloutGDNMetadataBuilder):
             num_decode_tokens=layout.D,
             num_spec_decodes=0,
             num_spec_decode_tokens=0,
-            num_actual_tokens=m.num_actual_tokens,
+            num_actual_tokens=num_actual_tokens,
             has_initial_state=layout.seq_init,
             non_spec_state_indices_tensor=self.mixed_step_slots,
         )
-        md._pear_layout, md._pear_common_attn_metadata = layout, m
+        md._pear_layout = layout
 
         return md
 

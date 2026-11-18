@@ -378,7 +378,7 @@ class DecoderLayer:
         # the input norm feeds the projections of the attention or the Gated DeltaNet: the twin and its remainder
         # (the Gated DeltaNet's as the GPU backend says)
         wants_remainder = Fp16Operands.wants_remainder() and (
-            self.layer_type != "linear_attention" or self.gpu_backend.gdn_wants_remainder
+            self.block_type != "linear_attention" or self.gpu_backend.gdn_wants_remainder
         )
         h, h16, remainder = RMSNorm.apply(
             hidden_states, norm.weight, norm.eps, out_dtype, Fp16Operands.is_enabled, wants_remainder
@@ -386,7 +386,7 @@ class DecoderLayer:
         Fp16Operands.register(h, h if h.dtype == torch.float16 else h16, remainder)
 
         try:
-            if self.layer_type == "linear_attention":
+            if self.block_type == "linear_attention":
                 out = self.linear_attn(
                     hidden_states=h,
                     cache_params=past_key_values,

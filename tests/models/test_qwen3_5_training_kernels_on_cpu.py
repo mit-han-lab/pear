@@ -157,6 +157,47 @@ def test_hopper_s_recompute_flags_reject_attention_retention():
         RecomputeFlag.install(model)
 
 
+def test_each_decoder_layer_s_mixer_is_patched_by_the_layer_s_block_type(monkeypatch):
+    import transformers.models.qwen3_5.modeling_qwen3_5 as modeling
+    from transformers.integrations import flash_attention
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+
+    from pear.models.qwen3_5.trainer.attention import FullAttention
+    from pear.models.qwen3_5.trainer.blackwell.gpu_backend import BlackwellTrainingGpuBackend
+    from pear.models.qwen3_5.trainer.gdn import GatedDeltaNet
+
+    # the process-wide patches of the installs, undone after the test
+    for owner, name in (
+        (modeling.Qwen3_5GatedDeltaNet, "forward"),
+        (modeling.Qwen3_5Attention, "forward"),
+        (flash_attention, "_flash_attention_forward"),
+    ):
+        monkeypatch.setattr(owner, name, getattr(owner, name))
+    config = Qwen3_5TextConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        linear_num_key_heads=1,
+        linear_num_value_heads=1,
+        vocab_size=16,
+        layer_types=["linear_attention", "full_attention"],
+    )
+    text_model = modeling.Qwen3_5TextModel(config)
+    model = SimpleNamespace(model=SimpleNamespace(language_model=text_model))
+
+    GatedDeltaNet.install(model, BlackwellTrainingGpuBackend)
+    FullAttention.install(model, BlackwellTrainingGpuBackend)
+
+    # transformers' decoder layer holds its type as block_type; each kind of mixer gets the backend and fp32 projections
+    linear_layer, full_layer = text_model.layers
+    assert linear_layer.block_type == "linear_attention" and full_layer.block_type == "full_attention"
+    for mixer, projection in ((linear_layer.linear_attn, "in_proj_qkv"), (full_layer.self_attn, "q_proj")):
+        assert mixer.gpu_backend is BlackwellTrainingGpuBackend
+        assert "forward" in vars(getattr(mixer, projection))
+
+
 def test_the_lru_cache_keeps_the_most_recently_used_entries():
     from pear.models.qwen3_5.trainer.blackwell.delta_rule import LRUCache
 

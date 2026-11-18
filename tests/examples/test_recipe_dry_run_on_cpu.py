@@ -14,6 +14,7 @@ from omegaconf import OmegaConf
 from recipe_dry_run import RecipeDryRun, RecipeDump, RecipeLaunch
 from repository import REPO
 from verl.utils.dataset.rl_dataset import get_dataset_class
+from verl.workers.rollout.vllm_rollout.utils import build_cli_args_from_config
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="the recipes call GNU readlink")
 # every recipe that launches on a Ray cluster, on each GPU
@@ -169,6 +170,19 @@ def test_the_workers_of_a_launch_get_every_variable_its_tools_read(composed):
 def test_the_workers_of_a_launch_encode_on_the_calling_thread(composed):
     # verl turns a tokenizer's thread pool on in every worker of a launch whose runtime environment does not name it
     assert composed.value(RUNTIME_ENV_KEY)["TOKENIZERS_PARALLELISM"] == "false"
+
+
+def test_the_replicas_of_a_launch_all_reduce_on_vllm_s_own_kernels(composed):
+    # vLLM's default hands a replica's tensor-parallel all-reduces to FlashInfer's
+    assert composed.value(RUNTIME_ENV_KEY)["VLLM_ALLREDUCE_USE_FLASHINFER"] == "0"
+
+
+def test_the_replicas_of_a_launch_start_their_gpu_workers_without_numa_binding(composed):
+    # verl writes the engine argument on a replica's command line as --no-numa_bind, which vLLM's parser reads as
+    # False (tests/examples/test_model_file_on_cpu.py)
+    cli_args = build_cli_args_from_config(composed.value("actor_rollout_ref.rollout.engine_kwargs.vllm"))
+
+    assert "--no-numa_bind" in cli_args
 
 
 def test_the_sizes_of_a_launch_are_those_the_recipes_own_arithmetic_gave(composed):

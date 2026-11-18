@@ -8,7 +8,8 @@ class BlackwellExtension(CudaExtension):
     first use."""
 
     OP_NAMESPACE = "pear_rollout_blackwell"
-    CUDA_FLAGS = ("-O3", "--use_fast_math", "-std=c++17", "-lineinfo")
+    # no -std: torch adds the C++ standard its headers need
+    CUDA_FLAGS = ("-O3", "--use_fast_math", "-lineinfo")
     LINK_FLAGS = ("-lcublasLt",)
 
     @staticmethod

@@ -3,8 +3,8 @@
 # hardware. A model's file of examples/models composes it with the override +qwen3_5=config.
 data:
   image_patch_size: 16  # the vision tower's patch, in pixels
-  # the vision tower casts pixel_values to bf16 at its patch embedding: stored in bf16 they are the same values in half
-  # the bytes, in TransferQueue and in its checkpoints
+  # the pixels both vision towers take, rounded to bf16 once: the trainer stores them so, in half the bytes in
+  # TransferQueue and in its checkpoints, and the replicas' processor casts them so (mm_device_do_normalize)
   pixel_dtype: bf16
 
 actor_rollout_ref:
@@ -35,7 +35,12 @@ actor_rollout_ref:
       format: qwen3_8  # the family's answer parser (pear/models/qwen3_5/tool_parser.py), which a recipe has verl import
     engine_kwargs:
       vllm:
-        mamba_cache_mode: align  # prefix caching of the Gated DeltaNet's state, kept at the block boundaries
+        # the KV cache sized from vLLM's memory estimate: the extensible cache caps torch's allocator at what warmup
+        # measured, and the weight sync allocates its buckets outside vLLM's own weight-update path
+        enable_extensible_kv_cache: false
         mm_encoder_attn_backend: TORCH_SDPA  # FlashAttention takes no fp32 inputs: the vision tower's attention is SDPA
+        # the processor normalizes the pixels on the CPU and vLLM casts them to bf16, as data.pixel_dtype stores them for
+        # the trainer: both vision towers take the same values (on the GPU vLLM would normalize them in fp32 unrounded)
+        mm_device_do_normalize: false
         hf_overrides:
           head_dtype: float32  # the lm_head accumulates its logits into fp32

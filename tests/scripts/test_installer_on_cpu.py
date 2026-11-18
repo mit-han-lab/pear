@@ -46,11 +46,12 @@ RECORDED_VARIABLES = (
     "HF_HUB_DISABLE_TELEMETRY",
 )
 # stand-ins for the programs the installer calls: each writes its name, its arguments and the variables above that it
-# was given onto a log, and leaves behind what the installer goes on with, where the real program writes it
+# was given (an empty one too) onto a log, and leaves behind what the installer goes on with, where the real program
+# writes it
 RECORD = (
     'record() { local line="$*" name; for name in '
     + " ".join(RECORDED_VARIABLES)
-    + '; do [ -z "${!name:-}" ] || line+=" $name=${!name}"; done; echo "$line" >> "$STAND_IN_LOG"; }\n'
+    + '; do [ -z "${!name+set}" ] || line+=" $name=${!name}"; done; echo "$line" >> "$STAND_IN_LOG"; }\n'
 )
 STAND_INS = {
     # an environment gets a Python that knows its version and the directory of its packages, where the CUDA wheels are;
@@ -195,6 +196,7 @@ class Installer:
             for line in (REPO / "scripts/install/versions.env").read_text().splitlines()
             if "=" in line and not line.startswith("#")
         )
+        self.flash_attn_commit = versions["FLASH_ATTN_COMMIT"]
         self.uv_release_url = (
             f"{versions['UV_RELEASES_URL']}/{versions['UV_VERSION']}/uv-x86_64-unknown-linux-gnu.tar.gz"
         )
@@ -212,6 +214,8 @@ class Installer:
             "UV_VERSION": versions["UV_VERSION"],
             "MICROMAMBA_VERSION": versions["MICROMAMBA_VERSION"],
             "CPU_N": "128",
+            # memory for every source build's own number of jobs
+            "MEMORY_GIB": "1024",
             "MACHINE_TYPE": "x86_64",
         }
 
@@ -359,14 +363,31 @@ def test_without_a_gpu_the_training_environment_is_its_packages_and_its_test(ins
 def test_on_a_gb300_the_builds_target_its_compute_capability(installer):
     process = installer.run("verl", GPU_ARCH="10.3", MACHINE_TYPE="aarch64")
 
-    [flash_attn_2] = [call for call in installer.calls("uv pip") if call.split(" TORCH_")[0].endswith(" flash-attn")]
+    [flash_attn_2] = [
+        call for call in installer.calls("uv pip") if call.split(" TORCH_")[0].endswith(" WORK/src/flash-attention")
+    ]
     assert process.returncode == 0, process.stderr
-    # 103 is none of flash-attn's own targets, so torch's flag for 10.3 alone reaches the compiler
-    assert flash_attn_2.endswith("flash-attn TORCH_CUDA_ARCH_LIST=10.3 FLASH_ATTN_CUDA_ARCHS=103 MAX_JOBS=64")
+    # built from the flash-attention checkout at its pinned commit; with no target of flash-attn's own, torch's flag for
+    # 10.3 gives the build its compiled target
+    assert f"git -C WORK/src/flash-attention checkout -q {installer.flash_attn_commit}" in installer.calls("git")
+    assert flash_attn_2.endswith(
+        "WORK/src/flash-attention TORCH_CUDA_ARCH_LIST=10.3 FLASH_ATTN_CUDA_ARCHS= MAX_JOBS=64"
+    )
     [lmcache_build] = installer.calls("build_lmcache_wheel.sh")
     assert lmcache_build.endswith("TORCH_CUDA_ARCH_LIST=10.3 MAX_JOBS=32")
     assert any(call.endswith("--no-deps --prerelease=allow flash-attn-4") for call in installer.calls("uv pip"))
     assert not [call for call in installer.calls("python") if "bdist_wheel" in call]
+
+
+def test_on_a_gb300_flashinfer_s_jit_modules_come_from_their_extra_without_their_requirements(installer):
+    process = installer.run("verl", GPU_ARCH="10.3", MACHINE_TYPE="aarch64")
+
+    # from FlashInfer's index of torch's CUDA build; the extra's markers keep the modules to a GB300 (aarch64)
+    assert process.returncode == 0, process.stderr
+    assert (
+        "uv pip install --python WORK/envs/verl/bin/python --no-deps --index https://flashinfer.ai/whl/cu130"
+        " -r TREE/pyproject.toml --extra verl_jit_cache"
+    ) in installer.calls("uv pip")
 
 
 def test_on_an_h100_flash_attn_3_is_built_too(installer):
@@ -376,15 +397,34 @@ def test_on_an_h100_flash_attn_3_is_built_too(installer):
     assert process.returncode == 0, process.stderr
     assert flash_attn_3_build.endswith("MAX_JOBS=8 NVCC_THREADS=4")
     assert any("--reinstall-package flash-attn-3 WORK/wheels/flash_attn_3-" in call for call in installer.calls("uv"))
-    assert any("FLASH_ATTN_CUDA_ARCHS=90" in call for call in installer.calls("uv pip"))
+    assert any(
+        "TORCH_CUDA_ARCH_LIST=9.0 FLASH_ATTN_CUDA_ARCHS= MAX_JOBS=" in call for call in installer.calls("uv pip")
+    )
 
 
-@pytest.mark.parametrize(("variables", "job_n"), [({"CPU_N": "16"}, "16"), ({"MAX_JOBS": "4"}, "4")])
-def test_a_build_takes_no_more_jobs_than_the_machine_has_cpus_or_the_caller_names(installer, variables, job_n):
+@pytest.mark.parametrize(
+    ("variables", "job_n"),
+    [({"CPU_N": "16"}, "16"), ({"MEMORY_GIB": "64"}, "16"), ({"MAX_JOBS": "4", "MEMORY_GIB": "8"}, "4")],
+)
+def test_a_build_takes_no_more_jobs_than_the_machine_has_cpus_its_memory_holds_or_the_caller_names(
+    installer, variables, job_n
+):
     installer.run("verl", GPU_ARCH="10.3", **variables)
 
     [lmcache_build] = installer.calls("build_lmcache_wheel.sh")
+    # LMCache's own number is 32, one of its jobs 4 GiB at its peak
     assert lmcache_build.endswith(f"MAX_JOBS={job_n}")
+
+
+def test_without_a_memory_size_a_build_takes_the_jobs_the_machine_s_available_memory_holds(installer):
+    process = installer.run("verl", GPU_ARCH="10.3", MEMORY_GIB="")
+
+    [lmcache_build] = installer.calls("build_lmcache_wheel.sh")
+    job_n = int(lmcache_build.rsplit("MAX_JOBS=", 1)[1])
+    available_kib = int(re.search(r"(?m)^MemAvailable:\s+(\d+)", Path("/proc/meminfo").read_text()).group(1))
+    assert process.returncode == 0, process.stderr
+    # a cgroup that holds the test can only lower it
+    assert 1 <= job_n <= max(1, min(32, available_kib // (4 * 1024 * 1024)))
 
 
 def test_a_second_run_builds_nothing_and_a_changed_input_builds_what_is_made_from_it(installer):
@@ -626,7 +666,7 @@ def test_the_station_s_environment_is_one_resolution_with_the_yam_s_sdk_then_pea
     ]
 
 
-def test_the_server_s_environment_is_its_extra_at_the_training_environment_s_pins_with_its_cuda_toolkit(installer):
+def test_the_server_s_environment_is_its_extra_at_its_own_pins_with_its_cuda_toolkit(installer):
     process = installer.run("server")
 
     toolkit = installer.work_dir / "envs/server/site-packages/nvidia/cu13"
@@ -634,8 +674,8 @@ def test_the_server_s_environment_is_its_extra_at_the_training_environment_s_pin
     assert not (installer.work_dir / "envs/verl").exists()
     assert installer.calls("uv venv") == ["uv venv --clear --python 3.12.15 WORK/envs/server"]
     assert installer.calls("uv pip") == [
-        "uv pip install --python WORK/envs/server/bin/python --constraint TREE/scripts/install/verl/constraints.txt"
-        " --override TREE/scripts/install/verl/overrides.txt --torch-backend=cu130"
+        "uv pip install --python WORK/envs/server/bin/python --constraint TREE/scripts/install/server/constraints.txt"
+        " --override TREE/scripts/install/server/overrides.txt --torch-backend=cu130"
         " --find-links https://flashinfer.ai/whl/flashinfer-cubin/ -r TREE/pyproject.toml --extra server",
         "uv pip install --python WORK/envs/server/bin/python --no-deps -e TREE",
     ]

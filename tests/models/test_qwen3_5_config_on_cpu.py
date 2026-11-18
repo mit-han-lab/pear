@@ -22,8 +22,9 @@ OVERRIDES = [
     "actor_rollout_ref.rollout.fp32_modules=[visual,A_log]",
     "actor_rollout_ref.rollout.kernels=pear.models.qwen3_5.rollout.rollout_kernels.Qwen3_5RolloutKernels",
     "actor_rollout_ref.rollout.multi_turn.format=qwen3_8",
-    "+actor_rollout_ref.rollout.engine_kwargs.vllm.mamba_cache_mode=align",
+    "+actor_rollout_ref.rollout.engine_kwargs.vllm.enable_extensible_kv_cache=false",
     "+actor_rollout_ref.rollout.engine_kwargs.vllm.mm_encoder_attn_backend=TORCH_SDPA",
+    "+actor_rollout_ref.rollout.engine_kwargs.vllm.mm_device_do_normalize=false",
     "+actor_rollout_ref.rollout.engine_kwargs.vllm.hf_overrides={head_dtype: float32}",
 ]
 

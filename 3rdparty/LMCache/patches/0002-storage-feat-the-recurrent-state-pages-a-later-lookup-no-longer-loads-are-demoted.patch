@@ -9,47 +9,60 @@ Local, from no pull request.
 For a hybrid (recurrent-state) model LMCache stores one recurrent-state page per chunk per object group, but a later
 lookup on the same prefix loads only the last `window` chunks of such a group: the earlier pages are dead weight.
 end_session touches every key of a session, so the dead pages stay as recent as live data and an eviction round
-takes live prefixes instead. An on_l1_keys_demoted hook goes through the listener, L1Manager, StorageManager and
+takes live prefixes instead. An on_l1_keys_demoted hook goes through the listener, the L1 managers, StorageManager and
 the eviction policy (the LRU moves demoted keys to its least-recently-used end and never promotes them again); the
-pages outside the window are demoted where the prefetch controller already releases their read locks; end_session
-touches only the usable keys (usable_key_indices), the window's pages first, so that the LRU's reversed walk leaves
-them most recent. A key demoted by mistake causes an earlier miss, never wrong KV.
+pages outside the window are demoted where the prefetch controller releases their read locks; end_session touches
+only the usable keys (usable_key_indices), the window's pages first, so that the LRU's reversed walk leaves them most
+recent, and demotes the rest. A key demoted by mistake causes an earlier miss, never wrong KV.
+
+What the port takes and changes:
+- v0.5.8rc1 has one L1 manager class per medium on BaseL1Manager (ShadowL1Manager included), behind the
+  L1ManagerInterface protocol, and a StorageManager with several of them: demote_keys is BaseL1Manager's and the
+  protocol's, and StorageManager.demote_l1_keys demotes in every L1 manager, as touch_cached_keys touches them.
+- v0.5.8rc1's prefetch controller releases the read locks of the pages outside the window in _plan_load, row by row,
+  where the load plan leaves them out, and demotes them there: _superseded_cells folds the hit over L1 and L2 as the
+  plan does and returns the cells inside the hit before the window of their group ("full" fetching has no windows).
+- end_session takes the keys chunk-major again, through the patch's _chunk_major_object_keys, which also returns
+  each group's window and kv-rank count from its one read of the registration; v0.5.8rc1's _all_object_keys, whose
+  order is unspecified, stays as it is for free_lookup_locks. The windows are the registration's, as
+  resolve_prefetched_obj_keys reads them, since v0.5.8rc1's session no longer records them. Since #6125 a group
+  stored once per tensor-parallel group has fewer kv-rank keys per chunk than a per-rank group, so
+  usable_key_indices takes each group's kv-rank count instead of the world size. The usable keys are touched with
+  touch_cached_keys, which also refreshes L2, and the superseded ones are found against a set built once.
+- The test follows LMCache's lint (88 columns, the license header, import headings), opts out of the shared
+  allocator, and also covers _superseded_cells, usable_key_indices and end_session with a group stored once, and a
+  prefix prefetch through PrefetchController on a CPU DramL1Manager whose LRU must then hand out the superseded pages
+  first.
 ---
- lmcache/v1/distributed/eviction.py            | 15 +++
- lmcache/v1/distributed/eviction_policy/lru.py | 28 ++++++
- lmcache/v1/distributed/internal_api.py        | 13 +++
- lmcache/v1/distributed/l1_manager.py          | 13 +++
- .../prefetch_controller.py                    | 10 +-
- lmcache/v1/distributed/storage_manager.py     | 10 ++
- lmcache/v1/multiprocess/modules/lookup.py     | 60 ++++++++++-
- .../test_superseded_page_demotion.py          | 99 +++++++++++++++++++
- 8 files changed, 243 insertions(+), 5 deletions(-)
+ lmcache/v1/distributed/eviction.py            |   9 +
+ lmcache/v1/distributed/eviction_policy/lru.py |  20 ++
+ lmcache/v1/distributed/internal_api.py        |  10 +
+ lmcache/v1/distributed/l1_manager/base.py     |   8 +
+ .../prefetch_controller.py                    |  37 +++
+ lmcache/v1/distributed/storage_manager.py     |   5 +
+ lmcache/v1/multiprocess/modules/lookup.py     |  78 ++++-
+ .../test_superseded_page_demotion.py          | 303 ++++++++++++++++++
+ 8 files changed, 467 insertions(+), 3 deletions(-)
  create mode 100644 tests/v1/distributed/test_superseded_page_demotion.py
 
 diff --git a/lmcache/v1/distributed/eviction.py b/lmcache/v1/distributed/eviction.py
-index 9e2e1e4fa018086013b733d4bd4eeba648393840..d435ee996b2447e8d01f46a1f813f23610992bd3 100644
+index 2ca3d7b062cc71a465bdb06867bc654d0aa6d7d5..c5a48eb57fe31080f2af8608382d68e787a116f1 100644
 --- a/lmcache/v1/distributed/eviction.py
 +++ b/lmcache/v1/distributed/eviction.py
-@@ -120,6 +120,18 @@ class EvictionPolicy:
+@@ -131,6 +131,12 @@ class EvictionPolicy:
          """
          pass
  
 +    def on_keys_demoted(self, keys: list[ObjectKey]):
-+        """
-+        Notify the eviction policy that keys are superseded and will not be
-+        read again by their owner (recurrent-state / sliding-window pages
-+        behind the window of a longer prefix). Policies that order by recency
-+        should make them the least recently used. Optional; default no-op.
-+
-+        Args:
-+            keys (list[ObjectKey]): The superseded keys.
-+        """
++        """Notify the policy that keys will not be read again (recurrent-state or
++        sliding-window pages before the window of a longer prefix); a no-op by
++        default."""
 +        pass
 +
      @abstractmethod
      def get_eviction_actions(
          self,
-@@ -206,6 +218,9 @@ class L1EvictionPolicy(L1ManagerListener):
+@@ -214,6 +220,9 @@ class L1EvictionPolicy(L1ManagerListener):
      def on_l1_keys_accessed(self, keys: list[ObjectKey]):
          self._policy.on_keys_touched(keys)
  
@@ -60,7 +73,7 @@ index 9e2e1e4fa018086013b733d4bd4eeba648393840..d435ee996b2447e8d01f46a1f813f236
  class L2EvictionPolicy(L2AdapterListener):
      """
 diff --git a/lmcache/v1/distributed/eviction_policy/lru.py b/lmcache/v1/distributed/eviction_policy/lru.py
-index 5ac1e811b8f4c16d3cf90cb586b0120a0fd53189..de7bb6fc46db88ea0df2725120e382d9316fc253 100644
+index 5ac1e811b8f4c16d3cf90cb586b0120a0fd53189..6f1d56c6624911f1076385295e312fae63d8f33a 100644
 --- a/lmcache/v1/distributed/eviction_policy/lru.py
 +++ b/lmcache/v1/distributed/eviction_policy/lru.py
 @@ -58,6 +58,10 @@ class LRUEvictionPolicy(EvictionPolicy):
@@ -69,7 +82,7 @@ index 5ac1e811b8f4c16d3cf90cb586b0120a0fd53189..de7bb6fc46db88ea0df2725120e382d9
  
 +        # Keys demoted by `on_keys_demoted` and still tracked: superseded for
 +        # good, so a later create/touch of the same key must not promote them.
-+        self._demoted: set[ObjectKey] = set()
++        self._demoted_keys: set[ObjectKey] = set()
 +
      def register_eviction_destination(self, destination: EvictionDestination):
          """
@@ -78,8 +91,8 @@ index 5ac1e811b8f4c16d3cf90cb586b0120a0fd53189..de7bb6fc46db88ea0df2725120e382d9
          if not keys:
              return
          with self._lock:
-+            if self._demoted:
-+                keys = [key for key in keys if key not in self._demoted]
++            if self._demoted_keys:
++                keys = [key for key in keys if key not in self._demoted_keys]
              # NOTE: for the request, the later keys should be evicted first.
              # For example, the request has (key1, key2, key3), if we first
              # evict key1, due to prefix match, key2 and key3 will not be hit.
@@ -87,85 +100,76 @@ index 5ac1e811b8f4c16d3cf90cb586b0120a0fd53189..de7bb6fc46db88ea0df2725120e382d9
          if not keys:
              return
          with self._lock:
-+            if self._demoted:
-+                keys = [key for key in keys if key not in self._demoted]
++            if self._demoted_keys:
++                keys = [key for key in keys if key not in self._demoted_keys]
              # NOTE: for the request, the later keys should be evicted first.
              # The example is the same as `on_keys_created`.
              for key in reversed(keys):
-@@ -109,6 +117,25 @@ class LRUEvictionPolicy(EvictionPolicy):
+@@ -109,6 +117,17 @@ class LRUEvictionPolicy(EvictionPolicy):
                      # Move to end (most recently used)
                      self._order.move_to_end(key)
  
 +    def on_keys_demoted(self, keys: list[ObjectKey]):
-+        """
-+        Notify the eviction policy that keys are superseded (recurrent-state /
-+        sliding-window pages behind the window of a longer prefix). They are
-+        moved to the least-recently-used end so the next eviction takes them
-+        before any live key, and remembered so that a later touch or store of
-+        the same key does not carry them back to the MRU end.
-+
-+        Args:
-+            keys (list[ObjectKey]): The superseded keys
-+        """
++        """Move the keys to the least recently used end, where the next eviction
++        takes them first, and keep them there through later touches and stores."""
 +        if not keys:
 +            return
 +        with self._lock:
 +            for key in keys:
 +                if key in self._order:
 +                    self._order.move_to_end(key, last=False)
-+                    self._demoted.add(key)
++                    self._demoted_keys.add(key)
 +
      def on_keys_removed(self, keys: list[ObjectKey]):
          """
          Notify the eviction policy that keys have been deleted.
-@@ -124,6 +151,7 @@ class LRUEvictionPolicy(EvictionPolicy):
+@@ -124,6 +143,7 @@ class LRUEvictionPolicy(EvictionPolicy):
                  # Remove from LRU order tracking
                  if key in self._order:
                      del self._order[key]
-+                self._demoted.discard(key)
++                self._demoted_keys.discard(key)
  
      def get_eviction_actions(
          self,
 diff --git a/lmcache/v1/distributed/internal_api.py b/lmcache/v1/distributed/internal_api.py
-index fb8c7009a0ea87f66c731f627ea3ec4f9e74b2e1..dda4f64965109a31a2b757e005f6b4ff1181fc6c 100644
+index ca11d37e110e33453a84782d65b4188578f1f113..8b66cda4de53311be91e6c20a2331a080dac7cff 100644
 --- a/lmcache/v1/distributed/internal_api.py
 +++ b/lmcache/v1/distributed/internal_api.py
-@@ -112,6 +112,19 @@ class L1ManagerListener(EventListener):
+@@ -136,6 +136,12 @@ class L1ManagerListener(EventListener):
          """
          pass
  
 +    def on_l1_keys_demoted(self, keys: list[ObjectKey]):
-+        """
-+        Notify the listener that keys will not be read again by the request
-+        that holds them (e.g. recurrent-state / sliding-window pages behind
-+        the window of a longer prefix). Listeners that track recency should
-+        make them the first candidates for eviction. Optional: the default
-+        is a no-op so existing listeners keep working.
-+
-+        Args:
-+            keys (list[ObjectKey]): The superseded keys
-+        """
++        """Notify the listener that keys will not be read again (recurrent-state
++        or sliding-window pages before the window of a longer prefix); a no-op
++        by default."""
 +        pass
 +
      @abstractmethod
      def on_l1_keys_accessed(self, keys: list[ObjectKey]):
          """
-diff --git a/lmcache/v1/distributed/l1_manager.py b/lmcache/v1/distributed/l1_manager.py
-index 8d03e641304a765407ab6e49489b1433f2917605..56605ac946e972274378754db01adb384460a37d 100644
---- a/lmcache/v1/distributed/l1_manager.py
-+++ b/lmcache/v1/distributed/l1_manager.py
-@@ -738,6 +738,19 @@ class L1Manager:
+@@ -334,6 +340,10 @@ class L1ManagerInterface(Protocol):
+         """Record an access to the keys; takes no lock."""
+         ...
+ 
++    def demote_keys(self, keys: list[ObjectKey]) -> None:
++        """Record that the keys' owners will not read them again; takes no lock."""
++        ...
++
+     def clear(self, force: bool = False) -> None:
+         """Drop every object this L1 is allowed to drop."""
+         ...
+diff --git a/lmcache/v1/distributed/l1_manager/base.py b/lmcache/v1/distributed/l1_manager/base.py
+index c900b67dd34cfff1dd325080a7dafc91d1181fe0..2f0e945ff8b6b1cb461a719305ad6bbc2a8ec208 100644
+--- a/lmcache/v1/distributed/l1_manager/base.py
++++ b/lmcache/v1/distributed/l1_manager/base.py
+@@ -873,6 +873,14 @@ class BaseL1Manager(L1ManagerInterface):
                  )
              )
  
 +    def demote_keys(self, keys: list[ObjectKey]):
-+        """Mark keys as superseded: the requests that hold them will never read
-+        them again (recurrent-state / sliding-window pages behind the window of
-+        a longer prefix), so eviction should take them before any live key.
-+
-+        Args:
-+            keys: The list of object keys to demote.
-+        """
++        """Tell the listeners that the keys will not be read again, so eviction
++        takes them before any key still in use."""
 +        if not keys:
 +            return
 +        for listener in self._registered_listeners:
@@ -175,49 +179,84 @@ index 8d03e641304a765407ab6e49489b1433f2917605..56605ac946e972274378754db01adb38
      def clear(self, force: bool = False) -> None:
          """Clear objects from L1 cache.
 diff --git a/lmcache/v1/distributed/storage_controllers/prefetch_controller.py b/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
-index ef78cee00dc524baad1dcac45276f2a10ef1ee2e..515e4aca2bc51eff04a0b7c69926858c21c4535f 100644
+index dbcd09e29eb6faf7fc6109705fab832fc1633a8d..61c4b8a31a6b962252203024758ed92d8165bb53 100644
 --- a/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
 +++ b/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
-@@ -868,9 +868,13 @@ class PrefetchController(StorageControllerInterface):
-         # hit -- won't be read again, so release their locks.
-         evictable = l1_readlocks & ~l1_window & within_l1_hit
-         if evictable.popcount() > 0:
--            self._l1_manager.finish_read(
--                evictable.gather(keys), read_locks=num_kv_readers
--            )
-+            evictable_keys = evictable.gather(keys)
-+            self._l1_manager.finish_read(evictable_keys, read_locks=num_kv_readers)
-+            # Superseded by the longer prefix: make them the first eviction
-+            # candidates instead of letting them age like live data (a single
-+            # eviction round would otherwise take live prefixes while these
-+            # never-read-again pages, refreshed by the prefix run, survive).
-+            self._l1_manager.demote_keys(evictable_keys)
-             l1_readlocks = l1_readlocks & ~evictable
-         return l1_readlocks
+@@ -397,6 +397,32 @@ def _needs_l2_lookup(
+     return hit_length < num_chunks
  
+ 
++def _superseded_cells(
++    key_groups: list[GroupedObjectKeys],
++    l1_locked_keys: MapState,
++    l2_locked_keys: MapState,
++    fetching_policy: FetchingPolicy,
++) -> Bitmap2D:
++    """Return the cells of a ``"prefix"`` hit (folded over L1 and L2 as the load
++    plan folds it) that lie before the window of their sliding-window or
++    recurrent-state group; ``"full"`` fetching has none."""
++    found_cells = _merged_or_zeros(l1_locked_keys, key_groups) + _merged_or_zeros(
++        l2_locked_keys, key_groups
++    )
++    if fetching_policy != "prefix":
++        return found_cells.zeros_like()
++    try:
++        hit_length, retained_rows = fold_unfold_grouped(
++            found_cells.to_list(), [group.sliding_window_size for group in key_groups]
++        )
++    except ValueError:
++        # The load plan logs the same failure and plans nothing.
++        return found_cells.zeros_like()
++    num_chunks = len(key_groups[0].keys)
++    hit_cells = Bitmap2D([Bitmap(num_chunks, hit_length) for _ in key_groups])
++    return hit_cells - Bitmap2D(retained_rows)
++
++
+ # Class definitions
+ 
+ 
+@@ -1283,12 +1309,23 @@ class PrefetchController(StorageControllerInterface):
+             fetching_policy=request.fetching_policy,
+         )
+ 
++        superseded_cells = _superseded_cells(
++            request.key_groups,
++            states.l1_locked_keys,
++            states.l2_locked_keys,
++            request.fetching_policy,
++        )
+         l1_dropped = states.l1_locked_keys - load_plan.l1_planned_keys
+         l2_dropped = states.l2_locked_keys - load_plan.l2_planned_keys
+         for l1_idx, cells in l1_dropped.items():
+             for row, keys in _gather_keys_by_row(request.key_groups, cells):
+                 if keys:
+                     self._l1_managers[l1_idx].finish_read(keys, row.num_kv_readers)
++            # Pages the longer prefix supersedes: the first eviction candidates,
++            # or an eviction round takes live prefixes while these survive.
++            demoted_keys = _gather_keys(request.key_groups, cells & superseded_cells)
++            if demoted_keys:
++                self._l1_managers[l1_idx].demote_keys(demoted_keys)
+         for l2_idx, cells in l2_dropped.items():
+             keys = _gather_keys(request.key_groups, cells)
+             if keys:
 diff --git a/lmcache/v1/distributed/storage_manager.py b/lmcache/v1/distributed/storage_manager.py
-index 1bd260226bf337f19d23584a8d3f05aafb2d9e70..34c30bac6c2d01a1f7c7056599578164510c959b 100644
+index 502f3f16d8b40918faaaae168e805f7d8bf0397b..f9ad83680c15f2482db1b9407d111468aa88a12c 100644
 --- a/lmcache/v1/distributed/storage_manager.py
 +++ b/lmcache/v1/distributed/storage_manager.py
-@@ -747,6 +747,16 @@ class StorageManager:
-         """
-         self._l1_manager.touch_keys(keys)
+@@ -653,6 +653,11 @@ class StorageManager:
+         for _adapter_id, _desc, adapter in self._snapshot_adapters():
+             adapter.submit_touch(keys)
  
-+    def demote_l1_keys(self, keys: list[ObjectKey]):
-+        """
-+        Mark keys in L1 storage as superseded: their owner will never read
-+        them again, so eviction should take them before any live key.
-+
-+        Args:
-+            keys (list[ObjectKey]): List of object keys to demote.
-+        """
-+        self._l1_manager.demote_keys(keys)
++    def demote_l1_keys(self, keys: list[ObjectKey]) -> None:
++        """Demote the keys in every L1 manager: they will not be read again."""
++        for manager in self._l1_managers_by_id.values():
++            manager.demote_keys(keys)
 +
      def delete_l1_keys(
          self, keys: list[ObjectKey], force: bool = False
      ) -> tuple[int, int]:
 diff --git a/lmcache/v1/multiprocess/modules/lookup.py b/lmcache/v1/multiprocess/modules/lookup.py
-index 4fceac9b060487df8117ba867354fc541083c726..749adeb9672836ead1880d6ef6b0472575b85899 100644
+index 58a4e5ef566d7789dd41707771ab3b0f22c3ba6f..bd82b40eb36cc5b06fa5ee357c3485109ec555a5 100644
 --- a/lmcache/v1/multiprocess/modules/lookup.py
 +++ b/lmcache/v1/multiprocess/modules/lookup.py
 @@ -2,6 +2,7 @@
@@ -225,109 +264,173 @@ index 4fceac9b060487df8117ba867354fc541083c726..749adeb9672836ead1880d6ef6b04725
  
  # Standard
 +from collections.abc import Sequence
- from dataclasses import dataclass
+ from dataclasses import dataclass, replace
  from functools import partial
  import threading
-@@ -32,6 +33,46 @@ from lmcache.v1.multiprocess.token_hasher import TokenHasher
- logger = init_logger(__name__)
+@@ -47,6 +48,32 @@ logger = init_logger(__name__)
+ _DEFAULT_LOAD_POLICY = DefaultKVLoadPolicy({})
  
  
 +def usable_key_indices(
-+    num_keys: int, group_windows: Sequence[int], world_size: int
++    num_keys: int, group_windows: Sequence[int], group_ranks: Sequence[int]
 +) -> list[int]:
-+    """Indices of the chunk-major keys (``chunk -> object group -> kv_rank``) a
-+    later lookup on the same prefix can still use, in touch order.
-+
-+    Every chunk of a full-attention group (window ``-1``) stays usable; of a
-+    sliding-window / recurrent-state group only the last ``window`` chunks do,
-+    which is exactly what the retrieve path loads (``num_objects_to_skip``).
-+
-+    The LRU policy walks a touched list backwards, so the first entries end up
-+    most recent: the window pages come first (without them the whole prefix is
-+    unusable), then the full-attention keys in chunk order (a prefix match
-+    starts at chunk 0, so its tail is the right end to lose first).
-+
-+    Args:
-+        num_keys: Length of the flat chunk-major key list.
-+        group_windows: Per-object-group windows in chunks (``-1`` = full).
-+        world_size: Number of kv_rank shards per chunk.
-+
-+    Returns:
-+        Usable key indices, window-group keys first, then full groups.
-+    """
-+    num_groups = len(group_windows)
-+    stride = num_groups * world_size
-+    if stride == 0 or num_keys == 0:
++    """Return the indices of the chunk-major keys (chunk, object group, kv rank)
++    that a later lookup on the same prefix can still use, in touch order: the
++    last ``window`` chunks of each windowed group, then every full-attention
++    group (window ``-1``) chunk by chunk."""
++    stride = sum(group_ranks)
++    if stride == 0:
 +        return []
 +    num_chunks = num_keys // stride
-+    window_keys: list[int] = []
-+    full_keys: list[int] = []
++    window_indices: list[int] = []
++    full_indices: list[int] = []
 +    for chunk in range(num_chunks):
-+        for group, window in enumerate(group_windows):
-+            base = chunk * stride + group * world_size
++        base = chunk * stride
++        for window, ranks in zip(group_windows, group_ranks, strict=True):
 +            if window < 0:
-+                full_keys.extend(range(base, base + world_size))
++                full_indices.extend(range(base, base + ranks))
 +            elif chunk >= num_chunks - window:
-+                window_keys.extend(range(base, base + world_size))
-+    return window_keys + full_keys
++                window_indices.extend(range(base, base + ranks))
++            base += ranks
++    # the LRU walks a touched list backwards: the window pages, without which
++    # the prefix is unusable, end up most recent, a full group's tail least
++    return window_indices + full_indices
 +
 +
  def resolve_prefetched_obj_keys(
      ctx: MPCacheServerContext,
      key: IPCCacheServerKey,
-@@ -579,11 +620,26 @@ class LookupModule:
+@@ -617,17 +644,62 @@ class LookupModule(DiscoverableModule):
+             return
  
          chunk_hashes = [TokenHasher.hash_to_bytes(h) for h in session.get_hashes(0)]
-         obj_keys = self._chunk_major_object_keys(session.lookup_ipc_key, chunk_hashes)
+-        obj_keys = self._all_object_keys(session.lookup_ipc_key, chunk_hashes)
 -        # unified touch of all keys, which include retrieved and stored keys
-+        # unified touch of the keys a later lookup can still use (retrieved and
-+        # stored): every chunk of a full-attention group, but only the last
-+        # `window` chunks of a sliding-window / recurrent-state group. Earlier
-+        # pages of those groups are never read again; touching them would keep
-+        # superseded pages as recent as live data and make eviction take live
-+        # prefixes instead.
++        obj_keys, group_windows, group_ranks = self._chunk_major_object_keys(
++            session.lookup_ipc_key, chunk_hashes
++        )
++        # unified touch of the keys a later lookup can still use, retrieved and
++        # stored; the earlier pages of a windowed group are demoted, or they stay
++        # as recent as live data and eviction takes live prefixes instead
          # TODO(chunxiaozheng): when l2 is enabled, the prefetched keys from l2 are temp
          #  and will be deleted after finish_read_prefetched, when we touch all keys,
          #  these keys has been deleted and will not be touched.
--        self._ctx.storage_manager.touch_l1_keys(obj_keys)
-+        attn_desc = self._ctx.layout_desc_registry.find_attn_desc(
-+            session.lookup_ipc_key.model_name, session.lookup_ipc_key.world_size
+-        self._ctx.storage_manager.touch_cached_keys(obj_keys)
++        usable_indices = usable_key_indices(len(obj_keys), group_windows, group_ranks)
++        self._ctx.storage_manager.touch_cached_keys(
++            [obj_keys[i] for i in usable_indices]
 +        )
-+        windows = session.prefetch_group_windows
-+        if len(windows) != attn_desc.num_object_groups:
-+            windows = tuple(attn_desc.num_chunks_in_sw)
-+        usable = usable_key_indices(len(obj_keys), windows, attn_desc.world_size)
-+        self._ctx.storage_manager.touch_l1_keys([obj_keys[i] for i in usable])
-+        superseded = [obj_keys[i] for i in range(len(obj_keys)) if i not in set(usable)]
-+        if superseded:
-+            self._ctx.storage_manager.demote_l1_keys(superseded)
++        usable_index_set = set(usable_indices)
++        superseded_keys = [
++            key for i, key in enumerate(obj_keys) if i not in usable_index_set
++        ]
++        if superseded_keys:
++            self._ctx.storage_manager.demote_l1_keys(superseded_keys)
  
      # -----------------------------------------------------------------
      # Internal helpers
+     # -----------------------------------------------------------------
+ 
++    def _chunk_major_object_keys(
++        self,
++        key: IPCCacheServerKey,
++        chunk_hashes: list[bytes],
++    ) -> tuple[list[ObjectKey], list[int], list[int]]:
++        """Return every object key of the chunks across the registration's object
++        groups, ordered chunk, object group, kv rank, with each group's window in
++        chunks and its number of kv-rank keys per chunk."""
++        registry = self._ctx.layout_desc_registry
++        attn_desc = registry.find_attn_desc(key.model_name, key.world_size)
++        shard_replication_desc = registry.find_shard_replication_desc(
++            key.model_name, key.world_size
++        )
++        keys_by_group = ipc_key_to_object_keys(
++            key,
++            chunk_hashes,
++            list(range(attn_desc.num_object_groups)),
++            shard_replication_desc,
++        )
++        # Each per-group list is chunk-major / rank-minor; a replicated group
++        # has fewer kv ranks per chunk than a per-rank one.
++        num_chunks = len(chunk_hashes)
++        group_ranks = [
++            len(group_keys) // num_chunks if num_chunks else 0
++            for group_keys in keys_by_group
++        ]
++        obj_keys: list[ObjectKey] = []
++        for chunk_idx in range(num_chunks):
++            for group_keys, ranks in zip(keys_by_group, group_ranks, strict=True):
++                obj_keys.extend(group_keys[chunk_idx * ranks : (chunk_idx + 1) * ranks])
++        return obj_keys, list(attn_desc.num_chunks_in_sw), group_ranks
++
+     def _all_object_keys(
+         self,
+         key: IPCCacheServerKey,
 diff --git a/tests/v1/distributed/test_superseded_page_demotion.py b/tests/v1/distributed/test_superseded_page_demotion.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..ac323181d47284352c885e8484a65e7a2a9a97b3
+index 0000000000000000000000000000000000000000..60717d613d1ebaa210c9719c20fcbd4c6b108f7d
 --- /dev/null
 +++ b/tests/v1/distributed/test_superseded_page_demotion.py
-@@ -0,0 +1,99 @@
-+"""Superseded recurrent-state / sliding-window pages must be evicted before live keys.
+@@ -0,0 +1,303 @@
++# SPDX-License-Identifier: Apache-2.0
++# Standard
++from collections.abc import Iterator
++from unittest.mock import MagicMock
 +
-+A hybrid model stores one recurrent-state page per chunk per group, but a later lookup on the same prefix only
-+loads the last ``window`` chunks of such a group. Those earlier pages are demoted (``on_keys_demoted``) by the
-+prefetch controller and no longer touched at session end, so the LRU must hand them out first and never move
-+them back to the MRU end through the prefix run.
-+"""
++# Third Party
++import pytest
++import torch
 +
-+from lmcache.v1.distributed.api import ObjectKey
++# First Party
++from lmcache.lmcache_native import Bitmap
++from lmcache.v1.common.attn_window import AttnWindowDesc
++from lmcache.v1.common.custom_types import IPCCacheServerKey
++from lmcache.v1.common.token_hasher import TokenHasher
++from lmcache.v1.distributed.api import (
++    GroupedObjectKeys,
++    MemoryLayoutDesc,
++    ObjectKey,
++    PrefetchTaskSpec,
++    ShardReplicationDesc,
++)
++from lmcache.v1.distributed.config import L1ManagerConfig, L1MemoryManagerConfig
++from lmcache.v1.distributed.error import L1Error
++from lmcache.v1.distributed.eviction import L1EvictionPolicy
 +from lmcache.v1.distributed.eviction_policy.lru import LRUEvictionPolicy
-+from lmcache.v1.multiprocess.modules.lookup import usable_key_indices
++from lmcache.v1.distributed.l1_manager import DramL1Manager
++from lmcache.v1.distributed.storage_controllers.prefetch_controller import (
++    PrefetchController,
++    _superseded_cells,
++)
++from lmcache.v1.distributed.storage_controllers.prefetch_policy import (
++    DefaultPrefetchPolicy,
++)
++from lmcache.v1.distributed.storage_controllers.utils import (
++    Bitmap2D,
++    L1ManagerDescriptor,
++    MapState,
++)
++from lmcache.v1.multiprocess.modules.lookup import LookupModule, usable_key_indices
++import lmcache.v1.memory_management as memory_management
 +
++pytestmark = pytest.mark.no_shared_allocator
++
++# kv-rank keys per chunk of every group
 +RANKS = 2
-+GROUPS = [1, 1, -1]  # two recurrent groups with a one-chunk window, one full-attention group
++# two recurrent groups with a one-chunk window, one full-attention group
++GROUPS = [1, 1, -1]
++LAYOUT = MemoryLayoutDesc([torch.Size([1024])], [torch.float32])  # 4 KiB
++# the L1 tier, 32 objects of LAYOUT
++CAPACITY = 32 * 4096
 +
 +
 +def key(conv: int, chunk: int, group: int, rank: int) -> ObjectKey:
-+    return ObjectKey(chunk_hash=f"c{conv}-{chunk}".encode(), model_name="m", kv_rank=rank, object_group_id=group)
++    return ObjectKey(
++        chunk_hash=f"c{conv}-{chunk}".encode(),
++        model_name="m",
++        kv_rank=rank,
++        object_group_id=group,
++    )
 +
 +
 +def chunk_keys(conv: int, chunk: int) -> list[ObjectKey]:
@@ -340,67 +443,95 @@ index 0000000000000000000000000000000000000000..ac323181d47284352c885e8484a65e7a
 +
 +def usable_keys(conv: int, num_chunks: int) -> list[ObjectKey]:
 +    keys = prefix_keys(conv, num_chunks)
-+    return [keys[i] for i in usable_key_indices(len(keys), GROUPS, RANKS)]
++    group_ranks = [RANKS] * len(GROUPS)
++    return [keys[i] for i in usable_key_indices(len(keys), GROUPS, group_ranks)]
++
++
++def chunk_of(k: ObjectKey) -> int:
++    return int(k.chunk_hash.split(b"-")[1])
 +
 +
 +def test_usable_key_indices_layout():
 +    keys = prefix_keys(0, 3)
-+    usable = [keys[i] for i in usable_key_indices(len(keys), GROUPS, RANKS)]
++    group_ranks = [RANKS] * len(GROUPS)
++    usable_key_list = [
++        keys[i] for i in usable_key_indices(len(keys), GROUPS, group_ranks)
++    ]
 +    # full-attention group: all chunks; recurrent groups: only the last chunk
-+    assert {(k.object_group_id, int(k.chunk_hash.split(b"-")[1])) for k in usable} == {
-+        (2, 0), (2, 1), (2, 2), (0, 2), (1, 2)
++    assert {(k.object_group_id, chunk_of(k)) for k in usable_key_list} == {
++        (2, 0),
++        (2, 1),
++        (2, 2),
++        (0, 2),
++        (1, 2),
 +    }
-+    assert usable_key_indices(0, GROUPS, RANKS) == []
-+    assert usable_key_indices(12, [], RANKS) == []
-+    # touch order: the window pages first (most recent after a reversed walk), then attention keys chunk by chunk
-+    ordered = [keys[i] for i in usable_key_indices(len(keys), GROUPS, RANKS)]
-+    assert [k.object_group_id for k in ordered] == [0] * RANKS + [1] * RANKS + [2] * (3 * RANKS)
-+    assert [int(k.chunk_hash.split(b"-")[1]) for k in ordered][2 * RANKS:] == [0] * RANKS + [1] * RANKS + [2] * RANKS
++    assert usable_key_indices(0, GROUPS, group_ranks) == []
++    assert usable_key_indices(12, [], []) == []
++    # touch order: the window pages first (most recent after a reversed walk),
++    # then the attention keys chunk by chunk
++    assert [k.object_group_id for k in usable_key_list] == (
++        [0] * RANKS + [1] * RANKS + [2] * (3 * RANKS)
++    )
++    assert [chunk_of(k) for k in usable_key_list][2 * RANKS :] == (
++        [0] * RANKS + [1] * RANKS + [2] * RANKS
++    )
++
++
++def test_usable_key_indices_with_a_group_stored_once():
++    """A group stored once per tensor-parallel group has one key per chunk
++    while the other groups keep one per rank."""
++    # chunk-major: (group 0, rank 0), (group 1, rank 0), (group 1, rank 1)
++    usable_indices = usable_key_indices(12, [1, -1], [1, 2])
++
++    assert usable_indices == [9, 1, 2, 4, 5, 7, 8, 10, 11]
 +
 +
 +def _store_chunks(policy: LRUEvictionPolicy, conv: int, chunks: range) -> None:
-+    note_positions = getattr(policy, "note_key_positions", None)  # only with PR #4867's prefix-run ordering
 +    for c in chunks:
-+        ks = chunk_keys(conv, c)
-+        if note_positions is not None:
-+            note_positions(ks, [c] * len(ks))
-+        policy.on_keys_created(ks)
++        policy.on_keys_created(chunk_keys(conv, c))
 +
 +
 +def _victims(policy: LRUEvictionPolicy, count: int) -> list[ObjectKey]:
-+    tracked = len(policy._order)
-+    return [k for a in policy.get_eviction_actions(count / tracked) for k in a.keys][:count]
++    num_tracked_keys = len(policy._order)
++    actions = policy.get_eviction_actions(count / num_tracked_keys)
++    return [k for a in actions for k in a.keys][:count]
 +
 +
 +def test_demoted_pages_are_evicted_first_and_stay_demoted():
 +    policy = LRUEvictionPolicy()
 +    _store_chunks(policy, 0, range(4))
 +    _store_chunks(policy, 1, range(4))
-+    superseded = [k for k in prefix_keys(0, 4) if k not in set(usable_keys(0, 4))]
-+    policy.on_keys_demoted(superseded)
-+    # a later touch of the prefix, an extension by one chunk (store of chunk 4 only, as the server dedups
-+    # existing chunks) and a re-touch must not carry the demoted pages back to the MRU end
++    superseded_keys = [k for k in prefix_keys(0, 4) if k not in set(usable_keys(0, 4))]
++    policy.on_keys_demoted(superseded_keys)
++    # a later touch of the prefix, an extension by one chunk (store of chunk 4
++    # only, as the server dedups existing chunks) and a re-touch must not carry
++    # the demoted pages back to the MRU end
 +    policy.on_keys_touched(usable_keys(0, 4))
 +    _store_chunks(policy, 0, range(4, 5))
 +    policy.on_keys_touched(usable_keys(0, 5))
 +
-+    victims = _victims(policy, len(superseded))
++    victims = _victims(policy, len(superseded_keys))
 +    assert victims, "policy returned no eviction candidates"
-+    assert set(victims) == set(superseded), f"eviction did not take the superseded pages first: {set(victims) ^ set(superseded)}"
++    assert set(victims) == set(superseded_keys), (
++        "eviction did not take the superseded pages first: "
++        f"{set(victims) ^ set(superseded_keys)}"
++    )
 +
 +
 +def test_recreating_a_demoted_page_does_not_promote_it():
 +    policy = LRUEvictionPolicy()
 +    _store_chunks(policy, 0, range(3))
-+    superseded = [k for k in prefix_keys(0, 3) if k not in set(usable_keys(0, 3))]
-+    policy.on_keys_demoted(superseded)
-+    # a redundant store of the whole prefix (e.g. a retried request) reports every key as created again
++    superseded_keys = [k for k in prefix_keys(0, 3) if k not in set(usable_keys(0, 3))]
++    policy.on_keys_demoted(superseded_keys)
++    # a redundant store of the whole prefix (e.g. a retried request) reports
++    # every key as created again
 +    _store_chunks(policy, 0, range(3))
 +    policy.on_keys_touched(prefix_keys(0, 3))
-+    assert set(_victims(policy, len(superseded))) == set(superseded)
-+    # once the pages are really gone they are forgotten and can be admitted afresh
-+    policy.on_keys_removed(superseded)
-+    assert not getattr(policy, "_demoted", set())
++    assert set(_victims(policy, len(superseded_keys))) == set(superseded_keys)
++    # once the pages are really gone they are forgotten and can be admitted
++    # afresh
++    policy.on_keys_removed(superseded_keys)
++    assert not policy._demoted_keys
 +    _store_chunks(policy, 0, range(3))
 +    assert set(_victims(policy, 1)) <= set(prefix_keys(0, 3))
 +
@@ -409,3 +540,138 @@ index 0000000000000000000000000000000000000000..ac323181d47284352c885e8484a65e7a
 +    policy = LRUEvictionPolicy()
 +    policy.on_keys_demoted([key(9, 0, 0, 0)])
 +    assert policy.get_eviction_actions(1.0) == []
++
++
++def test_end_session_touches_the_window_and_demotes_the_rest():
++    """At session end the recurrent group (stored once per tensor-parallel
++    group here) keeps only its last chunk; every attention key is touched."""
++    num_chunks = 4
++    chunk_size = 16
++    ctx = MagicMock()
++    ctx.layout_desc_registry.find_attn_desc.return_value = AttnWindowDesc(
++        num_chunks_in_sw=[1, -1], world_size=RANKS
++    )
++    ctx.layout_desc_registry.find_shard_replication_desc.return_value = (
++        ShardReplicationDesc(group_tp_replicas=(RANKS, 1), group_dcp_shards=(1, 1))
++    )
++    session = MagicMock()
++    session.lookup_ipc_key = IPCCacheServerKey.from_token_ids(
++        model_name="m",
++        world_size=RANKS,
++        worker_id=None,
++        token_ids=range(num_chunks * chunk_size),
++        start=0,
++        end=num_chunks * chunk_size,
++        request_id="r",
++    )
++    session.get_hashes.return_value = list(range(1, num_chunks + 1))
++    ctx.session_manager.remove.return_value = session
++
++    LookupModule(ctx).end_session("r")
++
++    last_chunk = TokenHasher.hash_to_bytes(num_chunks)
++    touched_keys = ctx.storage_manager.touch_cached_keys.call_args.args[0]
++    assert [(k.object_group_id, k.chunk_hash) for k in touched_keys[:1]] == [
++        (0, last_chunk)
++    ]
++    assert [k.object_group_id for k in touched_keys[1:]] == [1] * (num_chunks * RANKS)
++    demoted_keys = ctx.storage_manager.demote_l1_keys.call_args.args[0]
++    assert [(k.object_group_id, k.chunk_hash) for k in demoted_keys] == [
++        (0, TokenHasher.hash_to_bytes(chunk)) for chunk in range(1, num_chunks)
++    ]
++
++
++def _rows(windows: list[int], num_chunks: int) -> list[GroupedObjectKeys]:
++    """One prefetch row per object group (kv rank 0), chunk-ordered."""
++    return [
++        GroupedObjectKeys(
++            keys=[key(0, c, g, 0) for c in range(num_chunks)],
++            object_group_id=g,
++            layout_desc=LAYOUT,
++            sliding_window_size=window,
++        )
++        for g, window in enumerate(windows)
++    ]
++
++
++def _set_bits(grid: Bitmap2D) -> list[list[int]]:
++    return [[i for i in range(row.size()) if row.test(i)] for row in grid.to_list()]
++
++
++def _l1_holding(rows: list[GroupedObjectKeys], num_chunks: int) -> MapState:
++    """One L1 manager holding the first ``num_chunks`` chunks of every row."""
++    state = MapState()
++    state[0] = Bitmap2D([Bitmap(len(row.keys), num_chunks) for row in rows])
++    return state
++
++
++def test_superseded_cells_are_the_pages_before_each_window():
++    rows = _rows([1, 2, -1], num_chunks=4)
++
++    superseded_cells = _superseded_cells(
++        rows, _l1_holding(rows, 4), MapState(), "prefix"
++    )
++    assert _set_bits(superseded_cells) == [[0, 1, 2], [0, 1], []]
++
++    # the hit, not the request, sets the windows
++    superseded_cells = _superseded_cells(
++        rows, _l1_holding(rows, 2), MapState(), "prefix"
++    )
++    assert _set_bits(superseded_cells) == [[0], [], []]
++
++    full_rows = _rows([-1, -1], num_chunks=4)
++    superseded_cells = _superseded_cells(
++        full_rows, _l1_holding(full_rows, 4), MapState(), "full"
++    )
++    assert _set_bits(superseded_cells) == [[], []]
++
++
++@pytest.fixture
++def dram_l1(monkeypatch: pytest.MonkeyPatch) -> Iterator[DramL1Manager]:
++    monkeypatch.setattr(
++        memory_management,
++        "_allocate_cpu_memory",
++        lambda size, *args, **kwargs: torch.empty(size, dtype=torch.uint8),
++    )
++    monkeypatch.setattr(memory_management, "_free_cpu_memory", lambda *a, **k: None)
++    config = L1ManagerConfig(
++        L1MemoryManagerConfig(size_in_bytes=CAPACITY, use_lazy=False, shm_name="")
++    )
++    manager = DramL1Manager(config)
++    yield manager
++    manager.close()
++
++
++def test_a_prefix_prefetch_demotes_the_pages_it_supersedes(dram_l1: DramL1Manager):
++    """The pages of a recurrent-state row before its window, released by a
++    prefix prefetch, become the L1 LRU's first eviction candidates."""
++    policy = LRUEvictionPolicy()
++    dram_l1.register_listener(L1EvictionPolicy(policy))
++    rows = _rows([1, -1], num_chunks=4)
++    keys = [k for row in rows for k in row.keys]
++    write_results = dram_l1.reserve_write(keys, [False] * len(keys), LAYOUT)
++    assert all(write_results[k][0] == L1Error.SUCCESS for k in keys)
++    dram_l1.finish_write(keys)
++    controller = PrefetchController(
++        l1_managers=[dram_l1],
++        l1_manager_descriptors=[L1ManagerDescriptor(index=0, config=dram_l1.config)],
++        l2_adapters=[],
++        adapter_descriptors=[],
++        policy=DefaultPrefetchPolicy(),
++    )
++
++    request_id = controller.submit_prefetch_request(PrefetchTaskSpec(key_groups=rows))
++    result = controller.query_prefetch_result(request_id)
++
++    assert result is not None
++    assert [[i for i in range(4) if row.test(i)] for row in result.hit_cells] == [
++        [3],
++        [0, 1, 2, 3],
++    ]
++    superseded_keys = rows[0].keys[:3]
++    # a later touch, as a store of the same chunks makes, leaves them first
++    policy.on_keys_touched(superseded_keys)
++    assert set(policy.get_eviction_candidates(len(superseded_keys))) == set(
++        superseded_keys
++    )
++    dram_l1.finish_read(rows[0].keys[3:] + rows[1].keys)

@@ -35,7 +35,8 @@ class CudaExtension:
         try:
             load(
                 name=cls.OP_NAMESPACE,
-                sources=[str(path) for path in sorted(csrc.glob("*.cu"))],
+                # host-only sources are .cpp, built by the host compiler: nvcc's front end only for the kernels
+                sources=[str(path) for pattern in ("*.cpp", "*.cu") for path in sorted(csrc.glob(pattern))],
                 extra_cuda_cflags=list(cls.CUDA_FLAGS),
                 extra_cflags=list(cls.HOST_FLAGS),
                 extra_ldflags=list(cls.LINK_FLAGS),

@@ -15,10 +15,9 @@ VLLM_OPS_MODULES = ("vllm._C", "vllm._C_stable_libtorch")
 VLLM_PLUGIN_GROUP = "vllm.general_plugins"
 # what each patch of 3rdparty/LMCache adds to a module of the wheel scripts/install.sh verl builds
 LMCACHE_PATCH_ATTRIBUTES = (
-    ("lmcache.v1.distributed.l1_manager", "L1Manager.demote_keys"),
-    ("lmcache.integration.vllm.kv_cache_group_edits", "_SubpagedAttentionViewEdit._apply_fused"),
-    ("lmcache.integration.vllm.lmcache_mp_metadata", "LMCacheMPRequestTracker.account_lookup_result"),
     ("lmcache.integration.vllm.lmcache_mp_connector", "_PinnedStoreOperation"),
+    ("lmcache.v1.distributed.l1_manager.base", "BaseL1Manager.demote_keys"),
+    ("lmcache.integration.vllm.kv_cache_group_edits", "_SubpagedAttentionViewEdit._apply_fused"),
 )
 # LMCache is compiled for a GPU, so an environment installed with NO_GPU=1 has none
 NO_LMCACHE_REASON = "LMCache is compiled for a GPU, which an install with NO_GPU=1 leaves out"
@@ -33,8 +32,8 @@ def test_vllm_ships_its_compiled_operators():
     assert any(importlib.util.find_spec(module) for module in VLLM_OPS_MODULES)
 
 
-def test_vllm_takes_the_mamba_cache_mode_the_model_family_s_config_sets():
-    assert hasattr(EngineArgs, "mamba_cache_mode")
+def test_vllm_takes_the_kv_cache_sizing_the_model_family_s_config_sets():
+    assert hasattr(EngineArgs, "enable_extensible_kv_cache")
 
 
 def test_every_vllm_plugin_of_the_environment_loads_and_pear_s_is_among_them():

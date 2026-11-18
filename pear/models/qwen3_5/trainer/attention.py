@@ -213,7 +213,7 @@ class FullAttention:
         flash_attention._flash_attention_forward = UlyssesPackedAttention.forward
 
         for layer in model.model.language_model.layers:
-            if layer.layer_type == "full_attention":
+            if layer.block_type == "full_attention":
                 attention = layer.self_attn
                 attention.gpu_backend = gpu_backend
 

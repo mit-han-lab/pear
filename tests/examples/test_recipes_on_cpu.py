@@ -10,6 +10,7 @@ from hydra.errors import MissingConfigException
 from omegaconf import DictConfig
 
 from repository import REPO
+from waiting import Waiting
 
 # the general evaluation serves and scores with other programs: it is not one of the family recipes
 EVALUATION_RECIPES = sorted(set((REPO / "examples/eval").glob("eval_*.sh")) - {REPO / "examples/eval/eval_general.sh"})
@@ -39,6 +40,14 @@ STAND_INS = {
     'printf "%s\\n" "$@" "VLLM_NO_USAGE_STATS=$VLLM_NO_USAGE_STATS" >> "$SERVER_LOG"\n',
 }
 WAIT_S = 30  # for a replica to start or to end
+POLL_S = 0.1  # between two looks for a replica
+# the training replicas' settings on a general evaluation server's command line (the model file's MODEL_SERVER_ARGS)
+REPLICA_SETTINGS = (
+    "--prefix-cache-retention-interval None",
+    "--no-enable-extensible-kv-cache",
+    "--no-mm-device-do-normalize",
+    "--no-numa-bind",
+)
 
 
 class ServerRecipeConfig:
@@ -111,6 +120,36 @@ def test_a_signal_to_the_general_evaluation_s_serve_ends_its_replicas(tmp_path):
             time.sleep(0.1)
         with pytest.raises(ProcessLookupError):
             os.kill(pid, 0)
+
+
+@pytest.mark.usefixtures("stand_ins")
+def test_the_general_evaluation_s_replicas_run_with_the_training_replicas_settings(tmp_path):
+    replica_log, pids_file = tmp_path / "replica_log", tmp_path / "replica_pids"
+    # a vLLM server that writes its arguments and its all-reduce switch first, in the training environment the script
+    # puts first on its path
+    vllm = tmp_path / "env/bin/vllm"
+    vllm.write_text(
+        '#!/bin/sh\necho "$* VLLM_ALLREDUCE_USE_FLASHINFER=$VLLM_ALLREDUCE_USE_FLASHINFER" >> "$REPLICA_LOG"\n'
+        'echo $$ >> "$REPLICA_PIDS_FILE"\nexec sleep 600\n'
+    )
+    vllm.chmod(0o755)
+    variables = {"WORK_DIR": str(tmp_path), "VERL_ENV": str(tmp_path / "env"), "LOCAL_DIR": str(tmp_path / "local")}
+    run = {"GPU": "h100", "MODEL": str(tmp_path), "NAME": "model", "RUN": str(tmp_path / "run")}
+    logs = {"REPLICA_LOG": str(replica_log), "REPLICA_PIDS_FILE": str(pids_file)}
+
+    serve = subprocess.Popen(
+        ["bash", "examples/eval/eval_general.sh", "serve"],
+        env={"PATH": f"{tmp_path}/bin:{os.environ['PATH']}", **logs, **variables, **run},
+        cwd=REPO,
+    )
+    Waiting.until(pids_file.exists, WAIT_S, POLL_S)
+    serve.send_signal(signal.SIGTERM)
+    serve.wait(WAIT_S)
+
+    # the model file's arguments of the replicas' settings, and the all-reduce of their runtime env
+    [replica] = replica_log.read_text().splitlines()
+    assert all(f" {setting} " in replica for setting in REPLICA_SETTINGS)
+    assert replica.endswith(" VLLM_ALLREDUCE_USE_FLASHINFER=0")
 
 
 @pytest.mark.usefixtures("stand_ins")

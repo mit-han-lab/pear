@@ -10,5 +10,6 @@ class BlackwellBf16Extension(CudaExtension):
     # the variable of a test build's extra nvcc flags, e.g. -DMK_NEG_ACT=5, a numerical negative control
     EXTRA_FLAGS_ENV = "PEAR_DEPLOY_EXTRA_CUDA_FLAGS"
     # no fast math: the kernel reproduces the lowerings of the kernels it replaces (div.full, ex2.approx, rsqrt.approx)
-    CUDA_FLAGS = ("-O3", "-std=c++17", "-lineinfo") + tuple(os.environ.get(EXTRA_FLAGS_ENV, "").split())
+    # no -std: torch adds the C++ standard its headers need
+    CUDA_FLAGS = ("-O3", "-lineinfo") + tuple(os.environ.get(EXTRA_FLAGS_ENV, "").split())
     LINK_FLAGS = ()

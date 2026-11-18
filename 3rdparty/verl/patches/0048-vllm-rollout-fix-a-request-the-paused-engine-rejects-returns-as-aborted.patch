@@ -1,0 +1,122 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [vllm, rollout] fix: a request the paused engine rejects
+ returns as aborted
+
+From vLLM 0.33 (d5b36699, vllm-project/vllm#51488) pause_generation in abort mode makes the engine reject every new
+request until the resume instead of queueing it (vllm/v1/engine/core.py:2002-2022 and :2456-2469 in 0.34). The
+rejection reaches the request's output stream as RetryableRequestError (vllm/outputs.py:30-35,
+v1/engine/output_processor.py:767-775 and :86-93), and AsyncLLM.generate raises it (async_llm.py:835-841).
+abort_all_requests closes the submission gate before it pauses, and a request that arrives behind the gate waits
+there. A request admitted before the gate closed, though, reaches the engine after the pause when it was still on
+its way there as the gate barrier gave up waiting for it (_GATE_BARRIER_TIMEOUT_S). On vLLM 0.32 such a request
+waited in the engine's queue and ran after the resume; on 0.33 and later the error leaves generate() and fails its
+session, and with it the whole prompt group (verl/trainer/ppo/v1/agent_loop_tq.py:138-148).
+
+generate() now returns that request as aborted, which FullyAsyncLLMServerClient, the client of both v1 async
+trainers, resubmits a second later (verl/workers/rollout/llm_server.py:345-352). In vLLM 0.34 the paused engine's
+rejection is the only RetryableRequestError a generate request can raise: the engine's other request failures finish
+the request with finish_reason "error" and no exception (v1/core/sched/scheduler.py:2619-2645, core.py:2341-2370),
+so the error is caught as a whole. vLLM before 0.32 has no RetryableRequestError, and nothing is caught there.
+---
+ .../test_submitter_gate_on_cpu.py             | 43 +++++++++++++++++++
+ .../rollout/vllm_rollout/vllm_async_server.py | 20 ++++++++-
+ 2 files changed, 62 insertions(+), 1 deletion(-)
+
+diff --git a/tests/workers/rollout/rollout_vllm/test_submitter_gate_on_cpu.py b/tests/workers/rollout/rollout_vllm/test_submitter_gate_on_cpu.py
+index 23f18ec8b64f7361d9bcf0ac31bf5e7263fe2b50..537a68c9e33ed4a5501ad463b06746ddee9f97b9 100644
+--- a/tests/workers/rollout/rollout_vllm/test_submitter_gate_on_cpu.py
++++ b/tests/workers/rollout/rollout_vllm/test_submitter_gate_on_cpu.py
+@@ -222,3 +222,46 @@ def test_barrier_times_out_instead_of_hanging(monkeypatch):
+         assert server.engine.pause_calls == 1, "barrier must proceed rather than deadlock"
+ 
+     asyncio.run(main())
++
++
++def test_a_request_the_paused_engine_rejects_returns_as_aborted(monkeypatch):
++    # a request admitted before the gate closed reaches the engine only after the barrier gave up on it and the engine
++    # paused, which vLLM >= 0.33 answers with RetryableRequestError (vLLM >= 0.32 has the class)
++    pytest.importorskip("vllm", minversion="0.32.0")
++    from omegaconf import OmegaConf
++    from vllm.exceptions import RetryableRequestError
++
++    monkeypatch.setattr(vllm_async_server, "_GATE_BARRIER_TIMEOUT_S", 0.05)
++    runtime_context = SimpleNamespace(get_actor_name=lambda: None)  # outside a Ray actor
++    monkeypatch.setattr(vllm_async_server.ray, "get_runtime_context", lambda: runtime_context)
++
++    async def main():
++        server = _make_server()
++        server._disaggregation_role = "null"
++        server.config = OmegaConf.create(
++            {"max_model_len": 16, "prompt_length": 8, "response_length": 8, "full_determinism": False}
++        )
++        # no LoRA adapter: lora_as_adapter reads the rank and the merge switch of the model config
++        server.model_config = SimpleNamespace(processor=None, lora_rank=0, lora={})
++        on_its_way, arrived = asyncio.Event(), asyncio.Event()
++
++        async def generate(**kwargs):
++            on_its_way.set()
++            await arrived.wait()
++            raise RetryableRequestError("Generation is paused. Please retry after it resumes.")
++            yield  # an async generator, as AsyncLLM.generate is
++
++        server.engine.generate = generate
++        request = asyncio.create_task(server.generate([1, 2, 3], {}, "admitted"))
++        await on_its_way.wait()
++
++        await server.abort_all_requests()
++        arrived.set()
++        output = await asyncio.wait_for(request, timeout=5)
++
++        assert output.stop_reason == "aborted"
++        assert output.token_ids == []
++        assert output.extra_fields["global_steps"] == 7
++        assert server._admitting == 0, "a rejected request no longer counts as an admission"
++
++    asyncio.run(main())
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+index 0c7dd211cc58db0034a4c7308e6ea8e15b8a28fe..dd0eb721a81e67e50d3d8ef9d2f33be899111796 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -72,6 +72,12 @@ from verl.workers.rollout.vllm_rollout.utils import (
+     get_vllm_max_lora_rank,
+ )
+ 
++try:
++    # vLLM >= 0.33 rejects a request that reaches the engine while it is paused with this error, until the resume
++    from vllm.exceptions import RetryableRequestError as _PausedEngineRejection
++except ImportError:  # vLLM < 0.32 has no such error to catch
++    _PausedEngineRejection = ()
++
+ _VLLM_VERSION = version.parse(vllm.__version__)
+ 
+ # Max wait for admissions already past the submission gate to reach the engine.
+@@ -692,6 +698,17 @@ class vLLMHttpServer:
+                         admitted = True
+                         self._admitting -= 1
+                     final_res = output
++            except _PausedEngineRejection:
++                # admitted before the gate closed, the request reached the engine only after the barrier gave up on it
++                # and the pause began: returned as aborted, the partial-rollout client resubmits it after the resume
++                logger.warning("Request %s reached the paused engine, returned as aborted", request_id)
++                return TokenOutput(
++                    token_ids=[],
++                    log_probs=None,
++                    routed_experts=None,
++                    stop_reason="aborted",
++                    extra_fields={"global_steps": self.global_steps},
++                )
+             finally:
+                 if not admitted:
+                     self._admitting -= 1
+@@ -995,7 +1012,8 @@ class vLLMHttpServer:
+             request_ids = list(self.engine.output_processor.request_states.keys())
+ 
+             # pause_generation in abort mode will:
+-            # 1. Set engine to paused state (new requests are accepted but not scheduled)
++            # 1. Set engine to paused state (vLLM < 0.33 accepts new requests but does not
++            #    schedule them; vLLM >= 0.33 rejects them, see generate())
+             # 2. Abort all in-flight requests
+             # 3. Wait for requests to drain
+             # 4. Clear prefix and mm caches if clear_cache=True.

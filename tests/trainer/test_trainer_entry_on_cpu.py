@@ -51,6 +51,8 @@ EVERY_RUN_OVERRIDES = [
     "actor_rollout_ref.rollout.calculate_log_probs=True",
     "+actor_rollout_ref.rollout.engine_kwargs.vllm.disable_log_stats=False",
     "+actor_rollout_ref.rollout.engine_kwargs.vllm.enable_log_requests=False",
+    "+actor_rollout_ref.rollout.engine_kwargs.vllm.prefix_cache_retention_interval='None'",
+    "+actor_rollout_ref.rollout.engine_kwargs.vllm.numa_bind=False",
     "+actor_rollout_ref.rollout.enable_sleep_mode=False",
     "actor_rollout_ref.rollout.free_cache_engine=False",
     "actor_rollout_ref.rollout.checkpoint_engine.backend=nccl",
@@ -73,6 +75,7 @@ EVERY_RUN_OVERRIDES = [
     "+ray_kwargs.ray_init.runtime_env.env_vars.TENSORBOARD_DIR=${run_dir}/tensorboard",
     "+ray_kwargs.ray_init.runtime_env.env_vars.NCCL_LAUNCH_ORDER_IMPLICIT='1'",
     "+ray_kwargs.ray_init.runtime_env.env_vars.NCCL_MNNVL_ENABLE='0'",
+    "+ray_kwargs.ray_init.runtime_env.env_vars.VLLM_ALLREDUCE_USE_FLASHINFER='0'",
     "+ray_kwargs.ray_init.runtime_env.env_vars.TOKENIZERS_PARALLELISM='false'",
 ]
 # what pear/configs/training.yaml adds for a training

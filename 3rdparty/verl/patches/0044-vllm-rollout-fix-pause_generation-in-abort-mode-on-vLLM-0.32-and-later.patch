@@ -1,0 +1,92 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [vllm, rollout] fix: pause_generation in abort mode on vLLM
+ 0.32 and later
+
+vLLM 0.32 removed the deprecated wait_for_inflight_requests keyword of AsyncLLM.pause_generation (276fbcff,
+vllm-project/vllm#60923; vllm/v1/engine/async_llm.py:790-796 in 0.28, :952-957 in 0.32). abort_all_requests passed
+wait_for_inflight_requests=False, so on 0.32 and later it raised TypeError the first time it ran, at the first
+weight sync. From 0.32 on it passes mode="abort", the mode that False selected; older vLLM keeps the old call.
+Upstream made the same change, with this test, in #8390 (f78fd05).
+---
+ .../test_submitter_gate_on_cpu.py             | 21 +++++++++++++++++++
+ .../rollout/vllm_rollout/vllm_async_server.py | 14 ++++++++-----
+ 2 files changed, 30 insertions(+), 5 deletions(-)
+
+diff --git a/tests/workers/rollout/rollout_vllm/test_submitter_gate_on_cpu.py b/tests/workers/rollout/rollout_vllm/test_submitter_gate_on_cpu.py
+index b135020e43590ae48dec5313811a2e3155ec79d9..23f18ec8b64f7361d9bcf0ac31bf5e7263fe2b50 100644
+--- a/tests/workers/rollout/rollout_vllm/test_submitter_gate_on_cpu.py
++++ b/tests/workers/rollout/rollout_vllm/test_submitter_gate_on_cpu.py
+@@ -42,11 +42,13 @@ class _FakeEngine:
+         self.output_processor = SimpleNamespace(request_states={})
+         self.server = None
+         self.pause_calls = 0
++        self.pause_kwargs = []
+         self.resume_calls = 0
+         self.admitting_at_pause = None
+ 
+     async def pause_generation(self, **kwargs):
+         self.pause_calls += 1
++        self.pause_kwargs.append(kwargs)
+         self.admitting_at_pause = self.server._admitting
+ 
+     async def resume_generation(self):
+@@ -88,6 +90,25 @@ def test_abort_does_not_pause_until_inflight_admissions_land():
+     asyncio.run(main())
+ 
+ 
++@pytest.mark.parametrize(
++    ("vllm_version", "expected_kwargs"),
++    [
++        ("0.29.0", {"wait_for_inflight_requests": False, "clear_cache": False}),
++        ("0.32.0", {"mode": "abort", "clear_cache": False}),
++    ],
++)
++def test_abort_uses_compatible_vllm_pause_api(monkeypatch, vllm_version, expected_kwargs):
++    async def main():
++        server = _make_server()
++        monkeypatch.setattr(vllm_async_server, "_VLLM_VERSION", vllm_async_server.version.parse(vllm_version))
++
++        await server.abort_all_requests(reset_prefix_cache=False)
++
++        assert server.engine.pause_kwargs == [expected_kwargs]
++
++    asyncio.run(main())
++
++
+ def test_submission_parks_while_gate_closed_and_wakes_on_resume():
+     async def main():
+         server = _make_server()
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+index 3169e2761ccfe21f8d72e46f294f45ef4f2c1142..0c7dd211cc58db0034a4c7308e6ea8e15b8a28fe 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -994,7 +994,7 @@ class vLLMHttpServer:
+             # Snapshot request IDs before pausing for reporting
+             request_ids = list(self.engine.output_processor.request_states.keys())
+ 
+-            # pause_generation with wait_for_inflight_requests=False will:
++            # pause_generation in abort mode will:
+             # 1. Set engine to paused state (new requests are accepted but not scheduled)
+             # 2. Abort all in-flight requests
+             # 3. Wait for requests to drain
+@@ -1004,10 +1004,14 @@ class vLLMHttpServer:
+             #    MooncakeStoreConnector) is invalidated along with the
+             #    local prefix cache — RL-correct hard-reset at every
+             #    weight update boundary, no extra kwargs needed.
+-            await self.engine.pause_generation(
+-                wait_for_inflight_requests=False,
+-                clear_cache=reset_prefix_cache,
+-            )
++            # vLLM 0.32 removed wait_for_inflight_requests (vllm-project/vllm#60923), whose False was the abort mode
++            if _VLLM_VERSION >= version.parse("0.32.0"):
++                await self.engine.pause_generation(mode="abort", clear_cache=reset_prefix_cache)
++            else:
++                await self.engine.pause_generation(
++                    wait_for_inflight_requests=False,
++                    clear_cache=reset_prefix_cache,
++                )
+ 
+             logger.info(f"Aborted {len(request_ids)} requests: {request_ids}")
+             return {"aborted_count": len(request_ids), "request_ids": request_ids}

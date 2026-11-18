@@ -1,12 +1,13 @@
 import numpy as np
 import torch
-from vllm.utils.torch_utils import canonicalize_singleton_dim_strides, is_quantized_kv_cache
+from vllm.utils.torch_utils import canonicalize_singleton_dim_strides
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionBackend,
     FlashAttentionImpl,
     FlashAttentionMetadataBuilder,
 )
+from vllm.v1.kv_cache_interface import is_quantized_kv_cache
 
 from pear.models.qwen3_5.rollout.hopper.staging import StagedBuffer
 
@@ -52,8 +53,6 @@ class HopperFlashAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
     """vLLM's FlashAttention metadata builder with the attention arguments of a FULL-graph step: its decode rows and
     FA3's part."""
 
-    PAGE = 784  # the KV cache's block size in tokens (csrc/split_attn.cu PAGE)
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.step_buffers = None  # the attention arguments' device buffers, made at the first step that takes them
@@ -78,7 +77,7 @@ class HopperFlashAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
         finally:
             self.aot_schedule = True
 
-        if md.use_cascade or md.mm_prefix_query_range_tensor is not None:
+        if md.mm_prefix_query_range_tensor is not None:
             return super().build(common_prefix_len, m, fast_build=fast_build)
 
         # a pure decode step (vLLM captures the mixed-step graphs at max_query_len = their token count)
@@ -94,7 +93,6 @@ class HopperFlashAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
             and self.headdim == HEAD_DIM
             and self.num_heads_kv == 1
             and self.num_heads_q == QUERY_HEADS
-            and self.block_size == self.PAGE
             and self.kv_cache_dtype == torch.bfloat16
             and m.num_reqs <= min(self.vllm_config.scheduler_config.max_num_seqs, MAX_SEQS)
             and isinstance(m.causal, bool)
@@ -110,7 +108,7 @@ class HopperFlashAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
         n = m.num_reqs
         qsl = m.query_start_loc_cpu[: n + 1].numpy().astype(np.int64)
         qlens = np.diff(qsl)
-        klens = (m._seq_lens_cpu if m._seq_lens_cpu is not None else m.seq_lens.cpu())[:n].numpy().astype(np.int64)
+        klens = m.seq_lens_cpu_upper_bound[:n].numpy().astype(np.int64)  # exact without a drafter
         prefill_rows = np.flatnonzero(qlens != 1)
         num_decode_rows = int(prefill_rows[0]) if len(prefill_rows) else n
 

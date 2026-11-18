@@ -1,0 +1,2069 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [mp] fix: a store's GPU blocks are held until it ends
+
+After LMCache pull request #4955, "fix(mp): preserve and reload KV across preemption"
+(https://github.com/LMCache/LMCache/pull/4955), at its revision 83d9e57a2cc7b81c21a08fc66207452c5612b88f, ported onto
+the commit of UPSTREAM.
+
+In multiprocess mode a non-lazy STORE reads a request's GPU blocks after the forward pass that wrote them, and vLLM
+may free those blocks before the copy is done: when it preempts the request, when align-mode Mamba drops a state
+block the request has moved past (vLLM 0.34 does so every step, and once more when the request finishes, before it
+calls the connector), or when the worker reports a finished request's in-flight stores as done because the server's
+heartbeat lapsed. A freed block can go to another request and be overwritten, and the first request's hashes then
+store the other request's KV or recurrent state; a later prefix hit continues from it. LMCache pull request #5248
+(9a7b6050) waits for in-flight stores before the forward of a step with a preemption, but only up to the
+message-queue timeout and for no other free; #5938 (752e01fd) delays a finished request's free only while a store of
+it is scheduled, after vLLM has already dropped the Mamba blocks; #5886 (30dc05fb) pins only the boundary-state
+blocks of unfull-chunk stores. Each STORE now holds a reference to every block it reads, from the step that schedules
+it until every worker reports it terminal.
+
+What the port takes and changes:
+- The pull request's store lifetime in the connector, the metadata and the adapter, and its tests
+  (tests/v1/test_mp_store_lifetime.py, the operation-level tests of tests/v1/test_vllm_mp_adapter.py), on
+  v0.5.8rc1's API: packed token ids (lmcache.v1.common.token_codec), the transfer context's submit_store without
+  instance_id, and no KV events on the worker: #6122 moved them to the scheduler, so a STORE keeps no events of its
+  own and the worker metadata carries STORE results only.
+- The pull request's reload of a request resumed after a preemption is left out, with its
+  tests/v1/test_mp_preemption_loading.py: #5248 removed the same early return of get_num_new_matched_tokens. So are
+  its return annotations and reformatting of code it does not otherwise change.
+- The operation-level paths of submit_store_request and get_finished are the pull request's, in
+  _submit_store_operation and _get_finished_with_store_operations, so that the request-level bodies, which lazy
+  offload and vLLM's built-in fallback connector still use, stay as v0.5.8rc1 has them; the pull request's error for
+  get_finished under lazy offload is left out. The operation path polls retrieves as v0.5.8rc1's request-level path
+  does (_poll_transfer; a failed retrieve also goes into _failed_request_ids). A STORE operation whose query fails
+  keeps its blocks; one whose result fails is a failed terminal.
+- unregister_kv_caches (#6358) also waits for the operation-level STOREs before the engine releases the KV caches.
+- request_finished no longer delays a non-lazy request's free, since its STOREs hold their own blocks. #5938's
+  store_scheduled flag and its hand-over of delayed requests to the workers stay as v0.5.8rc1 has them; the non-lazy
+  path no longer delays any request through them.
+- The unfull-chunk STOREs of #5886 are pinned like every other STORE: the boundary-state block vLLM offers is one of
+  the STORE's block IDs. The per-request pin (_pinned_boundary_state_blocks, released on a finished_sending report,
+  which the operation path never makes) is removed.
+- update_connector_output requires the GPU block pool only for a report with terminal operations.
+- The pull request's names that are bare adjectives or participles are nouns, or booleans that ask a question
+  (operation_store_lifetime is tracks_store_operations, succeeded is_failed, pinned pinned_operation and the like), its
+  new functions have one-sentence docstrings, and a terminal STORE's result waits the adapter's mq_timeout, not 60 s.
+- The adapter's default stays request-level, so v0.5.8rc1's adapter tests keep testing that path; the pull request's
+  adapter tests run on an adapter built with tracks_store_operations=True (the operation_adapter fixture). Its
+  non-writer rank is made through the is_kv_writer property, which #6125 decides per KV group, and a new test checks
+  that unregistering the KV caches waits for an operation-level STORE.
+- tests/v1/test_mp_connector_kv_roles.py asserts the per-STORE references instead of v0.5.8rc1's delayed free of a
+  finished request with a scheduled store, checks that ranks without a STORE's future still report it terminal, and
+  binds the block pool in its MultiConnector and block-allocation tests as vLLM's scheduler does.
+  tests/v1/test_mp_connector_unfull_chunk.py checks the per-STORE pin of the boundary-state block, also across a
+  preemption, and tests/v1/lazy_offload/test_mp_connector.py's eager keepalive follows the pinned STOREs.
+  tests/v1/lazy_offload/test_worker_adapter.py's adapter, built without its constructor, sets the request-level
+  default of tracks_store_operations, which submit_store_request now reads.
+- tests/v1/test_mp_store_lifetime.py also runs vLLM's own BlockPool: a block vLLM frees while a STORE reads it stays
+  out of the free queue until every rank reports the STORE terminal.
+---
+ .../integration/vllm/lmcache_mp_connector.py  | 185 +++++---
+ .../integration/vllm/lmcache_mp_metadata.py   |  44 +-
+ .../vllm/vllm_multi_process_adapter.py        | 339 +++++++++++++-
+ tests/v1/lazy_offload/test_mp_connector.py    |  15 +-
+ tests/v1/lazy_offload/test_worker_adapter.py  |   2 +
+ tests/v1/test_mp_connector_kv_roles.py        |  60 ++-
+ tests/v1/test_mp_connector_unfull_chunk.py    | 102 +++--
+ tests/v1/test_mp_store_lifetime.py            | 249 +++++++++++
+ tests/v1/test_vllm_mp_adapter.py              | 417 +++++++++++++++++-
+ 9 files changed, 1271 insertions(+), 142 deletions(-)
+ create mode 100644 tests/v1/test_mp_store_lifetime.py
+
+diff --git a/lmcache/integration/vllm/lmcache_mp_connector.py b/lmcache/integration/vllm/lmcache_mp_connector.py
+index 375b8d360171bdddac34f52dc7b1151082b0215e..e2ad48ce1c3c991471004730bd5ffe85fa6909f0 100644
+--- a/lmcache/integration/vllm/lmcache_mp_connector.py
++++ b/lmcache/integration/vllm/lmcache_mp_connector.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ # Standard
+ from collections.abc import Iterable
++from dataclasses import dataclass
+ from typing import TYPE_CHECKING, Any
+ import math
+ import sys
+@@ -591,6 +592,14 @@ def _ensure_transport_scheme(server_url: str) -> str:
+     return f"tcp://{server_url}"
+ 
+ 
++@dataclass(frozen=True)
++class _PinnedStoreOperation:
++    """The GPU blocks one non-lazy STORE reads, held until it is terminal."""
++
++    request_id: str
++    block_ids: tuple[int, ...]
++
++
+ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+     """
+     The connector for LMCache multi-process mode.
+@@ -863,9 +872,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+ 
+             # GPU block pool reference
+             self._gpu_block_pool: "BlockPool | None" = None
+-            # Boundary-state blocks pinned for each request's unfull-chunk
+-            # stores, released once the request's stores finish.
+-            self._pinned_boundary_state_blocks: dict[str, list[int]] = {}
++            self._next_store_op_id = 0
++            self._pinned_store_operations: dict[int, _PinnedStoreOperation] = {}
+         elif self.role == KVConnectorRole.WORKER:
+             # Node routing: a worker connects only to its local LMCache server.
+             # Global ranks are assigned to nodes in contiguous blocks:
+@@ -883,6 +891,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+                 parallel_strategy=parallel_strategy,
+                 extra_config=_worker_extra_config(vllm_config),
+                 required_chunk_alignment=scheduler_block_size,
++                tracks_store_operations=True,
+             )
+             # Requests whose blocks vLLM keeps until they are in finished_sending.
+             self._delay_free_req_ids = set()
+@@ -1178,13 +1187,17 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+         assert isinstance(metadata, LMCacheMPConnectorMetadata)
+ 
+         request_ids = []
++        store_op_ids: list[int | None] = []
+         ops = []
+         cache_salts = []
+         request_configs_list = []
+         for meta in metadata.requests:
+             if meta.direction != "STORE":
+                 continue
++            if not self.lazy_offload and meta.store_op_id is None:
++                raise RuntimeError("non-lazy STORE metadata is missing an operation ID")
+             request_ids.append(meta.request_id)
++            store_op_ids.append(meta.store_op_id)
+             ops.append(meta.op)
+             cache_salts.append(meta.cache_salt)
+             request_configs_list.append(meta.request_configs)
+@@ -1202,6 +1215,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+             event,
+             cache_salts=cache_salts,
+             request_configs_list=request_configs_list,
++            store_op_ids=store_op_ids,
+         )
+         if self.dispatcher is not None:
+             dispatch(self.dispatcher, "wait_for_save", event=event)
+@@ -1288,14 +1302,22 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+         )
+ 
+     def build_connector_worker_meta(self) -> LMCacheMPWorkerMetadata | None:
+-        """Build this step's lazy-offload store results.
++        """Build this step's STORE results.
+ 
+         Returns:
+-            Completion counts and failed request IDs, or None when lazy
+-            offload is disabled or there are no new results.
++            The terminal and failed STORE operations without lazy offload, the
++            completion counts and failed request IDs with it, or None when
++            there are no new results.
+         """
+         if not self.lazy_offload:
+-            return None
++            result = self.worker_adapter.get_completed_store_operations()
++            if result is None:
++                return None
++            terminal_store_operations, failed_store_operations = result
++            return LMCacheMPWorkerMetadata(
++                terminal_store_operations=terminal_store_operations,
++                failed_store_operations=failed_store_operations,
++            )
+         completed_store_requests = self.worker_adapter.get_completed_store_requests()
+         failed_store_requests = self.worker_adapter.get_failed_store_requests()
+         if completed_store_requests or failed_store_requests:
+@@ -1739,21 +1761,60 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+             connector_output (KVConnectorOutput): the worker-side
+                 connectors output.
+         """
+-        # A request's stores are done once its workers report it sent.
+-        for request_id in connector_output.finished_sending or ():
+-            self._release_boundary_state_blocks(request_id)
+-
+-        if not self.lazy_offload:
+-            return
+         meta = connector_output.kv_connector_worker_meta
+         if not isinstance(meta, LMCacheMPWorkerMetadata):
+             return
+-        actions = self._lazy_offload_manager.on_store_results(
+-            meta.failed_store_requests,
+-            meta.completed_store_requests,
++
++        if self.lazy_offload:
++            actions = self._lazy_offload_manager.on_store_results(
++                meta.failed_store_requests,
++                meta.completed_store_requests,
++            )
++            for request_id in actions.sessions_to_end:
++                self.scheduler_adapter.end_session(request_id)
++            return
++
++        if not meta.terminal_store_operations:
++            return
++        if self._gpu_block_pool is None:
++            raise RuntimeError("GPU block pool is not bound")
++
++        unknown_failures = set(meta.failed_store_operations).difference(
++            meta.terminal_store_operations
+         )
+-        for request_id in actions.sessions_to_end:
+-            self.scheduler_adapter.end_session(request_id)
++        if unknown_failures:
++            raise RuntimeError(
++                "STORE failures lack matching terminal worker IDs: "
++                f"{sorted(unknown_failures)}"
++            )
++
++        for store_op_id, terminal_workers in meta.terminal_store_operations.items():
++            pinned_operation = self._pinned_store_operations.get(store_op_id)
++            if pinned_operation is None:
++                raise RuntimeError(
++                    f"unknown or already released STORE operation {store_op_id}"
++                )
++            failed_workers = meta.failed_store_operations.get(store_op_id, set())
++            all_failed_workers = self.scheduler_adapter.update_pending_store_workers(
++                store_op_id,
++                terminal_workers,
++                failed_workers,
++            )
++            if all_failed_workers is None:
++                continue
++
++            del self._pinned_store_operations[store_op_id]
++            self._gpu_block_pool.free_blocks(
++                self._gpu_block_pool.blocks[block_id]
++                for block_id in reversed(pinned_operation.block_ids)
++            )
++            if all_failed_workers:
++                logger.error(
++                    "STORE operation %d for request %s failed on workers %s",
++                    store_op_id,
++                    pinned_operation.request_id,
++                    sorted(all_failed_workers),
++                )
+ 
+     def request_finished(
+         self,
+@@ -1792,11 +1853,6 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+                 "num_lmcache_extra_cached_tokens": max(0, num_lmcache - num_vllm),
+             }
+ 
+-        # Keep the blocks only while a store may still read them. A preempted
+-        # request starts over with a new tracker on its next lookup.
+-        tracker = self.request_trackers.get(request.request_id)
+-        delay_free = tracker is not None and tracker.store_scheduled
+-
+         # Clean up request tracker to prevent memory leak
+         self._cleanup_request_tracker(request.request_id)
+ 
+@@ -1814,18 +1870,12 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+                 self.scheduler_adapter.end_session(request_id)
+             return False, (return_params or None)
+ 
+-        # A request preempted after an unfull-chunk store may store nothing
+-        # after it resumes. Its boundary-state blocks stay pinned until it is
+-        # reported in finished_sending, so it still delays.
+-        delay_free = (
+-            delay_free or request.request_id in self._pinned_boundary_state_blocks
+-        )
+-
+         # Notify LMCache to end the session for this request
+         self.scheduler_adapter.end_session(request.request_id)
+-        if delay_free:
+-            self._delay_free_req_ids.add(request.request_id)
+-        return delay_free, (return_params or None)
++        # Each non-lazy STORE holds references to the blocks it reads until
++        # every worker reports it terminal (_add_store_metadata), so the
++        # request's own references are released at once.
++        return False, (return_params or None)
+ 
+     def request_finished_all_groups(
+         self,
+@@ -1873,15 +1923,16 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+ 
+         Returns:
+             True when scheduler-side lazy offload has submitted stores waiting
+-            for worker completion. Queued stores are intentionally excluded:
++            for worker completion, or when non-lazy STORE operations still own
++            block references. Queued lazy stores are intentionally excluded:
+             they require a model-token step for submission and cannot progress
+-            during a connector-only step. Non-lazy mode uses vLLM's normal
+-            delayed-free path and does not need this keepalive.
++            during a connector-only step.
+         """
+-        if self.role != KVConnectorRole.SCHEDULER or not self.lazy_offload:
++        if self.role != KVConnectorRole.SCHEDULER:
+             return False
+-
+-        return self._lazy_offload_manager.has_inflight_store_work()
++        if self.lazy_offload:
++            return self._lazy_offload_manager.has_inflight_store_work()
++        return bool(self._pinned_store_operations)
+ 
+     @classmethod
+     def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> str | None:
+@@ -2020,7 +2071,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+                 if self.lazy_offload:
+                     self._lazy_offload_manager.add_store_candidate(r_meta)
+                 else:
+-                    metadata.add_request_metadata(r_meta)
++                    self._add_store_metadata(metadata, r_meta)
+                     request_tracker.store_scheduled = True
+             if self._save_unfull_chunk:
+                 self._add_unfull_chunk_stores(
+@@ -2070,7 +2121,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+                 if self.lazy_offload:
+                     self._lazy_offload_manager.add_store_candidate(r_meta)
+                 else:
+-                    metadata.add_request_metadata(r_meta)
++                    self._add_store_metadata(metadata, r_meta)
+                     request_tracker.store_scheduled = True
+             if self._save_unfull_chunk:
+                 self._add_unfull_chunk_stores(
+@@ -2252,7 +2303,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+         For align-mode Mamba groups, a grid unfull chunk's state block is a
+         boundary-state block vLLM offered this step
+         (``boundary_state_offloads``). It is not part of the request's block
+-        table, so it is pinned until the request's stores finish.
++        table, but it is one of the STORE's block IDs, so the STORE pins it
++        with the other blocks it reads (``_add_store_metadata``).
+ 
+         Args:
+             scheduler_output: This step's scheduler output.
+@@ -2272,7 +2324,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+                 boundary_state_blocks.setdefault(boundary, {})[group] = block_id
+         for (
+             r_meta,
+-            boundary_state_block_ids,
++            _boundary_state_block_ids,
+         ) in LMCacheMPRequestMetadata.GetUnfullChunkStoreMetadata(
+             tracker,
+             self.scheduler_adapter.lmcache_tokens_per_chunk,
+@@ -2281,23 +2333,36 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+             boundary_state_blocks,
+             self._boundary_state_groups,
+         ):
+-            if pool is not None and boundary_state_block_ids:
+-                pool.touch(
+-                    [pool.blocks[block_id] for block_id in boundary_state_block_ids]
+-                )
+-                self._pinned_boundary_state_blocks.setdefault(
+-                    tracker.request_id, []
+-                ).extend(boundary_state_block_ids)
+-            metadata.add_request_metadata(r_meta)
++            self._add_store_metadata(metadata, r_meta)
+             tracker.store_scheduled = True
+ 
+-    def _release_boundary_state_blocks(self, request_id: str) -> None:
+-        """Unpin the boundary-state blocks a request's unfull-chunk stores read.
++    def _add_store_metadata(
++        self,
++        connector_metadata: LMCacheMPConnectorMetadata,
++        store_metadata: LMCacheMPRequestMetadata,
++    ) -> None:
++        """Pin the blocks referenced by one non-lazy STORE operation."""
++        if self.lazy_offload:
++            raise RuntimeError("operation-level STORE tracking excludes lazy offload")
++        if store_metadata.direction != "STORE":
++            raise ValueError("only STORE metadata can own GPU block references")
++        if store_metadata.store_op_id is not None:
++            raise ValueError("STORE metadata already has an operation ID")
++        if self._gpu_block_pool is None:
++            raise RuntimeError("GPU block pool must be bound before storing KV")
++
++        block_ids = tuple(dict.fromkeys(store_metadata.op.flat_block_ids))
++        if not block_ids:
++            raise ValueError("STORE metadata must reference at least one GPU block")
++        self._gpu_block_pool.touch(
++            [self._gpu_block_pool.blocks[block_id] for block_id in block_ids]
++        )
+ 
+-        Args:
+-            request_id: The request whose stores finished.
+-        """
+-        block_ids = self._pinned_boundary_state_blocks.pop(request_id, [])
+-        if block_ids and self._gpu_block_pool is not None:
+-            pool = self._gpu_block_pool
+-            pool.free_blocks([pool.blocks[block_id] for block_id in block_ids])
++        store_op_id = self._next_store_op_id
++        self._next_store_op_id += 1
++        store_metadata.store_op_id = store_op_id
++        self._pinned_store_operations[store_op_id] = _PinnedStoreOperation(
++            request_id=store_metadata.request_id,
++            block_ids=block_ids,
++        )
++        connector_metadata.add_request_metadata(store_metadata)
+diff --git a/lmcache/integration/vllm/lmcache_mp_metadata.py b/lmcache/integration/vllm/lmcache_mp_metadata.py
+index 04d71963981d05727deb8ff245f4422f5fae8ff5..1c3f91026976ed9fd7c6c816219f22ba9fb316f0 100644
+--- a/lmcache/integration/vllm/lmcache_mp_metadata.py
++++ b/lmcache/integration/vllm/lmcache_mp_metadata.py
+@@ -319,6 +319,7 @@ class LMCacheMPRequestMetadata:
+     op: LoadStoreOp
+     cache_salt: str = ""
+     request_configs: dict[str, Any] | None = None
++    store_op_id: int | None = None
+ 
+     @staticmethod
+     def GetStoreMetadata(
+@@ -660,6 +661,7 @@ class LMCacheMPConnectorMetadata(KVConnectorMetadata):
+             request_strs.append(
+                 f"RequestMetadata(request_id={req_meta.request_id}, "
+                 f"direction={req_meta.direction}, "
++                f"store_op_id={req_meta.store_op_id}, "
+                 f"num_blocks={len(req_meta.op.flat_block_ids)}, "
+                 f"block_ids={req_meta.op.block_ids})"
+             )
+@@ -678,11 +680,11 @@ class LMCacheMPWorkerMetadata(KVConnectorWorkerMetadata):
+     """Worker -> Scheduler metadata for completed store events.
+ 
+     Attributes:
+-        completed_store_requests: Newly completed stores of this worker, as
+-            ``{request_id: 1}``. ``aggregate()`` sums the counts across the
+-            workers of one step; the scheduler-side manager accumulates
+-            across steps and settles a store only once its count reaches
+-            ``world_size``.
++        completed_store_requests: Newly completed lazy-offload stores of this
++            worker, as ``{request_id: 1}``. ``aggregate()`` sums the counts
++            across the workers of one step; the scheduler-side manager
++            accumulates across steps and settles a store only once its count
++            reaches ``world_size``.
+         failed_store_requests: Requests whose store did not succeed on this
+             worker, either with a failed result or dropped while unhealthy.
+             Their completion receipts are still counted -- the pinned blocks
+@@ -690,10 +692,20 @@ class LMCacheMPWorkerMetadata(KVConnectorWorkerMetadata):
+             breaks the request's stored-prefix chain so later chunks are not
+             stored unreachable. ``aggregate()`` unions the sets: one rank's
+             failure breaks the chain even when the other ranks succeeded.
++        terminal_store_operations: Non-lazy STORE operations this worker no
++            longer reads the source blocks of, as ``{store_op_id: {rank}}``.
++            ``aggregate()`` unions the ranks per operation; the scheduler
++            releases an operation's block references once every rank of the
++            world is terminal.
++        failed_store_operations: The terminal operations of
++            ``terminal_store_operations`` that did not durably store the KV,
++            as ``{store_op_id: {rank}}``; unioned like the terminal ranks.
+     """
+ 
+-    completed_store_requests: dict[str, int]
++    completed_store_requests: dict[str, int] = field(default_factory=dict)
+     failed_store_requests: set[str] = field(default_factory=set)
++    terminal_store_operations: dict[int, set[int]] = field(default_factory=dict)
++    failed_store_operations: dict[int, set[int]] = field(default_factory=dict)
+ 
+     def aggregate(
+         self, other: "KVConnectorWorkerMetadata"
+@@ -705,15 +717,33 @@ class LMCacheMPWorkerMetadata(KVConnectorWorkerMetadata):
+ 
+         Returns:
+             A new metadata whose completion counts are summed per request,
+-            and whose failed-request sets are unioned.
++            whose failed-request sets are unioned, and whose terminal and
++            failed ranks are unioned per STORE operation.
+         """
+         assert isinstance(other, LMCacheMPWorkerMetadata)
+         merged = dict(self.completed_store_requests)
+         for k, v in other.completed_store_requests.items():
+             merged[k] = merged.get(k, 0) + v
++
++        merged_terminal_operations = {
++            store_op_id: set(worker_ids)
++            for store_op_id, worker_ids in self.terminal_store_operations.items()
++        }
++        for store_op_id, worker_ids in other.terminal_store_operations.items():
++            merged_terminal_operations.setdefault(store_op_id, set()).update(worker_ids)
++
++        merged_failed_operations = {
++            store_op_id: set(worker_ids)
++            for store_op_id, worker_ids in self.failed_store_operations.items()
++        }
++        for store_op_id, worker_ids in other.failed_store_operations.items():
++            merged_failed_operations.setdefault(store_op_id, set()).update(worker_ids)
++
+         return LMCacheMPWorkerMetadata(
+             completed_store_requests=merged,
+             failed_store_requests=(
+                 self.failed_store_requests | other.failed_store_requests
+             ),
++            terminal_store_operations=merged_terminal_operations,
++            failed_store_operations=merged_failed_operations,
+         )
+diff --git a/lmcache/integration/vllm/vllm_multi_process_adapter.py b/lmcache/integration/vllm/vllm_multi_process_adapter.py
+index 750ec20717bd4ffc3a7579a37c3f2bf91022656d..99ef1bb1c24e060d200f4c52fb527ef7d7c35d30 100644
+--- a/lmcache/integration/vllm/vllm_multi_process_adapter.py
++++ b/lmcache/integration/vllm/vllm_multi_process_adapter.py
+@@ -528,6 +528,14 @@ RetrieveResult = bool
+ LookupResult = int
+ 
+ 
++@dataclass
++class _PendingStoreFuture:
++    """A submitted STORE operation's future and the request it stores."""
++
++    request_id: str
++    future: MessagingFuture[StoreResult]
++
++
+ class LMCacheMPSchedulerAdapter:
+     def __init__(
+         self,
+@@ -658,6 +666,8 @@ class LMCacheMPSchedulerAdapter:
+         # Events must be reported by all world_size workers before considered complete.
+         self._expected_worker_count = parallel_strategy.vllm_world_size
+         self._store_request_pending_counts: dict[str, int] = {}
++        self._store_operation_terminal_workers: dict[int, set[int]] = {}
++        self._store_operation_failed_workers: dict[int, set[int]] = {}
+ 
+         self._kv_events_enabled = enable_kv_events
+         # Keep the UUID identity in the existing signed-int64 RPC field.
+@@ -1217,6 +1227,46 @@ class LMCacheMPSchedulerAdapter:
+             self._store_request_pending_counts[req_id] = total
+             return False
+ 
++    def update_pending_store_workers(
++        self,
++        store_op_id: int,
++        terminal_workers: set[int],
++        failed_workers: set[int],
++    ) -> set[int] | None:
++        """Add one report of a STORE operation's terminal and failed worker
++        ranks, and return its failed ranks once every rank is terminal, else
++        None."""
++        if not terminal_workers:
++            raise ValueError("terminal_workers must not be empty")
++        if not failed_workers.issubset(terminal_workers):
++            raise ValueError("failed_workers must be a subset of terminal_workers")
++
++        invalid_workers = {
++            worker_id
++            for worker_id in terminal_workers
++            if worker_id < 0 or worker_id >= self._expected_worker_count
++        }
++        if invalid_workers:
++            raise ValueError(
++                "STORE operation reported invalid worker IDs: "
++                f"{sorted(invalid_workers)}"
++            )
++
++        all_terminal_workers = self._store_operation_terminal_workers.setdefault(
++            store_op_id, set()
++        )
++        all_failed_workers = self._store_operation_failed_workers.setdefault(
++            store_op_id, set()
++        )
++        all_terminal_workers.update(terminal_workers)
++        all_failed_workers.update(failed_workers)
++        if len(all_terminal_workers) != self._expected_worker_count:
++            return None
++
++        self._store_operation_terminal_workers.pop(store_op_id, None)
++        self._store_operation_failed_workers.pop(store_op_id, None)
++        return all_failed_workers
++
+     def _mark_lookup_timed_out(self, url: str) -> None:
+         """Log and mark ``url`` unhealthy after an unanswered lookup RPC."""
+         logger.warning(
+@@ -1241,6 +1291,7 @@ class LMCacheMPWorkerAdapter:
+         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
+         extra_config: dict[str, Any] | None = None,
+         required_chunk_alignment: int | None = None,
++        tracks_store_operations: bool = False,
+     ):
+         """Initialize the worker adapter for current or legacy vLLM callers.
+ 
+@@ -1263,6 +1314,9 @@ class LMCacheMPWorkerAdapter:
+                 provided, it overrides ``mq_timeout`` / ``heartbeat_interval``.
+             required_chunk_alignment: Optional model-derived chunk alignment
+                 used to bind or validate the LMCache server chunk size.
++            tracks_store_operations: Whether each non-lazy STORE is tracked by
++                its scheduler-assigned operation ID and ends in the worker
++                metadata; other callers keep the request-level completion.
+ 
+         Raises:
+             TypeError: If the connector argument shape is unsupported.
+@@ -1322,6 +1376,7 @@ class LMCacheMPWorkerAdapter:
+         self._mq_timeout = mq_timeout
+         self._server_url = server_url
+         self._required_chunk_alignment = required_chunk_alignment
++        self.tracks_store_operations = tracks_store_operations
+ 
+         # Instance id for GPU worker. uuid4-derived (OS entropy) rather
+         # than os.getpid() to avoid collision in containerized deployments.
+@@ -1354,6 +1409,7 @@ class LMCacheMPWorkerAdapter:
+ 
+         # Request futures
+         self.store_futures: dict[str, MessagingFuture[StoreResult]] = {}
++        self._store_operation_futures: dict[int, _PendingStoreFuture] = {}
+         # request_id -> (future, block_ids)
+         self.retrieve_futures: dict[
+             str, tuple[MessagingFuture[RetrieveResult], list[int]]
+@@ -1361,6 +1417,7 @@ class LMCacheMPWorkerAdapter:
+         # The IPC handle is not enough by itself; CUDA needs the exporting
+         # event object to stay alive until the consumer is done with it.
+         self.store_events: dict[str, _IpcEvent] = {}
++        self._store_operation_events: dict[int, _IpcEvent] = {}
+         self.retrieve_events: dict[str, _IpcEvent] = {}
+ 
+         # Alternative error reports, drained together by either public getter.
+@@ -1372,6 +1429,7 @@ class LMCacheMPWorkerAdapter:
+         # exactly once, or async loads hang in WAITING_FOR_REMOTE_KVS.
+         self._dropped_retrieves: set[str] = set()
+ 
++        # Request-level STORE completion state used by legacy connectors.
+         # The store requests that have finished execution in LMCache
+         self.finished_stores: set[str] = set()
+         # The finished request ids that are passed via vLLM and also
+@@ -1381,6 +1439,10 @@ class LMCacheMPWorkerAdapter:
+         # Prevents re-reporting the same ID after drain clears tracking sets.
+         self._returned_finished: set[str] = set()
+ 
++        self._pending_store_ops_by_request: dict[str, set[int]] = {}
++        self._engine_finished_store_requests: set[str] = set()
++        self._indeterminate_store_operations: dict[int, str] = {}
++
+         self.model_name = model_name
+         self.parallel_strategy = parallel_strategy
+ 
+@@ -1460,6 +1522,8 @@ class LMCacheMPWorkerAdapter:
+         # or dropped while unhealthy). Reported alongside the completion
+         # receipts so the scheduler can break their stored-prefix chains.
+         self._failed_store_requests: set[str] = set()
++        self._terminal_store_operations: dict[int, set[int]] = {}
++        self._failed_store_operations: dict[int, set[int]] = {}
+ 
+     @property
+     def is_healthy(self) -> bool:
+@@ -1815,6 +1879,8 @@ class LMCacheMPWorkerAdapter:
+         event: _IpcEvent | None,
+         cache_salt: str = "",
+         request_configs: dict[str, Any] | None = None,
++        *,
++        store_op_id: int | None = None,
+     ):
+         """
+         Submit a KV cache store request to LMCache
+@@ -1823,7 +1889,9 @@ class LMCacheMPWorkerAdapter:
+         receipt from this rank: a call that creates no store future (a
+         non-writer rank, or a drop while the server is unhealthy) reports
+         completion immediately, because the scheduler unpins the request's
+-        blocks only after collecting one receipt per worker rank.
++        blocks only after collecting one receipt per worker rank. With
++        ``tracks_store_operations`` and without lazy offload every call
++        reports its ``store_op_id`` terminal exactly once instead.
+ 
+         Args:
+             request_id: The ID of the request
+@@ -1833,13 +1901,22 @@ class LMCacheMPWorkerAdapter:
+             cache_salt: Per-user isolation salt.
+             request_configs: Optional LMCache request configs to include in
+                 the IPC key.
++            store_op_id: Scheduler-assigned identity for a non-lazy STORE.
+ 
+         Raises:
+-            RuntimeError: If the store reaches the server while the KV caches
+-                are unregistered or before they are registered.
++            ValueError: If a tracked STORE's ``store_op_id`` is missing or
++                already pending.
++            RuntimeError: If an untracked store reaches the server while the
++                KV caches are unregistered or before they are registered.
+         """
+         self._ensure_heartbeat_started()
+ 
++        if self.tracks_store_operations and not self.lazy_offload:
++            self._submit_store_operation(
++                request_id, op, event, cache_salt, request_configs, store_op_id
++            )
++            return
++
+         if not self.is_kv_writer:
+             # Every group this rank holds is written by another of its
+             # server's TP ranks; the server would reserve nothing for this STORE.
+@@ -1947,6 +2024,8 @@ class LMCacheMPWorkerAdapter:
+         event: _IpcEvent | None,
+         cache_salts: list[str] | None = None,
+         request_configs_list: list[dict[str, Any] | None] | None = None,
++        *,
++        store_op_ids: list[int | None] | None = None,
+     ):
+         """
+         Submit a batched store request to LMCache
+@@ -1962,9 +2041,12 @@ class LMCacheMPWorkerAdapter:
+                 request_ids.
+             request_configs_list: Optional LMCache request configs, one per
+                 request.
++            store_op_ids: Scheduler-assigned identities, one per STORE.
+         """
+         if cache_salts is None:
+             cache_salts = [""] * len(request_ids)
++        if store_op_ids is None:
++            store_op_ids = [None] * len(request_ids)
+         if request_configs_list is None:
+             request_configs_list = [None] * len(request_ids)
+         if not (
+@@ -1972,13 +2054,19 @@ class LMCacheMPWorkerAdapter:
+             == len(ops)
+             == len(cache_salts)
+             == len(request_configs_list)
++            == len(store_op_ids)
+         ):
+             raise ValueError(
+-                "request_ids, ops, cache_salts, and request_configs_list "
++                "request_ids, ops, cache_salts, request_configs_list, and store_op_ids "
+                 "must have the same length"
+             )
+-        for request_id, op, salt, request_configs in zip(
+-            request_ids, ops, cache_salts, request_configs_list, strict=True
++        for request_id, op, salt, request_configs, store_op_id in zip(
++            request_ids,
++            ops,
++            cache_salts,
++            request_configs_list,
++            store_op_ids,
++            strict=True,
+         ):
+             self.submit_store_request(
+                 request_id,
+@@ -1986,6 +2074,7 @@ class LMCacheMPWorkerAdapter:
+                 event,
+                 cache_salt=salt,
+                 request_configs=request_configs,
++                store_op_id=store_op_id,
+             )
+ 
+     @_lmcache_nvtx_annotate
+@@ -2081,10 +2170,20 @@ class LMCacheMPWorkerAdapter:
+             multiple times in `finished_req_ids_from_engine`. The adapter should
+             take care of deduplicating the request IDs and only return the request
+             IDs that have not been returned before.
++
++            With ``tracks_store_operations`` (and without lazy offload) the
++            first set is always empty: STORE completion reaches the scheduler
++            through the worker metadata of
++            :meth:`get_completed_store_operations` instead.
+         """
+         if self.dispatcher is not None:
+             dispatch(self.dispatcher, "reclaim")
+ 
++        if self.tracks_store_operations and not self.lazy_offload:
++            return self._get_finished_with_store_operations(
++                finished_req_ids_from_engine
++            )
++
+         # If unhealthy, drain all pending futures immediately
+         if not self.is_healthy:
+             finished_stores = set(self.store_futures.keys())
+@@ -2319,6 +2418,21 @@ class LMCacheMPWorkerAdapter:
+         self._completed_store_requests = {}
+         return completed_store_requests
+ 
++    def get_completed_store_operations(
++        self,
++    ) -> tuple[dict[int, set[int]], dict[int, set[int]]] | None:
++        """Drain the terminal and the failed ranks of the STORE operations that
++        ended since the previous call, keyed by operation, or None when none
++        did."""
++        self._poll_store_operations()
++        if not self._terminal_store_operations:
++            return None
++        terminal_store_operations = self._terminal_store_operations
++        failed_store_operations = self._failed_store_operations
++        self._terminal_store_operations = {}
++        self._failed_store_operations = {}
++        return terminal_store_operations, failed_store_operations
++
+     def get_failed_store_requests(self) -> set[str] | None:
+         """Return the requests whose store failed since the last call.
+ 
+@@ -2462,6 +2576,10 @@ class LMCacheMPWorkerAdapter:
+         """
+         futures = [
+             *self.store_futures.values(),
++            *(
++                pending_store.future
++                for pending_store in self._store_operation_futures.values()
++            ),
+             *(future for future, _block_ids in self.retrieve_futures.values()),
+         ]
+         deadline = time.monotonic() + self._mq_timeout
+@@ -2526,3 +2644,212 @@ class LMCacheMPWorkerAdapter:
+             cache_salt=cache_salt,
+             request_configs=request_configs,
+         )
++
++    def _submit_store_operation(
++        self,
++        request_id: str,
++        op: LoadStoreOp,
++        event: _IpcEvent | None,
++        cache_salt: str,
++        request_configs: dict[str, Any] | None,
++        store_op_id: int | None,
++    ) -> None:
++        """Submit one operation-level STORE (see ``submit_store_request``)."""
++        if store_op_id is None:
++            raise ValueError("operation-level STORE requires store_op_id")
++        if (
++            store_op_id in self._store_operation_futures
++            or store_op_id in self._indeterminate_store_operations
++        ):
++            raise ValueError(f"duplicate pending store_op_id {store_op_id}")
++        self._pending_store_ops_by_request.setdefault(request_id, set()).add(
++            store_op_id
++        )
++
++        if not self.is_kv_writer:
++            self._record_store_terminal(store_op_id, request_id, is_failed=False)
++            return
++
++        if not self.is_healthy:
++            self._record_store_terminal(store_op_id, request_id, is_failed=True)
++            return
++
++        key = self._create_key(
++            op.token_bytes,
++            op.start,
++            op.end,
++            request_id=request_id,
++            cache_salt=cache_salt,
++            request_configs=request_configs,
++        )
++        transfer_ctx = self.transfer_ctx
++        if transfer_ctx is None:
++            logger.error(
++                "STORE operation %d cannot start for request_id=%s because "
++                "the transfer context is not initialized",
++                store_op_id,
++                request_id,
++            )
++            self._record_store_terminal(store_op_id, request_id, is_failed=True)
++            return
++        if event is not None:
++            self._store_operation_events[store_op_id] = event
++        try:
++            future = transfer_ctx.submit_store(
++                request_id,
++                key,
++                self.kv_caches,
++                self._block_ids_per_group(op),
++                event,
++                self.blocks_in_chunk,
++            )
++        except Exception:
++            logger.exception(
++                "STORE operation %d for request_id=%s has indeterminate "
++                "submission state; retaining its GPU block references",
++                store_op_id,
++                request_id,
++            )
++            self._indeterminate_store_operations[store_op_id] = request_id
++            raise
++        self._store_operation_futures[store_op_id] = _PendingStoreFuture(
++            request_id,
++            future,
++        )
++
++    def _get_finished_with_store_operations(
++        self,
++        finished_req_ids_from_engine: set[str],
++    ) -> tuple[set[str], set[str]]:
++        """Poll the STORE operations and the asynchronous retrieves, and return no
++        finished STORE (operations end through the worker metadata) and the
++        finished retrieves."""
++        self._engine_finished_store_requests.update(finished_req_ids_from_engine)
++        self._poll_store_operations()
++
++        finished_retrieves: set[str] = set()
++        if not self.is_healthy:
++            for request_id, (
++                _r_future,
++                r_block_ids,
++            ) in self.retrieve_futures.items():
++                finished_retrieves.add(request_id)
++                self.error_block_ids.update(r_block_ids)
++                self._failed_request_ids.add(request_id)
++            self.retrieve_futures.clear()
++            self.retrieve_events.clear()
++        else:
++            for request_id, (r_future, r_block_ids) in self.retrieve_futures.items():
++                is_done, r_result = _poll_transfer(request_id, r_future)
++                if not is_done:
++                    continue
++
++                finished_retrieves.add(request_id)
++
++                if not r_result:
++                    self.error_block_ids.update(r_block_ids)
++                    self._failed_request_ids.add(request_id)
++                    logger.error(
++                        "Something went wrong when processing the "
++                        "retrieve request for request_id=%s, result=%s",
++                        request_id,
++                        r_result,
++                    )
++            for request_id in finished_retrieves:
++                self.retrieve_futures.pop(request_id, None)
++                self.retrieve_events.pop(request_id, None)
++
++        # Retrieves dropped while unhealthy still must be reported, exactly
++        # once, or async loads hang in WAITING_FOR_REMOTE_KVS. Swap-drain so a
++        # concurrent submit_retrieve_request add is never lost.
++        dropped_retrieves = self._dropped_retrieves
++        self._dropped_retrieves = set()
++        finished_retrieves.update(dropped_retrieves)
++        self._finish_operation_store_telemetry()
++        return set(), finished_retrieves
++
++    def _record_store_terminal(
++        self,
++        store_op_id: int,
++        request_id: str,
++        *,
++        is_failed: bool,
++    ) -> None:
++        """Record this worker's rank as terminal for one STORE operation, and as
++        failed when the STORE did not store the KV."""
++        if store_op_id in self._terminal_store_operations:
++            raise RuntimeError(f"STORE operation {store_op_id} completed twice")
++
++        worker_id = self.parallel_strategy.vllm_worker_id
++        self._terminal_store_operations[store_op_id] = {worker_id}
++        if is_failed:
++            self._failed_store_operations[store_op_id] = {worker_id}
++
++        request_operations = self._pending_store_ops_by_request.get(request_id)
++        if request_operations is not None:
++            request_operations.discard(store_op_id)
++            if not request_operations:
++                self._pending_store_ops_by_request.pop(request_id, None)
++
++    def _poll_store_operations(self) -> None:
++        """Record the STORE operations whose futures ended as terminal, and keep
++        the ones whose state cannot be read."""
++        terminal_store_op_ids: set[int] = set()
++        for store_op_id, pending_store in list(self._store_operation_futures.items()):
++            try:
++                is_terminal = pending_store.future.query()
++            except Exception:
++                logger.exception(
++                    "Cannot prove STORE operation %d terminal for request_id=%s; "
++                    "retaining its GPU block references",
++                    store_op_id,
++                    pending_store.request_id,
++                )
++                continue
++            if not is_terminal:
++                continue
++
++            try:
++                # the future is done: the timeout only bounds a broken one
++                is_stored = bool(pending_store.future.result(timeout=self._mq_timeout))
++            except Exception:
++                logger.exception(
++                    "Terminal STORE operation %d failed for request_id=%s",
++                    store_op_id,
++                    pending_store.request_id,
++                )
++                is_stored = False
++            if not is_stored:
++                logger.error(
++                    "STORE operation %d was not durable for request_id=%s",
++                    store_op_id,
++                    pending_store.request_id,
++                )
++            self._record_store_terminal(
++                store_op_id,
++                pending_store.request_id,
++                is_failed=not is_stored,
++            )
++            terminal_store_op_ids.add(store_op_id)
++
++        for store_op_id in terminal_store_op_ids:
++            self._store_operation_futures.pop(store_op_id, None)
++            self._store_operation_events.pop(store_op_id, None)
++
++    def _finish_operation_store_telemetry(self) -> None:
++        """Report the store telemetry of the engine-finished requests that have
++        no STORE operation left."""
++        finished_request_ids = {
++            request_id
++            for request_id in self._engine_finished_store_requests
++            if request_id not in self._pending_store_ops_by_request
++        }
++        if not finished_request_ids:
++            return
++        self._engine_finished_store_requests.difference_update(finished_request_ids)
++        self.request_telemetry.on_request_store_finished(
++            request_ids_set=finished_request_ids,
++            model_name=self.model_name,
++            world_size=self.world_size,
++            kv_rank=self.worker_id,
++        )
+diff --git a/tests/v1/lazy_offload/test_mp_connector.py b/tests/v1/lazy_offload/test_mp_connector.py
+index e887ab6773c6f01a0871672eba67269737283125..49f94c98a83be7ee622c603b9ac966988b30bc2e 100644
+--- a/tests/v1/lazy_offload/test_mp_connector.py
++++ b/tests/v1/lazy_offload/test_mp_connector.py
+@@ -28,6 +28,7 @@ from lmcache.integration.vllm.lazy_offload_manager import (  # noqa: E402
+ from lmcache.integration.vllm.lmcache_mp_connector import (  # noqa: E402
+     KVConnectorRole,
+     LMCacheMPConnector,
++    _PinnedStoreOperation,
+ )
+ from lmcache.integration.vllm.lmcache_mp_metadata import (  # noqa: E402
+     LMCacheMPConnectorMetadata,
+@@ -646,16 +647,24 @@ def test_keepalive_follows_the_managers_inflight_stores() -> None:
+     assert harness.connector.has_pending_push_work() is True
+ 
+ 
+-def test_eager_mode_needs_no_keepalive() -> None:
+-    """Without lazy offload the connector uses vLLM's normal delayed-free path, so it
+-    must never hold the engine awake.
++def test_eager_mode_keepalive_follows_the_pinned_stores() -> None:
++    """Without lazy offload each STORE holds its own block references until every
++    worker reports it terminal; those operations, never the manager, hold the engine
++    awake.
+     """
+     harness = _make_connector()
+     harness.manager.inflight_store_work = True
+     harness.connector.lazy_offload = False
++    harness.connector._pinned_store_operations = {}
+ 
+     assert harness.connector.has_pending_push_work() is False
+ 
++    harness.connector._pinned_store_operations = {
++        0: _PinnedStoreOperation(request_id="req", block_ids=(1, 2))
++    }
++
++    assert harness.connector.has_pending_push_work() is True
++
+ 
+ def test_worker_role_needs_no_keepalive() -> None:
+     """The keepalive is a scheduler-side decision; the worker half has no manager to
+diff --git a/tests/v1/lazy_offload/test_worker_adapter.py b/tests/v1/lazy_offload/test_worker_adapter.py
+index c3f6e8ece83a57d4e448933db7fb80c4ac4145fc..22c8aa3e83948ec89a0cf7a2a0d770c4ee155f73 100644
+--- a/tests/v1/lazy_offload/test_worker_adapter.py
++++ b/tests/v1/lazy_offload/test_worker_adapter.py
+@@ -42,6 +42,8 @@ def _make_worker_adapter(
+     """Build an adapter with only the attributes the tested paths read."""
+     adapter = LMCacheMPWorkerAdapter.__new__(LMCacheMPWorkerAdapter)
+     adapter.lazy_offload = lazy_offload
++    # The request-level store path, the adapter's default.
++    adapter.tracks_store_operations = False
+     adapter.dispatcher = None
+     adapter._health_event = threading.Event()
+     if healthy:
+diff --git a/tests/v1/test_mp_connector_kv_roles.py b/tests/v1/test_mp_connector_kv_roles.py
+index 5fec6fbc4bbf0c57a9612b6d1ffab1c205e186b4..c8b82d841c947f3af7d022938c9b285a62fc0272 100644
+--- a/tests/v1/test_mp_connector_kv_roles.py
++++ b/tests/v1/test_mp_connector_kv_roles.py
+@@ -140,6 +140,8 @@ def mock_io(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+     """Stub transport, telemetry and GPU resources, keeping worker logic real."""
+     scheduler = MagicMock(lmcache_tokens_per_chunk=4)
+     scheduler.check_lookup_result.return_value = 0
++    # One worker: its terminal report settles a STORE operation, with no failure.
++    scheduler.update_pending_store_workers.return_value = set()
+     transfer = MagicMock()
+     transfer.create_recorded_event.return_value = None
+     for submit in (transfer.submit_store, transfer.submit_retrieve):
+@@ -317,12 +319,14 @@ def test_chunked_prefill_stores_and_completion(
+         assert not any(worker.get_finished(set()))
+ 
+     mock_io.scheduler.cleanup_lookup_result.reset_mock()
+-    assert scheduler.request_finished(request, [1, 2, 3]) == (
+-        can_store and not lazy_offload,
+-        None,
+-    )
++    assert scheduler.request_finished(request, [1, 2, 3]) == (False, None)
+     assert scheduler.request_trackers == {}
+     mock_io.scheduler.cleanup_lookup_result.assert_called_once_with("request")
++    if not lazy_offload:
++        # The three STOREs still hold their blocks, one touch each.
++        assert scheduler.has_pending_push_work() is can_store
++        assert mock_io.pool.touch.call_count == (3 if can_store else 0)
++        mock_io.pool.free_blocks.assert_not_called()
+ 
+     if lazy_offload:
+         # A later token step drains a writer's completed request, never a consumer's.
+@@ -348,9 +352,9 @@ def test_chunked_prefill_stores_and_completion(
+         worker.bind_connector_metadata(metadata)
+         worker.wait_for_save()
+     else:
+-        # The next step's metadata carries the request_finished decision.
++        # No request delays its free: its STOREs hold their own blocks.
+         metadata = scheduler.build_connector_meta(_schedule())
+-        assert metadata.delay_free_req_ids == ({"request"} if can_store else set())
++        assert metadata.delay_free_req_ids == set()
+         worker.bind_connector_metadata(metadata)
+         worker.start_load_kv(MagicMock())
+ 
+@@ -358,14 +362,14 @@ def test_chunked_prefill_stores_and_completion(
+     mock_io.telemetry.on_request_store_finished.assert_not_called()
+     mock_io.transfer.submit_store.return_value.query.return_value = True
+     sending, receiving = worker.get_finished({"request"})
+-    assert (sending or set()) == (
+-        {"request"} if can_store and not lazy_offload else set()
+-    )
++    assert not sending
+     assert not receiving
+     scheduler.update_connector_output(
+         KVConnectorOutput(kv_connector_worker_meta=worker.build_connector_worker_meta())
+     )
+     assert not scheduler.has_pending_push_work()
++    if not lazy_offload:
++        assert mock_io.pool.free_blocks.call_count == (3 if can_store else 0)
+     mock_io.scheduler.end_session.assert_called_once_with("request")
+     assert mock_io.transfer.submit_store.call_count == (
+         (1 if lazy_offload else 3) if can_store else 0
+@@ -630,14 +634,14 @@ def test_reload_after_preemption_is_not_reported_as_sending(
+ @pytest.mark.parametrize("kv_role", ["kv_both"])
+ @pytest.mark.parametrize("lazy_offload", [False])
+ @pytest.mark.parametrize("dropped_by", ["non_writer", "unhealthy"])
+-def test_delayed_request_is_reported_by_ranks_without_its_store(
++def test_store_is_reported_terminal_by_ranks_without_its_future(
+     connectors: tuple[LMCacheMPConnector, LMCacheMPConnector],
+     mock_io: SimpleNamespace,
+     monkeypatch: pytest.MonkeyPatch,
+     dropped_by: str,
+ ) -> None:
+-    """vLLM frees a delayed request once every rank reports it, including
+-    ranks that never created its store future."""
++    """A STORE's blocks are released once every rank reports it terminal,
++    including ranks that never created its store future."""
+     scheduler, worker = connectors
+     request = _request()
+     assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+@@ -661,13 +665,20 @@ def test_delayed_request_is_reported_by_ranks_without_its_store(
+     worker.wait_for_save()
+     mock_io.transfer.submit_store.assert_not_called()
+ 
+-    assert scheduler.request_finished(request, [1]) == (True, None)
+-    metadata = scheduler.build_connector_meta(_schedule())
+-    assert metadata.delay_free_req_ids == {"request"}
+-    worker.bind_connector_metadata(metadata)
+-    worker.start_load_kv(MagicMock())
+-    assert worker.get_finished({"request"}) == ({"request"}, set())
+-    assert not any(worker.get_finished({"request"}))
++    assert scheduler.request_finished(request, [1]) == (False, None)
++    assert scheduler.has_pending_push_work()
++    assert worker.get_finished({"request"}) == (set(), set())
++    worker_meta = worker.build_connector_worker_meta()
++    assert worker_meta is not None
++    assert worker_meta.terminal_store_operations == {0: {0}}
++    assert worker_meta.failed_store_operations == (
++        {0: {0}} if dropped_by == "unhealthy" else {}
++    )
++    scheduler.update_connector_output(
++        KVConnectorOutput(kv_connector_worker_meta=worker_meta)
++    )
++    mock_io.pool.free_blocks.assert_called_once()
++    assert not scheduler.has_pending_push_work()
+ 
+ 
+ @pytest.mark.parametrize("mp_role", ["kv_both", "kv_consumer"])
+@@ -721,6 +732,8 @@ def test_multi_connector_child_role_and_completion(
+     )
+     scheduler = MultiConnector(config, KVConnectorRole.SCHEDULER, None)
+     worker = MultiConnector(config, KVConnectorRole.WORKER, None)
++    # vLLM's scheduler binds its block pool, which MultiConnector forwards.
++    scheduler.bind_gpu_block_pool(mock_io.pool)
+     worker.register_kv_caches(mock_io.kv_caches)
+     request = _request()
+     assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+@@ -735,16 +748,15 @@ def test_multi_connector_child_role_and_completion(
+     worker.bind_connector_metadata(metadata)
+     worker.wait_for_save()
+     assert mock_io.transfer.submit_store.call_count == int(can_store)
++    # The LMCache child never delays the free: its STORE holds its own blocks.
+     assert scheduler.request_finished(request, [1]) == (
+-        can_store or peer_delays_free,
++        peer_delays_free,
+         {"remote_engine_id": "peer"},
+     )
+     worker.bind_connector_metadata(scheduler.build_connector_meta(_schedule()))
+     worker.start_load_kv(MagicMock())
+     sending, receiving = worker.get_finished({"request"})
+-    assert (sending or set()) == (
+-        {"request"} if can_store and not peer_delays_free else set()
+-    )
++    assert not sending
+     assert not receiving
+     sending, receiving = worker.get_finished(set())
+     assert (sending or set()) == ({"request"} if peer_delays_free else set())
+@@ -976,6 +988,8 @@ def test_block_allocation_records_carry_key_token_ids(
+         KVTransferConfig(kv_connector="LMCacheMPConnector", kv_role="kv_both")
+     )
+     connector = LMCacheMPConnector(config, KVConnectorRole.SCHEDULER)
++    # The steps below schedule STOREs, which pin their blocks in the pool.
++    connector.bind_gpu_block_pool(mock_io.pool)
+     try:
+         assert connector.get_num_new_matched_tokens(request, 0) == (0, False)
+         connector.update_state_after_alloc(
+diff --git a/tests/v1/test_mp_connector_unfull_chunk.py b/tests/v1/test_mp_connector_unfull_chunk.py
+index f3fb5945ee0060974f2fd61d20e4ded3a62ab6f7..10839b8eb2f512aa2f8cc7f3bab7e42aa861ad16 100644
+--- a/tests/v1/test_mp_connector_unfull_chunk.py
++++ b/tests/v1/test_mp_connector_unfull_chunk.py
+@@ -22,6 +22,7 @@ from lmcache.integration.vllm.lmcache_mp_metadata import (  # noqa: E402
+     LMCacheMPRequestMetadata,
+     LMCacheMPRequestState,
+     LMCacheMPRequestTracker,
++    LMCacheMPWorkerMetadata,
+ )
+ 
+ CHUNK = 128
+@@ -209,60 +210,41 @@ def test_retrieve_of_a_tail_vllm_partly_holds_skips_vllms_tokens():
+     )
+ 
+ 
+-def test_boundary_state_block_is_pinned_until_the_request_is_sent():
+-    connector, _ = _connector(lookup_hit=0)
+-    pool = MagicMock()
+-    pool.blocks = {BOUNDARY_STATE_BLOCK: "boundary-state-block"}
++def test_boundary_state_block_is_pinned_until_the_store_ends():
++    connector, scheduler_adapter = _connector(lookup_hit=0)
++    pool = _pool()
+     connector._gpu_block_pool = pool
+     connector._boundary_state_groups = [1]
+-    connector._pinned_boundary_state_blocks = {}
+     connector._group_tokens_per_block = GROUP_TOKENS_PER_BLOCK
+     connector._unfull_chunk_grid = GRID
+     tracker = _tracker()
+     tracker.increase_num_scheduled_tokens(PROMPT)
+-    scheduler_output = SimpleNamespace(
+-        kv_connector_block_state=SimpleNamespace(
+-            boundary_state_offloads={
+-                "req-0": [(1, BOUNDARY_STATE_BLOCK, TAIL_BOUNDARY)]
+-            }
+-        )
+-    )
+     metadata = MagicMock()
+ 
+-    connector._add_unfull_chunk_stores(scheduler_output, tracker, metadata)
++    connector._add_unfull_chunk_stores(_boundary_state_offload(), tracker, metadata)
+ 
+     (r_meta,), _ = metadata.add_request_metadata.call_args
+     assert r_meta.op.end == TAIL_BOUNDARY
+-    pool.touch.assert_called_once_with(["boundary-state-block"])
+-    connector.update_connector_output(
+-        SimpleNamespace(
+-            kv_cache_events=None,
+-            kv_connector_worker_meta=None,
+-            finished_sending={"req-0"},
+-        )
+-    )
+-    pool.free_blocks.assert_called_once_with(["boundary-state-block"])
++    # The STORE pins every block it reads, the boundary-state block included.
++    store_block_ids = [*range(16, 21), BOUNDARY_STATE_BLOCK]
++    pool.touch.assert_called_once_with([pool.blocks[i] for i in store_block_ids])
++    pool.free_blocks.assert_not_called()
++    _report_terminal(connector, r_meta.store_op_id)
++    assert list(pool.free_blocks.call_args.args[0]) == [
++        pool.blocks[i] for i in reversed(store_block_ids)
++    ]
++    scheduler_adapter.update_pending_store_workers.assert_called_once()
+ 
+ 
+-def test_pinned_boundary_state_block_is_released_after_a_preemption():
++def test_boundary_state_block_pinned_before_a_preemption_is_held_by_its_store():
+     """A request stores its tail, is preempted, then hits the whole tail and
+-    stores nothing more. It still delays its free, so the block it pinned
+-    before the preemption is released when it is reported sent."""
++    stores nothing more. It does not delay its free: the STORE it made before
++    the preemption holds the boundary-state block until the STORE ends."""
+     connector, scheduler_adapter = _connector(lookup_hit=2 * CHUNK)
+-    pool = MagicMock()
+-    pool.blocks = {BOUNDARY_STATE_BLOCK: "boundary-state-block"}
++    pool = _pool()
+     connector._gpu_block_pool = pool
+     connector._boundary_state_groups = [1]
+-    connector._pinned_boundary_state_blocks = {}
+     connector._group_tokens_per_block = GROUP_TOKENS_PER_BLOCK
+-    connector._delay_free_req_ids = set()
+-    scheduler_output = SimpleNamespace(
+-        kv_connector_block_state=SimpleNamespace(
+-            boundary_state_offloads={
+-                "req-0": [(1, BOUNDARY_STATE_BLOCK, TAIL_BOUNDARY)]
+-            }
+-        )
+-    )
+     request = _request()
+     for status, hit in (
+         (RequestStatus.WAITING, 2 * CHUNK),
+@@ -275,24 +257,58 @@ def test_pinned_boundary_state_block_is_released_after_a_preemption():
+         tracker.append_block_ids((list(range(-(-PROMPT // 16))), MAMBA_BLOCKS))
+         tracker.increase_num_scheduled_tokens(PROMPT - hit)
+         tracker.state = LMCacheMPRequestState.READY
+-        connector._add_unfull_chunk_stores(scheduler_output, tracker, MagicMock())
++        connector._add_unfull_chunk_stores(
++            _boundary_state_offload(), tracker, MagicMock()
++        )
++
++    assert list(connector._pinned_store_operations) == [0]
++    assert connector.request_finished(request, []) == (False, None)
++    pool.free_blocks.assert_not_called()
++    _report_terminal(connector, 0)
++    assert pool.blocks[BOUNDARY_STATE_BLOCK] in list(pool.free_blocks.call_args.args[0])
++    assert connector._pinned_store_operations == {}
++
++
++def _pool() -> MagicMock:
++    """A block pool whose blocks the tail STOREs read can be looked up."""
++    pool = MagicMock()
++    pool.blocks = {
++        block_id: f"block-{block_id}"
++        for block_id in (*range(16, 21), BOUNDARY_STATE_BLOCK)
++    }
++    return pool
++
++
++def _boundary_state_offload() -> SimpleNamespace:
++    """A scheduler output offering the tail's boundary-state block."""
++    return SimpleNamespace(
++        kv_connector_block_state=SimpleNamespace(
++            boundary_state_offloads={
++                "req-0": [(1, BOUNDARY_STATE_BLOCK, TAIL_BOUNDARY)]
++            }
++        )
++    )
++
+ 
+-    assert not tracker.store_scheduled
+-    assert connector.request_finished(request, []) == (True, None)
++def _report_terminal(connector: LMCacheMPConnector, store_op_id: int) -> None:
++    """Report one STORE terminal on the single worker rank."""
+     connector.update_connector_output(
+         SimpleNamespace(
+             kv_cache_events=None,
+-            kv_connector_worker_meta=None,
+-            finished_sending={"req-0"},
++            kv_connector_worker_meta=LMCacheMPWorkerMetadata(
++                terminal_store_operations={store_op_id: {0}}
++            ),
++            finished_sending=None,
+         )
+     )
+-    pool.free_blocks.assert_called_once_with(["boundary-state-block"])
+ 
+ 
+ def _connector(lookup_hit: int) -> tuple[LMCacheMPConnector, MagicMock]:
+     scheduler_adapter = MagicMock()
+     scheduler_adapter.lmcache_tokens_per_chunk = CHUNK
+     scheduler_adapter.check_lookup_result.return_value = lookup_hit
++    # One worker: its terminal report settles a STORE, with no failure.
++    scheduler_adapter.update_pending_store_workers.return_value = set()
+     connector = LMCacheMPConnector.__new__(LMCacheMPConnector)
+     connector.request_trackers = {}
+     connector.scheduler_adapter = scheduler_adapter
+@@ -302,6 +318,8 @@ def _connector(lookup_hit: int) -> tuple[LMCacheMPConnector, MagicMock]:
+     connector._unfull_chunk_grid = GRID
+     connector._connector_stats = MagicMock()
+     connector.lazy_offload = False
++    connector._next_store_op_id = 0
++    connector._pinned_store_operations = {}
+     return connector, scheduler_adapter
+ 
+ 
+diff --git a/tests/v1/test_mp_store_lifetime.py b/tests/v1/test_mp_store_lifetime.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f1c8042dfb76f1acff75546262b123909dcc149e
+--- /dev/null
++++ b/tests/v1/test_mp_store_lifetime.py
+@@ -0,0 +1,249 @@
++# SPDX-License-Identifier: Apache-2.0
++# Standard
++from types import SimpleNamespace
++from unittest.mock import MagicMock
++
++# Third Party
++import pytest
++
++pytest.importorskip("vllm", reason="MP connector imports vLLM at module top")
++
++# Third Party
++from vllm.distributed.kv_transfer.kv_connector.v1.base import (  # noqa: E402
++    KVConnectorRole,
++)
++from vllm.v1.core.block_pool import BlockPool  # noqa: E402
++
++# First Party
++from lmcache.integration.vllm.lmcache_mp_connector import (  # noqa: E402
++    LMCacheMPConnector,
++)
++from lmcache.integration.vllm.lmcache_mp_metadata import (  # noqa: E402
++    LMCacheMPConnectorMetadata,
++    LMCacheMPRequestMetadata,
++    LMCacheMPWorkerMetadata,
++)
++from lmcache.integration.vllm.vllm_multi_process_adapter import (  # noqa: E402
++    LMCacheMPSchedulerAdapter,
++    LoadStoreOp,
++)
++from lmcache.v1.common.token_codec import pack_token_ids  # noqa: E402
++
++
++def _store_metadata(request_id: str, block_ids: list[int]) -> LMCacheMPRequestMetadata:
++    return LMCacheMPRequestMetadata(
++        request_id=request_id,
++        direction="STORE",
++        op=LoadStoreOp(
++            token_bytes=pack_token_ids(range(256)),
++            block_ids=[block_ids],
++            start=0,
++            end=256,
++        ),
++    )
++
++
++def _connector_output(meta: LMCacheMPWorkerMetadata) -> SimpleNamespace:
++    return SimpleNamespace(kv_cache_events=None, kv_connector_worker_meta=meta)
++
++
++def _bare_scheduler_adapter(expected_workers: int) -> LMCacheMPSchedulerAdapter:
++    adapter = object.__new__(LMCacheMPSchedulerAdapter)
++    adapter._expected_worker_count = expected_workers
++    adapter._store_operation_terminal_workers = {}
++    adapter._store_operation_failed_workers = {}
++    return adapter
++
++
++def _bare_connector_with_pool(
++    pool: object, expected_workers: int
++) -> LMCacheMPConnector:
++    connector = object.__new__(LMCacheMPConnector)
++    connector._role = KVConnectorRole.SCHEDULER
++    connector.lazy_offload = False
++    connector._next_store_op_id = 0
++    connector._pinned_store_operations = {}
++    connector.scheduler_adapter = _bare_scheduler_adapter(expected_workers)
++    connector._gpu_block_pool = pool
++    return connector
++
++
++def _bare_connector(expected_workers: int = 2) -> tuple[LMCacheMPConnector, MagicMock]:
++    pool = MagicMock(name="block_pool")
++    pool.blocks = {index: MagicMock(name=f"block_{index}") for index in range(8)}
++    return _bare_connector_with_pool(pool, expected_workers), pool
++
++
++def test_worker_metadata_aggregates_terminals_and_failures() -> None:
++    merged_metadata = LMCacheMPWorkerMetadata(
++        completed_store_requests={"lazy": 1},
++        terminal_store_operations={1: {0}, 2: {0}},
++        failed_store_operations={2: {0}},
++    ).aggregate(
++        LMCacheMPWorkerMetadata(
++            completed_store_requests={"lazy": 1},
++            terminal_store_operations={1: {1}, 3: {1}},
++            failed_store_operations={3: {1}},
++        )
++    )
++
++    assert isinstance(merged_metadata, LMCacheMPWorkerMetadata)
++    assert merged_metadata.completed_store_requests == {"lazy": 2}
++    assert merged_metadata.terminal_store_operations == {1: {0, 1}, 2: {0}, 3: {1}}
++    assert merged_metadata.failed_store_operations == {2: {0}, 3: {1}}
++
++
++def test_scheduler_aggregates_operation_across_steps() -> None:
++    adapter = _bare_scheduler_adapter(expected_workers=2)
++
++    assert adapter.update_pending_store_workers(4, {1}, {1}) is None
++    assert adapter.update_pending_store_workers(4, {0}, set()) == {1}
++    assert adapter._store_operation_terminal_workers == {}
++    assert adapter._store_operation_failed_workers == {}
++
++
++def test_scheduler_rejects_invalid_worker_id() -> None:
++    adapter = _bare_scheduler_adapter(expected_workers=2)
++
++    with pytest.raises(ValueError, match="invalid worker IDs"):
++        adapter.update_pending_store_workers(5, {0, 2}, set())
++
++
++def test_scheduler_rejects_failure_without_terminal_report() -> None:
++    adapter = _bare_scheduler_adapter(expected_workers=2)
++
++    with pytest.raises(ValueError, match="subset"):
++        adapter.update_pending_store_workers(5, {0}, {1})
++
++
++def test_duplicate_worker_report_does_not_replace_delayed_rank() -> None:
++    adapter = _bare_scheduler_adapter(expected_workers=2)
++
++    assert adapter.update_pending_store_workers(6, {0}, set()) is None
++    assert adapter.update_pending_store_workers(6, {0}, set()) is None
++    assert adapter._store_operation_terminal_workers[6] == {0}
++    assert adapter.update_pending_store_workers(6, {1}, set()) == set()
++
++
++def test_store_pins_unique_blocks_and_releases_after_all_ranks() -> None:
++    connector, pool = _bare_connector(expected_workers=2)
++    connector_metadata = LMCacheMPConnectorMetadata()
++    store_metadata = _store_metadata("same-request", [1, 2, 1, 2])
++
++    connector._add_store_metadata(connector_metadata, store_metadata)
++
++    assert store_metadata.store_op_id == 0
++    assert connector_metadata.requests == [store_metadata]
++    pool.touch.assert_called_once_with([pool.blocks[1], pool.blocks[2]])
++    assert connector.has_pending_push_work() is True
++
++    connector.update_connector_output(
++        _connector_output(LMCacheMPWorkerMetadata(terminal_store_operations={0: {0}}))
++    )
++    pool.free_blocks.assert_not_called()
++
++    connector.update_connector_output(
++        _connector_output(LMCacheMPWorkerMetadata(terminal_store_operations={0: {1}}))
++    )
++    assert list(pool.free_blocks.call_args.args[0]) == [
++        pool.blocks[2],
++        pool.blocks[1],
++    ]
++    assert pool.free_blocks.call_count == 1
++    assert connector.has_pending_push_work() is False
++
++
++def test_block_vllm_frees_mid_store_is_not_reused_until_the_store_ends() -> None:
++    """vLLM's own free (a preemption, or align-mode Mamba dropping an old
++    state block) leaves a stored block out of the free queue until every
++    rank reports the STORE terminal."""
++    pool = BlockPool(num_gpu_blocks=4, enable_caching=True, hash_block_size=16)
++    connector = _bare_connector_with_pool(pool, expected_workers=2)
++    request_blocks = pool.get_new_blocks(1)
++    stored_block_id = request_blocks[0].block_id
++
++    connector._add_store_metadata(
++        LMCacheMPConnectorMetadata(), _store_metadata("req", [stored_block_id])
++    )
++    pool.free_blocks(request_blocks)
++
++    taken_blocks = pool.get_new_blocks(pool.get_num_free_blocks())
++    assert stored_block_id not in {block.block_id for block in taken_blocks}
++    pool.free_blocks(taken_blocks)
++
++    connector.update_connector_output(
++        _connector_output(
++            LMCacheMPWorkerMetadata(terminal_store_operations={0: {0, 1}})
++        )
++    )
++    reusable_blocks = pool.get_new_blocks(pool.get_num_free_blocks())
++    assert stored_block_id in {block.block_id for block in reusable_blocks}
++
++
++def test_same_request_gets_independent_operation_ids() -> None:
++    connector, _pool = _bare_connector(expected_workers=1)
++    connector_metadata = LMCacheMPConnectorMetadata()
++    first_store = _store_metadata("same-request", [1])
++    second_store = _store_metadata("same-request", [2])
++
++    connector._add_store_metadata(connector_metadata, first_store)
++    connector._add_store_metadata(connector_metadata, second_store)
++
++    assert first_store.store_op_id == 0
++    assert second_store.store_op_id == 1
++    assert set(connector._pinned_store_operations) == {0, 1}
++
++
++def test_failed_rank_is_terminal_and_releases_after_all_ranks() -> None:
++    connector, pool = _bare_connector(expected_workers=2)
++    connector_metadata = LMCacheMPConnectorMetadata()
++    connector._add_store_metadata(
++        connector_metadata,
++        _store_metadata("req-failure", [3]),
++    )
++
++    connector.update_connector_output(
++        _connector_output(
++            LMCacheMPWorkerMetadata(
++                terminal_store_operations={0: {0, 1}},
++                failed_store_operations={0: {1}},
++            )
++        )
++    )
++
++    assert list(pool.free_blocks.call_args.args[0]) == [pool.blocks[3]]
++    assert pool.free_blocks.call_count == 1
++    assert connector.has_pending_push_work() is False
++
++
++def test_request_finish_uses_operation_owned_block_references() -> None:
++    connector, pool = _bare_connector(expected_workers=1)
++    connector._cleanup_request_tracker = MagicMock()
++    connector.scheduler_adapter.cleanup_lookup_result = MagicMock()
++    connector.scheduler_adapter.end_session = MagicMock()
++    request = SimpleNamespace(request_id="req-finished", kv_transfer_params=None)
++
++    is_free_delayed, return_params = connector.request_finished(request, [1, 2])
++
++    assert is_free_delayed is False
++    assert return_params is None
++    pool.free_blocks.assert_not_called()
++    connector._cleanup_request_tracker.assert_called_once_with("req-finished")
++    connector.scheduler_adapter.end_session.assert_called_once_with("req-finished")
++
++
++def test_worker_metadata_drains_operation_results() -> None:
++    connector = object.__new__(LMCacheMPConnector)
++    connector.lazy_offload = False
++    connector.worker_adapter = MagicMock()
++    connector.worker_adapter.get_completed_store_operations.return_value = (
++        {7: {0, 1}},
++        {7: {1}},
++    )
++
++    metadata = connector.build_connector_worker_meta()
++
++    assert metadata == LMCacheMPWorkerMetadata(
++        terminal_store_operations={7: {0, 1}},
++        failed_store_operations={7: {1}},
++    )
+diff --git a/tests/v1/test_vllm_mp_adapter.py b/tests/v1/test_vllm_mp_adapter.py
+index 1e0380c9af359c40d6c8d84dc77c77c6573cf198..953a00841d43ecb0c5407e4936ea7910c38fbd1e 100644
+--- a/tests/v1/test_vllm_mp_adapter.py
++++ b/tests/v1/test_vllm_mp_adapter.py
+@@ -241,11 +241,14 @@ class FakeHeartbeatThread:
+ def _make_worker_adapter(
+     extra_config: dict[str, object] | None = None,
+     parallel_strategy: ParallelStrategy | None = None,
++    tracks_store_operations: bool = False,
+ ) -> LMCacheMPWorkerAdapter:
+     """Construct a worker adapter with the standard test arguments; the
+     network boundary must already be patched (see ``fake_adapter``).
+     ``extra_config`` forwards ``lmcache.mp.*`` overrides, and
+-    ``parallel_strategy`` overrides the default single-rank placement."""
++    ``parallel_strategy`` overrides the default single-rank placement.
++    ``tracks_store_operations`` selects the per-STORE completion
++    ``LMCacheMPConnector`` uses instead of the request-level default."""
+     if parallel_strategy is None:
+         parallel_strategy = ParallelStrategy(
+             vllm_world_size=1,
+@@ -262,6 +265,7 @@ def _make_worker_adapter(
+         parallel_strategy=parallel_strategy,
+         mq_timeout=5.0,
+         extra_config=extra_config,
++        tracks_store_operations=tracks_store_operations,
+     )
+ 
+ 
+@@ -425,6 +429,16 @@ def fake_adapter(monkeypatch):
+     return adapter, req_client, future
+ 
+ 
++@pytest.fixture
++def operation_adapter(fake_adapter):
++    """Like ``fake_adapter``, with the operation-level STORE lifetime that
++    ``LMCacheMPConnector`` selects."""
++    _, req_client, future = fake_adapter
++    adapter = _make_worker_adapter(tracks_store_operations=True)
++    req_client.reset_mock()
++    return adapter, req_client, future
++
++
+ def test_scheduler_reset_cache_clears_every_server_without_force(
+     monkeypatch: pytest.MonkeyPatch,
+ ) -> None:
+@@ -930,6 +944,407 @@ def test_submit_store_request_expands_block_ids_to_views(fake_adapter, monkeypat
+     ]
+ 
+ 
++def test_operation_store_tracks_returned_future_by_operation_id(
++    operation_adapter: tuple[LMCacheMPWorkerAdapter, MagicMock, MagicMock],
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """submit_store_request tracks the future by STORE operation ID."""
++    adapter, _send_mock, _ = operation_adapter
++    monkeypatch.setattr(adapter, "_ensure_heartbeat_started", lambda: None)
++    fake_tensor = MagicMock()
++    fake_tensor.device.type = "cuda"
++    adapter.kv_caches = {"layer.0": fake_tensor}
++    transfer_ctx = MagicMock()
++    fake_future = MagicMock()
++    transfer_ctx.submit_store.return_value = fake_future
++    adapter.transfer_ctx = transfer_ctx
++
++    adapter.submit_store_request(
++        "req-1",
++        _op([[0]]),
++        event=MagicMock(),
++        request_configs={"lmcache.skip_save": True},
++        store_op_id=17,
++    )
++
++    assert transfer_ctx.submit_store.call_args.kwargs == {}
++    assert transfer_ctx.submit_store.call_args.args[1].request_configs == {
++        "lmcache.skip_save": True
++    }
++    assert transfer_ctx.submit_store.call_args.args[3] == [[0]]
++    assert adapter.store_futures == {}
++    assert adapter._store_operation_futures[17].request_id == "req-1"
++    assert adapter._store_operation_futures[17].future is fake_future
++
++
++def test_legacy_connector_keeps_request_level_store_completion(
++    fake_adapter: tuple[LMCacheMPWorkerAdapter, MagicMock, MagicMock],
++) -> None:
++    adapter, _, _ = fake_adapter
++    future = MagicMock()
++    future.query.return_value = True
++    future.result.return_value = True
++    adapter.transfer_ctx = MagicMock()
++    adapter.transfer_ctx.submit_store.return_value = future
++
++    adapter.submit_store_request("legacy-request", _op([[0]]), MagicMock())
++
++    assert adapter.store_futures == {"legacy-request": future}
++    assert adapter.get_finished({"legacy-request"}) == ({"legacy-request"}, set())
++
++
++def test_operation_store_requires_scheduler_identity(
++    operation_adapter: tuple[LMCacheMPWorkerAdapter, MagicMock, MagicMock],
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    adapter, _send_mock, _ = operation_adapter
++    monkeypatch.setattr(adapter, "_ensure_heartbeat_started", lambda: None)
++
++    with pytest.raises(ValueError, match="requires store_op_id"):
++        adapter.submit_store_request("missing-id", _op([[0]]), MagicMock())
++
++
++def test_operation_completion_releases_finished_request_id(
++    operation_adapter: tuple[LMCacheMPWorkerAdapter, MagicMock, MagicMock],
++) -> None:
++    class RequestId(str):
++        pass
++
++    adapter, _, _ = operation_adapter
++    adapter.request_telemetry = MagicMock()
++    request_id = RequestId("finished-request")
++    reference = weakref.ref(request_id)
++
++    assert adapter.get_finished({request_id}) == (set(), set())
++    adapter.get_finished(set())
++    adapter.request_telemetry.on_request_store_finished.assert_called_once()
++    adapter.request_telemetry.reset_mock()
++    del request_id
++    gc.collect()
++
++    assert reference() is None
++
++
++def test_operation_telemetry_waits_for_last_store(
++    operation_adapter: tuple[LMCacheMPWorkerAdapter, MagicMock, MagicMock],
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    adapter, _, _ = operation_adapter
++    monkeypatch.setattr(adapter, "_ensure_heartbeat_started", lambda: None)
++    adapter.request_telemetry = MagicMock()
++    future = MagicMock()
++    future.query.return_value = False
++    future.result.return_value = True
++    adapter.transfer_ctx = MagicMock()
++    adapter.transfer_ctx.submit_store.return_value = future
++    adapter.submit_store_request("delayed", _op([[1]]), MagicMock(), store_op_id=301)
++
++    adapter.get_finished({"delayed"})
++    adapter.get_finished(set())
++    adapter.request_telemetry.on_request_store_finished.assert_not_called()
++    future.query.return_value = True
++    adapter.get_finished(set())
++    adapter.get_finished(set())
++
++    adapter.request_telemetry.on_request_store_finished.assert_called_once_with(
++        request_ids_set={"delayed"}, model_name="test-model", world_size=1, kv_rank=0
++    )
++    assert adapter.get_completed_store_operations() == ({301: {0}}, {})
++
++
++def test_operation_store_accepts_context_without_event(
++    operation_adapter: tuple[LMCacheMPWorkerAdapter, MagicMock, MagicMock],
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    adapter, _, _ = operation_adapter
++    monkeypatch.setattr(adapter, "_ensure_heartbeat_started", lambda: None)
++    future = MagicMock()
++    future.query.return_value = True
++    future.result.return_value = True
++    adapter.transfer_ctx = MagicMock()
++    adapter.transfer_ctx.submit_store.return_value = future
++
++    adapter.submit_store_request("sync-store", _op([[1]]), None, store_op_id=302)
++
++    assert adapter.transfer_ctx.submit_store.call_args.args[4] is None
++    assert 302 not in adapter._store_operation_events
++    assert adapter.get_completed_store_operations() == ({302: {0}}, {})
++
++
++def test_store_batch_rejects_operation_count_before_submission(
++    operation_adapter: tuple[LMCacheMPWorkerAdapter, MagicMock, MagicMock],
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    adapter, _, _ = operation_adapter
++    submit_mock = MagicMock()
++    monkeypatch.setattr(adapter, "submit_store_request", submit_mock)
++
++    with pytest.raises(ValueError, match="must have the same length"):
++        adapter.batched_submit_store_requests(
++            ["first", "second"], [_op([[1]]), _op([[2]])], None, store_op_ids=[303]
++        )
++
++    submit_mock.assert_not_called()
++
++
++def test_same_request_store_operations_do_not_overwrite_each_other(
++    operation_adapter: tuple[LMCacheMPWorkerAdapter, MagicMock, MagicMock],
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    adapter, _send_mock, _ = operation_adapter
++    monkeypatch.setattr(adapter, "_ensure_heartbeat_started", lambda: None)
++    adapter.kv_caches = {"layer.0": MagicMock()}
++    first_future = MagicMock(name="first_future")
++    second_future = MagicMock(name="second_future")
++    first_future.query.return_value = True
++    first_future.result.return_value = True
++    second_future.query.return_value = False
++    adapter.transfer_ctx = MagicMock()
++    adapter.transfer_ctx.submit_store.side_effect = [first_future, second_future]
++
++    adapter.submit_store_request(
++        "same-request", _op([[1]]), MagicMock(), store_op_id=101
++    )
++    adapter.submit_store_request(
++        "same-request", _op([[2]]), MagicMock(), store_op_id=102
++    )
++
++    assert set(adapter._store_operation_futures) == {101, 102}
++    assert adapter.get_finished({"same-request"})[0] == set()
++    assert set(adapter._store_operation_futures) == {102}
++    assert adapter.get_completed_store_operations() == ({101: {0}}, {})
++
++    second_future.query.return_value = True
++    second_future.result.return_value = True
++    assert adapter.get_finished({"same-request"})[0] == set()
++    assert adapter._store_operation_futures == {}
++    assert adapter.get_completed_store_operations() == ({102: {0}}, {})
++
++
++def test_false_store_result_reports_failed_terminal(
++    operation_adapter: tuple[LMCacheMPWorkerAdapter, MagicMock, MagicMock],
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    adapter, _send_mock, _ = operation_adapter
++    monkeypatch.setattr(adapter, "_ensure_heartbeat_started", lambda: None)
++    adapter.kv_caches = {"layer.0": MagicMock()}
++    future = MagicMock()
++    future.query.return_value = True
++    future.result.return_value = False
++    adapter.transfer_ctx = MagicMock()
++    adapter.transfer_ctx.submit_store.return_value = future
++
++    adapter.submit_store_request("req-failed", _op([[3]]), MagicMock(), store_op_id=103)
++    adapter.get_finished(set())
++
++    assert adapter.get_completed_store_operations() == ({103: {0}}, {103: {0}})
++
++
++def test_terminal_store_exception_reports_failed_terminal(
++    operation_adapter: tuple[LMCacheMPWorkerAdapter, MagicMock, MagicMock],
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    adapter, _send_mock, _ = operation_adapter
++    monkeypatch.setattr(adapter, "_ensure_heartbeat_started", lambda: None)
++    adapter.kv_caches = {"layer.0": MagicMock()}
++    future = MagicMock()
++    future.query.return_value = True
++    future.result.side_effect = RuntimeError("store failed")
++    adapter.transfer_ctx = MagicMock()
++    adapter.transfer_ctx.submit_store.return_value = future
++
++    adapter.submit_store_request(
++        "req-terminal-error", _op([[3]]), MagicMock(), store_op_id=109
++    )
++
++    assert adapter.get_completed_store_operations() == ({109: {0}}, {109: {0}})
++    assert 109 not in adapter._store_operation_futures
++
++
++def test_unknown_store_state_retains_operation(
++    operation_adapter: tuple[LMCacheMPWorkerAdapter, MagicMock, MagicMock],
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    adapter, _send_mock, _ = operation_adapter
++    monkeypatch.setattr(adapter, "_ensure_heartbeat_started", lambda: None)
++    adapter.kv_caches = {"layer.0": MagicMock()}
++    future = MagicMock()
++    future.query.side_effect = RuntimeError("query failed")
++    adapter.transfer_ctx = MagicMock()
++    adapter.transfer_ctx.submit_store.return_value = future
++
++    adapter.submit_store_request(
++        "req-query-error", _op([[3]]), MagicMock(), store_op_id=110
++    )
++
++    assert adapter.get_completed_store_operations() is None
++    assert 110 in adapter._store_operation_futures
++    assert 110 in adapter._store_operation_events
++
++
++def test_store_submit_exception_is_indeterminate_and_propagates(
++    operation_adapter: tuple[LMCacheMPWorkerAdapter, MagicMock, MagicMock],
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    adapter, _send_mock, _ = operation_adapter
++    monkeypatch.setattr(adapter, "_ensure_heartbeat_started", lambda: None)
++    adapter.kv_caches = {"layer.0": MagicMock()}
++    adapter.transfer_ctx = MagicMock()
++    adapter.transfer_ctx.submit_store.side_effect = RuntimeError("submit failed")
++
++    event = MagicMock()
++    with pytest.raises(RuntimeError, match="submit failed"):
++        adapter.submit_store_request(
++            "req-submit-failed", _op([[4]]), event, store_op_id=104
++        )
++
++    assert adapter._store_operation_futures == {}
++    assert adapter._indeterminate_store_operations == {104: "req-submit-failed"}
++    assert adapter._store_operation_events == {104: event}
++    assert adapter.get_completed_store_operations() is None
++
++
++def test_unhealthy_store_reports_failed_terminal(
++    operation_adapter: tuple[LMCacheMPWorkerAdapter, MagicMock, MagicMock],
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    adapter, _send_mock, _ = operation_adapter
++    monkeypatch.setattr(adapter, "_ensure_heartbeat_started", lambda: None)
++    adapter._health_event.clear()
++    adapter.transfer_ctx = MagicMock()
++
++    adapter.submit_store_request(
++        "req-unhealthy", _op([[5]]), MagicMock(), store_op_id=105
++    )
++
++    adapter.transfer_ctx.submit_store.assert_not_called()
++    assert adapter.get_completed_store_operations() == ({105: {0}}, {105: {0}})
++
++
++def test_missing_transfer_context_reports_failed_terminal(
++    operation_adapter: tuple[LMCacheMPWorkerAdapter, MagicMock, MagicMock],
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    adapter, _send_mock, _ = operation_adapter
++    monkeypatch.setattr(adapter, "_ensure_heartbeat_started", lambda: None)
++    adapter.transfer_ctx = None
++
++    adapter.submit_store_request(
++        "req-no-context", _op([[5]]), MagicMock(), store_op_id=108
++    )
++
++    assert adapter.get_completed_store_operations() == ({108: {0}}, {108: {0}})
++
++
++def test_unhealthy_heartbeat_keeps_inflight_store_pending(
++    operation_adapter: tuple[LMCacheMPWorkerAdapter, MagicMock, MagicMock],
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    adapter, _send_mock, _ = operation_adapter
++    monkeypatch.setattr(adapter, "_ensure_heartbeat_started", lambda: None)
++    adapter.kv_caches = {"layer.0": MagicMock()}
++    future = MagicMock()
++    future.query.return_value = False
++    adapter.transfer_ctx = MagicMock()
++    adapter.transfer_ctx.submit_store.return_value = future
++
++    adapter.submit_store_request(
++        "req-inflight", _op([[5]]), MagicMock(), store_op_id=107
++    )
++    adapter._health_event.clear()
++    adapter.get_finished(set())
++
++    assert 107 in adapter._store_operation_futures
++    assert adapter.get_completed_store_operations() is None
++
++
++def test_non_writer_store_reports_successful_terminal(
++    operation_adapter: tuple[LMCacheMPWorkerAdapter, MagicMock, MagicMock],
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """A rank that writes no registered group reports its vLLM rank terminal."""
++    adapter, _send_mock, _ = operation_adapter
++    monkeypatch.setattr(adapter, "_ensure_heartbeat_started", lambda: None)
++    adapter.parallel_strategy = ParallelStrategy(
++        vllm_world_size=2,
++        vllm_worker_id=1,
++        tp_size=2,
++        pp_size=1,
++        n_servers=1,
++    )
++    monkeypatch.setattr(
++        adapter_mod.LMCacheMPWorkerAdapter,
++        "is_kv_writer",
++        property(lambda self: False),
++    )
++    adapter.transfer_ctx = MagicMock()
++
++    adapter.submit_store_request(
++        "req-non-writer", _op([[6]]), MagicMock(), store_op_id=106
++    )
++
++    adapter.transfer_ctx.submit_store.assert_not_called()
++    assert adapter.get_completed_store_operations() == ({106: {1}}, {})
++
++
++def test_operation_store_keeps_event_until_future_finishes(
++    operation_adapter: tuple[LMCacheMPWorkerAdapter, MagicMock, MagicMock],
++) -> None:
++    """An operation-level STORE keeps the exported CUDA event alive while
++    pending."""
++    adapter, _send_mock, _future = operation_adapter
++    cuda_future = MagicMock(name="cuda_future")
++    cuda_future.query.return_value = False
++    transfer_ctx = MagicMock()
++    transfer_ctx.submit_store.return_value = cuda_future
++    adapter.transfer_ctx = transfer_ctx
++
++    event = FakeCudaEvent()
++    event_ref = weakref.ref(event)
++    op = LoadStoreOp(
++        token_bytes=pack_token_ids([1, 2]), block_ids=[[7]], start=0, end=2
++    )
++
++    adapter.submit_store_request("req-1", op, event, store_op_id=23)
++    del event
++    gc.collect()
++    assert event_ref() is not None
++
++    cuda_future.query.return_value = True
++    cuda_future.result.return_value = True
++    finished_stores, finished_retrieves = adapter.get_finished({"req-1"})
++
++    assert finished_stores == set()
++    assert finished_retrieves == set()
++    assert 23 not in adapter._store_operation_events
++    assert adapter.get_completed_store_operations() == ({23: {0}}, {})
++    transfer_ctx.reset_mock()
++    gc.collect()
++    assert event_ref() is None
++
++
++def test_unregister_waits_for_operation_stores(
++    operation_adapter: tuple[LMCacheMPWorkerAdapter, MagicMock, MagicMock],
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Unregistering the KV caches also waits for operation-level STOREs,
++    which stay tracked until they are polled."""
++    adapter, _send_mock, _ = operation_adapter
++    monkeypatch.setattr(adapter, "_ensure_heartbeat_started", lambda: None)
++    adapter.kv_caches = {"layer.0": MagicMock()}
++    future = MagicMock()
++    future.query.return_value = False
++    future.wait.return_value = True
++    adapter.transfer_ctx = MagicMock()
++    adapter.transfer_ctx.submit_store.return_value = future
++
++    adapter.submit_store_request("req-sleep", _op([[8]]), None, store_op_id=111)
++    adapter.unregister_kv_caches()
++
++    future.wait.assert_called_once()
++    assert 111 in adapter._store_operation_futures
++
++
+ @pytest.mark.parametrize("store_result", [True, False, None])
+ def test_lazy_store_preserves_completion_and_failure_reporting(
+     fake_adapter,

@@ -1,0 +1,277 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [vllm] fix: the sub-paged attention view of FlashInfer's
+ fused K/V layout under HND
+
+Local, from no pull request. LMCache pull request #4253 (1847435f) re-views the fused layout for NHD only; its own
+design document names HND as a limitation, and draft pull request #5390 targets it.
+
+vLLM's FlashInfer backend registers each attention layer as a fused-K/V rank-4 tensor
+(pages, num_kv_heads, kernel_block_size, 2 * head_size) and allows only HND layouts on Blackwell. Since #4253
+_SubpagedAttentionViewEdit re-views it at the scheduler block size as an NHD-shaped rank-5 tensor, whose block size
+the format detector reads under HND from the synthetic heads axis (1): LMCache classifies the attention group as
+compressed, and store and retrieve move a fraction of each block's KV, corrupting live KV on every load. Under HND
+the rank-4 tensor is now re-viewed in its own memory order as (blocks, 1, block_size, num_kv_heads * content), which
+the detector reads at the scheduler block size; with one KV head per rank the dims stay semantic. Each group's kind,
+block size, page size, layout and registered tensor shape are logged once at registration.
+
+What the port takes and changes:
+- The patch's fused re-view, _apply_fused, for HND only; under NHD v0.5.8rc1's re-view from #4253 stays, which does
+  the job of the patch's NHD-strided rank-4 view. vLLM 0.34 resolves LBHNC (the "HND" hint) for FlashInfer on
+  Blackwell; with its other choice there, the blocks-first BLHNC, it keeps kernel blocks at the scheduler block size,
+  so no sub-paged edit applies.
+- The patch's rank-5 change (matching on both candidate token dims, the kernel block size from dim 3 under HND) is
+  left out: vLLM registers a rank-5 tensor in NHD order under HND too, with the heads at dim 3, and v0.5.8rc1
+  deliberately rejects a rank-5 tensor it cannot re-view correctly, while reading dim 3 would re-view an HND-ordered
+  one into the NHD-shaped view the detector misreads. vLLM 0.28 and 0.34 register rank 4 for FlashInfer.
+- The patch's docstring change to _SubpagedMLAAttentionViewEdit.apply, which changed no code there, is left out.
+- The registration log reads each group's first layer spec (v0.5.8rc1 keeps per-layer specs for a group of uniform
+  types) and shows a (K, V) plane tuple like a list.
+- docs/design/integration/vllm/kv_cache_group_edits.md says what HND does now; it said HND is not reached by default.
+- tests/v1/test_vllm_kv_cache_group_edits.py covers the HND re-view, its detection as NL_X_NB_NH_BS_CS at the
+  scheduler block size (detect_format and get_block_size from lmcache.v1.common since #6530), and the refusal of a
+  non-contiguous HND tensor; the patch had no test.
+---
+ .../integration/vllm/kv_cache_group_edits.md  | 13 ++--
+ .../integration/vllm/kv_cache_group_edits.py  | 69 ++++++++++++++++-
+ tests/v1/test_vllm_kv_cache_group_edits.py    | 74 ++++++++++++++++++-
+ 3 files changed, 147 insertions(+), 9 deletions(-)
+
+diff --git a/docs/design/integration/vllm/kv_cache_group_edits.md b/docs/design/integration/vllm/kv_cache_group_edits.md
+index 5419ece308ed739cff8e4eccecfd58913562c6bd..4258b7a8e0412e1ae6b2a586c02077af5287fdb3 100644
+--- a/docs/design/integration/vllm/kv_cache_group_edits.md
++++ b/docs/design/integration/vllm/kv_cache_group_edits.md
+@@ -118,11 +118,14 @@ edited view is NHD-shaped by construction, so under an HND hint the detector
+ selects `NL_X_NB_TWO_NH_BS_HS`, whose `block_size()` reads the synthetic
+ `num_heads` axis and resolves 1 — extending the rank-4 memory-order
+ normalization to rank 5 would replace a loud startup failure with exactly that
+-silent wrong block size. This is a **general limitation** of the edits, not a
+-rank-5 one: under an explicit `VLLM_KV_CACHE_LAYOUT=HND` every edited group,
+-Mamba included, resolves `block_size` to 1. Not reached by default
+-(`get_required_kvcache_layout` returns `None`, so vLLM falls back to NHD);
+-tracked separately.
++silent wrong block size. Under HND every NHD-shaped edited view, Mamba's
++included, resolves `block_size` to 1. HND is the only layout vLLM's FlashInfer
++backend allows on Blackwell (`supported_kv_cache_layouts`; vLLM 0.28 forced it
++through `get_required_kv_cache_layout`), whatever the connector prefers, so the
++**rank-4** attention edit keeps the fused layout there instead: `_apply_fused`
++re-views the contiguous HND tensor as `(num_blocks, 1, block_size,
++num_kv_heads * 2 * head_size)`, which the detector reads as `NL_X_NB_NH_BS_CS`
++at the scheduler block size.
+ 
+ vLLM-Ascend registers the same scheduler-versus-kernel mismatch as a `(K, V)`
+ pair of rank-4 planes at the kernel block size. Both releases use the same
+diff --git a/lmcache/integration/vllm/kv_cache_group_edits.py b/lmcache/integration/vllm/kv_cache_group_edits.py
+index 40fa3dc936d0e65d8a495d39f4b254e0322d42cb..d2a913f6e2095179133f6e95f19390d52e955b81 100644
+--- a/lmcache/integration/vllm/kv_cache_group_edits.py
++++ b/lmcache/integration/vllm/kv_cache_group_edits.py
+@@ -474,7 +474,7 @@ class _SubpagedAttentionViewEdit(KVCacheGroupEdit):
+         self,
+         spec: KVCacheSpec,
+         kv_cache: RegisteredKVCache,
+-        _layout_hints: LayoutHints,
++        layout_hints: LayoutHints,
+     ) -> torch.Tensor:
+         """Re-view ``kv_cache`` at logical-block granularity.
+ 
+@@ -482,7 +482,8 @@ class _SubpagedAttentionViewEdit(KVCacheGroupEdit):
+         kernel_block_size, num_kv_heads, head_size)`` (vLLM <= 0.25.x) or as
+         ``(num_kernel_pages, num_kv_heads, kernel_block_size, 2 * head_size)``
+         (vLLM >= 0.26.0); the result is ``(num_logical_blocks, 2,
+-        spec.block_size, num_heads, head_size)`` over the same storage.
++        spec.block_size, num_heads, head_size)`` over the same storage, but
++        for a rank-4 tensor under HND (see :meth:`_apply_fused`).
+ 
+         A rank-4 tensor is re-viewed in memory order, since vLLM registers it
+         as a permute view of the backend's physical layout. A rank-5 tensor
+@@ -496,6 +497,12 @@ class _SubpagedAttentionViewEdit(KVCacheGroupEdit):
+                 exactly (which would indicate an undeclared packed layout that
+                 must not be edited).
+         """
++        if (
++            isinstance(kv_cache, torch.Tensor)
++            and kv_cache.ndim == 4
++            and layout_hints.get("kv_layout") == "HND"
++        ):
++            return self._apply_fused(spec, kv_cache)
+         if not isinstance(kv_cache, torch.Tensor) or kv_cache.ndim not in (5, 4):
+             got = (
+                 tuple(kv_cache.shape)
+@@ -573,6 +580,44 @@ class _SubpagedAttentionViewEdit(KVCacheGroupEdit):
+             int(spec.page_size_bytes),
+         )
+ 
++    @staticmethod
++    def _apply_fused(spec: KVCacheSpec, kv_cache: torch.Tensor) -> torch.Tensor:
++        """Re-view the contiguous HND tensor ``(num_kernel_pages, num_kv_heads,
++        kernel_block_size, 2 * head_size)`` of vLLM's FlashInfer backend as
++        ``(num_blocks, 1, spec.block_size, num_kv_heads * 2 * head_size)``,
++        whose HND reading finds the block size on its token axis."""
++        # The NHD-shaped rank-5 view's HND reading takes the block size from its
++        # synthetic heads axis. With one KV head per rank the dims stay semantic;
++        # with more, token rows interleave heads but whole blocks round-trip.
++        num_kernel_pages, num_heads, kernel_block_size, content_size = kv_cache.shape
++        logical_block_size = spec.block_size
++        if logical_block_size % kernel_block_size != 0:
++            raise ValueError(
++                f"logical block size {logical_block_size} is not a multiple of "
++                f"kernel block size {kernel_block_size}"
++            )
++        ratio = logical_block_size // kernel_block_size
++        if num_kernel_pages % ratio != 0:
++            raise ValueError(
++                f"kernel page count {num_kernel_pages} is not a multiple of "
++                f"the logical/kernel block ratio {ratio}"
++            )
++        kernel_page_bytes = kv_cache.shape[1:].numel() * kv_cache.element_size()
++        if kernel_page_bytes * ratio != spec.page_size_bytes:
++            raise ValueError(
++                f"{ratio} kernel pages ({kernel_page_bytes * ratio} bytes) do "
++                f"not tile the logical page ({spec.page_size_bytes} bytes)"
++            )
++        if not kv_cache.is_contiguous():
++            raise ValueError(
++                f"fused K/V tensor with strides {tuple(kv_cache.stride())} is "
++                "not HND-contiguous; cannot re-view as logical pages"
++            )
++        num_blocks = num_kernel_pages // ratio
++        return kv_cache.view(
++            num_blocks, 1, logical_block_size, num_heads * content_size
++        )
++
+ 
+ ######################
+ # vLLM 0.26.0 or later
+@@ -1117,6 +1162,26 @@ def apply_kv_cache_group_edits(
+     counts: Counter[str] = Counter()
+     for group in kv_cache_config.kv_cache_groups:
+         per_layer_specs = getattr(group.kv_cache_spec, "kv_cache_specs", None)
++        if group.layer_names:
++            # Each group's kind, sizes, layout and registered shape, once.
++            first_layer_name = group.layer_names[0]
++            first_layer_spec = group.kv_cache_spec
++            if per_layer_specs:
++                first_layer_spec = per_layer_specs[first_layer_name]
++            first_layer_cache = kv_caches[first_layer_name]
++            logger.info(
++                "KV cache group %s: block_size=%s page_size_bytes=%s layout=%s "
++                "registered=%s",
++                get_kv_cache_spec_kind(first_layer_spec).name,
++                first_layer_spec.block_size,
++                first_layer_spec.page_size_bytes,
++                layout_hints.get("kv_layout", "none"),
++                (
++                    [tuple(t.shape) for t in first_layer_cache]
++                    if isinstance(first_layer_cache, (list, tuple))
++                    else tuple(first_layer_cache.shape)
++                ),
++            )
+         for name in group.layer_names:
+             spec = per_layer_specs[name] if per_layer_specs else group.kv_cache_spec
+             for edit in _EDITS:
+diff --git a/tests/v1/test_vllm_kv_cache_group_edits.py b/tests/v1/test_vllm_kv_cache_group_edits.py
+index 40a8c2502df2fa54db7d7f4eadb025ed0d4163db..efc32005558a9e9689ce353bc65641a947411e13 100644
+--- a/tests/v1/test_vllm_kv_cache_group_edits.py
++++ b/tests/v1/test_vllm_kv_cache_group_edits.py
+@@ -268,7 +268,10 @@ def _hybrid_config(
+ 
+ 
+ def _edit_attention(
+-    edits, attention_cache: torch.Tensor, attention_spec: _Spec | None = None
++    edits,
++    attention_cache: torch.Tensor,
++    attention_spec: _Spec | None = None,
++    layout_hints: dict[str, str] | None = None,
+ ) -> torch.Tensor:
+     """Run the public entry point and return the edited attention tensor.
+ 
+@@ -276,13 +279,16 @@ def _edit_attention(
+         edits: The module under test.
+         attention_cache: Registered tensor for the attention layer.
+         attention_spec: Optional attention spec override.
++        layout_hints: vLLM's layout hints; none (NHD) by default.
+ 
+     Returns:
+         The attention layer's entry in the edited mapping. It is the *same
+         object* as ``attention_cache`` when no rule matched.
+     """
+     config, kv_caches = _hybrid_config(attention_cache, attention_spec)
+-    edited = edits.apply_kv_cache_group_edits(config, kv_caches, layout_hints={})
++    edited = edits.apply_kv_cache_group_edits(
++        config, kv_caches, layout_hints=layout_hints or {}
++    )
+     return edited["attn.0"]
+ 
+ 
+@@ -429,6 +435,70 @@ def test_subpaged_edit_rejects_permuted_split_registration(edits):
+         _edit_attention(edits, registered)
+ 
+ 
++# --------------------------------------------------------------------------
++# HND: what vLLM's FlashInfer backend requires on Blackwell
++# --------------------------------------------------------------------------
++
++# vLLM's layout hints under HND
++HND = {"kv_layout": "HND"}
++
++
++def test_subpaged_edit_keeps_hnd_fused_kv_at_rank_4(edits):
++    """Under HND the contiguous fused rank-4 tensor is re-viewed over the same
++    storage with one logical block per page."""
++    cache = _fused_kv_cache()
++    viewed_cache = _edit_attention(edits, cache, layout_hints=HND)
++
++    assert tuple(viewed_cache.shape) == (
++        NUM_LOGICAL_BLOCKS,
++        1,
++        LOGICAL_BLOCK_SIZE,
++        NUM_KV_HEADS * 2 * HEAD_SIZE,
++    )
++    assert (
++        viewed_cache.untyped_storage().data_ptr() == cache.untyped_storage().data_ptr()
++    )
++    for block in range(NUM_LOGICAL_BLOCKS):
++        expected_block = cache[block * SUBPAGE_RATIO : (block + 1) * SUBPAGE_RATIO]
++        torch.testing.assert_close(
++            viewed_cache[block].reshape(-1), expected_block.reshape(-1)
++        )
++
++
++def test_hnd_fused_edit_reads_at_the_scheduler_block_size(edits):
++    """The HND reading of the edited view finds the scheduler block size, where
++    that of an NHD-shaped rank-5 view finds the synthetic heads axis (1)."""
++    # First Party
++    from lmcache.utils import EngineType
++    from lmcache.v1.common.kv_format import detect_format
++    from lmcache.v1.common.utils import get_block_size
++    import lmcache.lmcache_native as lmcache_native
++
++    viewed_cache = _edit_attention(edits, _fused_kv_cache(), layout_hints=HND)
++    engine_kv_format, normalized_caches = detect_format(
++        [viewed_cache], EngineType.VLLM, HND
++    )
++
++    assert engine_kv_format == lmcache_native.EngineKVFormat.NL_X_NB_NH_BS_CS
++    assert get_block_size(normalized_caches, engine_kv_format) == LOGICAL_BLOCK_SIZE
++
++
++def test_subpaged_edit_rejects_non_contiguous_hnd_fused_kv(edits):
++    """An HND fused tensor that is not contiguous (e.g. a cross-layer view)
++    fails loudly rather than being re-viewed in the wrong order."""
++    physical_cache = torch.zeros(
++        NUM_KERNEL_PAGES,
++        KERNEL_BLOCK_SIZE,
++        NUM_KV_HEADS,
++        2 * HEAD_SIZE,
++        dtype=torch.bfloat16,
++    )
++    registered_cache = physical_cache.permute(0, 2, 1, 3)
++
++    with pytest.raises(ValueError, match="not HND-contiguous"):
++        _edit_attention(edits, registered_cache, layout_hints=HND)
++
++
+ def test_subpaged_edit_rejects_untiled_page(edits):
+     """An undeclared packed layout must fail loudly, not transfer wrongly."""
+     spec = _attention_spec()

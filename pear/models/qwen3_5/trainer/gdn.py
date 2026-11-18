@@ -535,7 +535,7 @@ class GatedDeltaNet:
         Qwen3_5GatedDeltaNet.forward = GatedDeltaNet.forward
 
         for layer in model.model.language_model.layers:
-            if layer.layer_type == "linear_attention":
+            if layer.block_type == "linear_attention":
                 mixer = layer.linear_attn
                 mixer.gpu_backend = gpu_backend
 
@@ -631,7 +631,7 @@ class GatedDeltaNet:
             core_attn_out,
             z.reshape(-1, self.head_v_dim),
             self.norm.weight,
-            self.norm.eps,
+            self.norm.variance_epsilon,
             core16,
             gpu_backend.recompute_is_fp16,
         )

@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [model] fix: Qwen3.5's packed short convolution uses
+ transformers' causal_conv1d_fn only with the causal-conv1d package
+
+From transformers 5.16 the modeling module's causal_conv1d_fn is never None: it is the wrapper of
+use_kernel_func_from_hub_with_fallback, which without the causal-conv1d package runs a reference torch convolution.
+That convolution cannot keep packed sequences apart. On 5.16.1 the wrapper drops seq_idx
+(integrations/hub_kernels.py:850,860), so in every linear-attention layer the first three tokens of each packed
+sequence see the last tokens of the sequence before it; on 5.22.0 it raises ValueError on seq_idx instead
+(hub_kernels.py:1033-1040). Upstream's port in #8390, the previous patch, sends packed rows through it, and patch
+0024's FLA kernel is never reached.
+
+The forward now takes transformers' convolution only when is_causal_conv1d_available(). Without the package, packed
+rows take the FLA kernel and unpacked rows nn.Conv1d, as on transformers 5.12, whose causal_conv1d_fn is None without
+the package (modeling_qwen3_5.py:66-69 in 5.12.1). transformers.utils exports is_causal_conv1d_available in every
+release from 5.10.3 to 5.22.2 (utils/__init__.py:126 in 5.22.0).
+---
+ .../models/test_qwen3_5_monkey_patch_on_cpu.py  | 17 +++++++++++++++++
+ verl/models/transformers/qwen3_5.py             |  7 ++++++-
+ 2 files changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/tests/models/test_qwen3_5_monkey_patch_on_cpu.py b/tests/models/test_qwen3_5_monkey_patch_on_cpu.py
+index ac1f57ca1eb21db65a896ffe8777bddef77882f8..5f2f7014cefd43197fa6b77458d38c6f7bec0759 100644
+--- a/tests/models/test_qwen3_5_monkey_patch_on_cpu.py
++++ b/tests/models/test_qwen3_5_monkey_patch_on_cpu.py
+@@ -93,9 +93,26 @@ def test_the_decoder_layer_runs_the_mixer_its_type_names(type_name, layer_type,
+ @pytest.mark.parametrize("kernels_on_layer", [True, False])  # transformers 5.12, 5.16 and later
+ def test_the_gated_delta_net_runs_the_kernels_where_its_transformers_keeps_them(monkeypatch, kernels_on_layer):
+     calls = []
++    monkeypatch.setattr(qwen3_5, "is_causal_conv1d_available", lambda: True)  # the causal-conv1d package installed
+     layer = _gated_delta_net(monkeypatch, _kernels(calls), kernels_on_layer)
+ 
+     output = qwen3_5.qwen3_5_gated_delta_net_forward(layer, torch.randn(1, 3, HIDDEN))
+ 
+     assert output.shape == (1, 3, HEAD_DIM)
+     assert calls == ["convolution", "gated delta rule"]
++
++
++def test_packed_rows_take_the_fla_convolution_without_the_causal_conv1d_package(monkeypatch):
++    calls = []
++
++    def packed_causal_conv1d(layer, mixed_qkv, cu_seqlens, cu_seqlens_cpu):
++        calls.append("FLA convolution")
++        return mixed_qkv
++
++    monkeypatch.setattr(qwen3_5, "is_causal_conv1d_available", lambda: False)
++    monkeypatch.setattr(qwen3_5, "_packed_causal_conv1d", packed_causal_conv1d)
++    layer = _gated_delta_net(monkeypatch, _kernels(calls))
++
++    qwen3_5.qwen3_5_gated_delta_net_forward(layer, torch.randn(1, 3, HIDDEN), cu_seqlens=torch.tensor([0, 1, 3]))
++
++    assert calls == ["FLA convolution", "gated delta rule"]
+diff --git a/verl/models/transformers/qwen3_5.py b/verl/models/transformers/qwen3_5.py
+index 35ff13e4389be67a4a07eda54d93d12d356aeddc..325cb182eeea87b648625606961ec0323450efe2 100644
+--- a/verl/models/transformers/qwen3_5.py
++++ b/verl/models/transformers/qwen3_5.py
+@@ -27,6 +27,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
+     Qwen3_5CausalLMOutputWithPast,
+     Qwen3_5ForConditionalGeneration,
+ )
++from transformers.utils import is_causal_conv1d_available
+ 
+ from verl.utils.ulysses import (
+     get_ulysses_sequence_parallel_group,
+@@ -230,7 +231,11 @@ def qwen3_5_gated_delta_net_forward(
+ 
+     module = import_module(self.__class__.__module__)
+     hidden_states = module.apply_mask_to_padding_states(hidden_states, attention_mask)
+-    causal_conv1d_fn = self.causal_conv1d_fn if hasattr(self, "causal_conv1d_fn") else module.causal_conv1d_fn
++    # transformers >= 5.16 never sets causal_conv1d_fn to None: without the causal-conv1d package its torch fallback
++    # cannot keep packed sequences apart (5.16 drops seq_idx, 5.22 raises on it), so packed rows take FLA's kernel below
++    causal_conv1d_fn = None
++    if is_causal_conv1d_available():
++        causal_conv1d_fn = self.causal_conv1d_fn if hasattr(self, "causal_conv1d_fn") else module.causal_conv1d_fn
+     causal_conv1d_update = (
+         self.causal_conv1d_update if hasattr(self, "causal_conv1d_update") else module.causal_conv1d_update
+     )

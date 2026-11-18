@@ -7,5 +7,6 @@ class BlackwellNvfp4DraftExtension(CudaExtension):
 
     OP_NAMESPACE = "pear_deploy_blackwell_nvfp4_draft"
     # no fast math: the kernel reproduces the lowerings of vLLM's kernels (div.full, ex2.approx, rsqrt.approx)
-    CUDA_FLAGS = ("-O3", "-std=c++17", "-lineinfo")
+    # no -std: torch adds the C++ standard its headers need
+    CUDA_FLAGS = ("-O3", "-lineinfo")
     LINK_FLAGS = ()

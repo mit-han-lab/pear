@@ -13,6 +13,7 @@ from vllm.v1.attention.backends.gdn_attn import (
 )
 
 from pear.models.qwen3_5.gdn_constants import L2_NORM_EPS
+from pear.models.qwen3_5.rollout.blackwell.flashinfer_launchers import FlashInferChunk
 from pear.models.qwen3_5.rollout.blackwell.triton_launcher import TritonLauncher
 from pear.models.qwen3_5.rollout.gdn import RolloutGDNAttention, RolloutGDNMetadataBuilder
 from pear.models.qwen3_5.rollout.gdn_dims import GDNDims
@@ -297,7 +298,6 @@ def _norm_kernel(
 class LayerConstants(NamedTuple):
     """A Gated DeltaNet layer's state pools, their strides, its weights and its sizes."""
 
-    kv_cache: list  # the layer's KV cache the pools were read from
     conv_state: torch.Tensor  # the conv state pool
     state_pool: torch.Tensor  # the recurrent state pool
     stride_sb: int  # the conv state pool's strides over blocks, channels and taps
@@ -344,40 +344,6 @@ class SideStream:
             cls.instance = cls()
 
         return cls.instance
-
-
-class FlashInferChunk:
-    """FlashInfer's Blackwell chunked GDN kernel on packed states, called through its compiled function."""
-
-    def __init__(self):
-        self.compiled_kernel = None
-        self.workspace = None
-        self.cuda = None
-
-    def __call__(self, q, k, v, g, beta, out, cu_seqlens, s_in, s_out, scale) -> None:
-        """One call of the chunked kernel over the prefill rows."""
-        if self.compiled_kernel is None:
-            # the first call goes through FlashInfer's wrapper, which compiles
-            from flashinfer.gdn_kernels.blackwell import gdn_prefill as fi
-
-            fi.chunk_gated_delta_rule_sm100(q, k, v, g, beta, out, cu_seqlens, s_in, s_out, scale)
-
-            # FlashInfer's key of this call: GQA when there are not fewer q heads than v heads; initial and final
-            # states given, no checkpoints, packed states (no state indices)
-            heads, v_heads = q.shape[1], v.shape[1]
-            cache = fi._get_compiled_cache(
-                str(q.dtype), str(torch.float32), heads, v_heads, heads >= v_heads, True, True, False, False
-            )
-            self.compiled_kernel = cache["compiled"]
-            # the persistent kernel's TMA-descriptor workspace is sized per SM, so one serves any number of sequences
-            self.workspace = cache[f"workspace_{q.device.index}"]
-            self.cuda = fi.cuda
-            return
-
-        stream = self.cuda.CUstream(torch._C._cuda_getCurrentRawStream(q.device.index))
-        self.compiled_kernel(
-            q, k, v, g, beta, out, cu_seqlens, s_in, s_out, None, None, None, 0, scale, self.workspace, stream
-        )
 
 
 class GDNScratch:
@@ -466,62 +432,50 @@ class StagedBuffers:
 
 
 class MixedStepMetadata:
-    """The GDN metadata of a step with prefill tokens from the host-side batch layout: numpy and one copy to the GPU."""
+    """The GDN metadata of a step with prefill rows from the host-side batch layout: numpy and one copy to the GPU."""
 
     @staticmethod
-    def build(builder, m) -> GDNAttentionMetadata | None:
-        """What GDNCore.mixed_step reads, None when the step does not qualify (vLLM then builds it)."""
-        # vLLM builds the conv kernel's program map with Python loops and fresh pinned tensors, the state indices and
-        # initial-state flags with small device ops
-        num_computed, seq_lens = m._num_computed_tokens_cpu, m._seq_lens_cpu
-        if num_computed is None or seq_lens is None:
-            return None
-
+    def build(builder: RolloutGDNMetadataBuilder, m) -> GDNAttentionMetadata | None:
+        """What GDNCore.mixed_step reads, None for a step without prefill rows (vLLM builds it: the decode kernels'
+        FULL-graph buffers)."""
+        # vLLM builds the conv kernel's program map with Python loops and fresh pinned tensors, the initial-state flags
+        # with small device ops
         num_reqs = m.num_reqs
+        D = builder.num_decodes(m)
+        if D == num_reqs:
+            return None
+
         qsl = m.query_start_loc_cpu.numpy()[: num_reqs + 1]
-        T = int(qsl[num_reqs])
-        if T != m.num_actual_tokens:
-            return None
-
         query_lens = np.diff(qsl)
-        is_prefill = query_lens > 1
-        if not is_prefill.any():
-            return None
-        D = int(np.argmax(is_prefill))  # the batch is ordered: decodes (1 token) first
-        if (query_lens[D:] < 1).any() or (query_lens[:D] != 1).any():
-            return None
-
         num_prefills = num_reqs - D
         chunks = -(-query_lens[D:] // CONV_TOKENS)
         num_programs = D + int(chunks.sum())
-        state_columns = np.maximum((seq_lens.numpy()[:num_reqs] - 1) // builder.kv_cache_spec.block_size, 0)
-        initial_state_flags = num_computed.numpy()[:num_reqs] > 0
         host_buffer, device_buffer = StagedBuffers.next_buffers(m.query_start_loc.device)
-        num_slots = 3 * num_reqs + 1 + 2 * num_programs
-        if num_slots > host_buffer.numel():
+
+        # one int32 array: the requests' initial-state flags | the prefill rows' query starts | conv program ->
+        # sequence | conv program -> chunk of its sequence (a conv program per decode row and per CONV_TOKENS tokens,
+        # begun, of a prefill row)
+        query_starts_offset = num_reqs
+        batch_ptr_offset = query_starts_offset + num_prefills + 1
+        chunk_ptr_offset = batch_ptr_offset + num_programs
+        size = chunk_ptr_offset + num_programs
+        if size > host_buffer.numel():
             return None
 
-        # one int32 array: block-table columns | initial-state flags | prefill query starts | conv program -> sequence |
-        # conv program -> chunk of its sequence
         host_array = host_buffer.numpy()
-        host_array[0:num_reqs] = state_columns
-        host_array[num_reqs : 2 * num_reqs] = initial_state_flags
-        host_array[2 * num_reqs : 3 * num_reqs - D + 1] = qsl[D:] - D
-        batch_ptr_start = 3 * num_reqs - D + 1
-        host_array[batch_ptr_start : batch_ptr_start + D] = np.arange(D)
-        host_array[batch_ptr_start + D : batch_ptr_start + num_programs] = np.repeat(np.arange(D, num_reqs), chunks)
-        chunk_ptr_start = batch_ptr_start + num_programs
-        host_array[chunk_ptr_start : chunk_ptr_start + D] = 0
-        host_array[chunk_ptr_start + D : chunk_ptr_start + num_programs] = np.arange(num_programs - D) - np.repeat(
-            np.cumsum(chunks) - chunks, chunks
-        )
-        total = chunk_ptr_start + num_programs
-        device_array = device_buffer[:total]
-        device_array.copy_(host_buffer[:total], non_blocking=True)
+        host_array[:num_reqs] = m.seq_lens_cpu_upper_bound.numpy()[:num_reqs] > query_lens
+        host_array[query_starts_offset:batch_ptr_offset] = qsl[D:] - qsl[D]
+        host_array[batch_ptr_offset : batch_ptr_offset + D] = np.arange(D)
+        host_array[batch_ptr_offset + D : chunk_ptr_offset] = np.repeat(np.arange(D, num_reqs), chunks)
+        host_array[chunk_ptr_offset : chunk_ptr_offset + D] = 0
+        first_programs = np.repeat(np.cumsum(chunks) - chunks, chunks)  # each prefill row's first program, per program
+        host_array[chunk_ptr_offset + D : size] = np.arange(num_programs - D) - first_programs
+        device_array = device_buffer[:size]
+        device_array.copy_(host_buffer[:size], non_blocking=True)
 
-        column_index = device_array[0:num_reqs].long().unsqueeze(1)
-        idx = torch.gather(m.block_table_tensor[:num_reqs], 1, column_index)[:, 0]
-        has_initial_state = device_array[num_reqs : 2 * num_reqs]
+        idx = builder.state_slots(m.block_table_tensor, num_reqs).contiguous()
+        has_initial_state = device_array[:num_reqs]
+        T = int(qsl[num_reqs])
 
         md = GDNAttentionMetadata(
             num_prefills=num_prefills,
@@ -534,15 +488,13 @@ class MixedStepMetadata:
             has_initial_state=has_initial_state,
             non_spec_query_start_loc=m.query_start_loc,
             non_spec_state_indices_tensor=idx,
-            prefill_query_start_loc=device_array[2 * num_reqs : 3 * num_reqs - D + 1],
+            prefill_query_start_loc=device_array[query_starts_offset:batch_ptr_offset],
             prefill_state_indices=idx[D:],
             prefill_has_initial_state=has_initial_state[D:],
             nums_dict={CONV_TOKENS: {"tot": num_programs}},
-            batch_ptr=device_array[batch_ptr_start : batch_ptr_start + num_programs],
-            token_chunk_offset_ptr=device_array[chunk_ptr_start : chunk_ptr_start + num_programs],
+            batch_ptr=device_array[batch_ptr_offset:chunk_ptr_offset],
+            token_chunk_offset_ptr=device_array[chunk_ptr_offset:size],
         )
-        md._pear_common_attn_metadata = m
-        md._pear_state_columns = column_index
         md._pear_layout = GDNLayout(md)
 
         return md
@@ -776,9 +728,9 @@ class GDNCore:
 
     @staticmethod
     def constants(layer) -> LayerConstants:
-        """The layer's state pools, strides, weights and sizes, kept while its KV cache stays the same."""
+        """The layer's state pools, strides, weights and sizes, kept until vLLM binds or releases its KV cache."""
         constants = layer.__dict__.get("_pear_layer_constants")
-        if constants is None or constants.kv_cache is not layer.kv_cache:
+        if constants is None:
             conv_state, state_pool = layer.kv_cache[0], layer.kv_cache[1]
             if is_conv_state_dim_first():  # [blocks, C, 3]
                 stride_sb, stride_sc, stride_sk = conv_state.stride()
@@ -786,7 +738,6 @@ class GDNCore:
                 stride_sb, stride_sk, stride_sc = conv_state.stride()
             # the weights by reference: a weight sync updates them in place
             constants = layer._pear_layer_constants = LayerConstants(
-                kv_cache=layer.kv_cache,
                 conv_state=conv_state,
                 state_pool=state_pool,
                 stride_sb=stride_sb,
@@ -808,14 +759,25 @@ class GDNCore:
 class BlackwellGDNAttention(RolloutGDNAttention):
     """vLLM's Qwen Gated DeltaNet layer on GDNCore (registered out of tree in its place)."""
 
+    @property
+    def kv_cache(self):
+        """The state pools vLLM bound to the layer (MambaBase.bind_kv_cache)."""
+        try:
+            return self.__dict__["state_pools"]
+        except KeyError:
+            raise AttributeError("kv_cache") from None  # none bound yet: vLLM's hasattr sees no cache
+
+    @kv_cache.setter
+    def kv_cache(self, kv_cache):
+        # GDNCore's constants hold the pools and so their memory: they go when vLLM binds another cache or releases this
+        # one, as it releases its CUDA graph memory profiling's cache before it allocates the real one
+        self.__dict__["state_pools"] = kv_cache
+        self.__dict__.pop("_pear_layer_constants", None)
+
     def forward_cuda(self, hidden_states):
         # vLLM's fused path zero-fills the core output of every layer; GDNCore writes every row it computes (a
         # piecewise-graph batch's padding rows are never read back), so it starts uninitialized
-        if not (
-            self.enable_fused_gdn_decode
-            and hidden_states.dtype == torch.bfloat16
-            and self.norm.weight.dtype in (torch.bfloat16, torch.float32)
-        ):
+        if not self.computes_core(hidden_states):
             return super().forward_cuda(hidden_states)
 
         mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
@@ -829,9 +791,10 @@ class BlackwellGDNAttention(RolloutGDNAttention):
         return self.fused_core(mixed_qkvz, ba, core_attn_out)
 
     def _forward_core_fused_norm_packed(self, mixed_qkvz, ba, core_attn_out):
+        # no metadata of the layer (a profiling run leaves the GDN groups out): vLLM's warm-up of its prefill kernels
         attn_metadata = get_forward_context().attn_metadata
-        if type(attn_metadata) is dict:
-            md = attn_metadata[self.prefix]
+        md = attn_metadata.get(self.prefix) if isinstance(attn_metadata, dict) else None
+        if md is not None:
             layout = md.__dict__.get("_pear_layout")
             if layout is not None:
                 return GDNCore.mixed_step(self, mixed_qkvz, ba, core_attn_out, layout)
@@ -848,41 +811,34 @@ class BlackwellGDNAttention(RolloutGDNAttention):
 
 class BlackwellGDNMetadataBuilder(RolloutGDNMetadataBuilder):
     """vLLM's GDN metadata builder with a mixed step's metadata from MixedStepMetadata, shared by the GDN layers'
-    groups."""
+    groups; the other steps' as vLLM builds them (the decode steps' FULL-graph buffers are per builder)."""
 
-    # The GDN layers' KV cache groups differ only in their block tables: in a mixed step the runner builds the first
-    # group's metadata and derives the others' from it (update_block_table), swapping in the group's state indices
-    # (one gather). Other steps (pure decode, whose FULL-graph buffers are per builder) are built in full.
-    supports_update_block_table = True
-
-    def build(self, common_prefix_len, common_attn_metadata, *args, **kwargs):
-        if not self.use_spec_decode and not args and not kwargs:
+    def build(
+        self,
+        common_prefix_len,
+        common_attn_metadata,
+        num_accepted_tokens=None,
+        num_decode_draft_tokens_cpu=None,
+        fast_build=False,
+    ):
+        # vLLM's V2 runner hands every GDN build the draft-token arguments, None without a drafter; a FULL graph's
+        # capture passes them for its decode batch
+        if num_decode_draft_tokens_cpu is None:
             md = MixedStepMetadata.build(self, common_attn_metadata)
             if md is not None:
                 return md
 
-        md = super().build(common_prefix_len, common_attn_metadata, *args, **kwargs)
-        md._pear_common_attn_metadata = common_attn_metadata
-        if md.num_prefills > 0 and md.spec_sequence_masks is None and md.nums_dict is not None:
-            md._pear_layout = GDNLayout(md)
-            # the state block of every request: its block-table column (as mamba_get_block_table_tensor gathers it)
-            md._pear_state_columns = (
-                ((common_attn_metadata.seq_lens - 1) // self.kv_cache_spec.block_size)
-                .clamp_(min=0)
-                .to(torch.int64)
-                .unsqueeze(1)
-            )
-
-        return md
+        return super().build(
+            common_prefix_len, common_attn_metadata, num_accepted_tokens, num_decode_draft_tokens_cpu, fast_build
+        )
 
     def update_block_table(self, metadata, blk_table, slot_mapping):
         layout = metadata.__dict__.get("_pear_layout")
         if layout is None:
-            return self.build(
-                0, self.group_common_metadata(metadata._pear_common_attn_metadata, blk_table, slot_mapping)
-            )
+            return super().update_block_table(metadata, blk_table, slot_mapping)
 
-        idx = torch.gather(blk_table, 1, metadata._pear_state_columns)[:, 0]
+        # a mixed step: the first group's metadata and layout with this group's state slots
+        idx = self.state_slots(blk_table, metadata.num_decodes + metadata.num_prefills).contiguous()
         group_metadata = copy.copy(metadata)
         group_metadata.non_spec_state_indices_tensor = idx
         group_metadata.prefill_state_indices = idx[metadata.num_decodes :]
@@ -892,14 +848,6 @@ class BlackwellGDNMetadataBuilder(RolloutGDNMetadataBuilder):
         group_metadata._pear_layout = group_layout
 
         return group_metadata
-
-    def _build_chunk_metadata(self, *args, **kwargs):
-        # the FLA chunk metadata (built on the host, copied every step) feeds only the Triton / CuTe-DSL prefill
-        # backends; FlashInfer's and GDNCore never read it
-        if self.gdn_prefill_backend == "flashinfer":
-            return None, None
-
-        return super()._build_chunk_metadata(*args, **kwargs)
 
 
 class BlackwellGDNBackend(GDNAttentionBackend):

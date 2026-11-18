@@ -46,6 +46,8 @@ serve() {
   # the replicas' variables, as on a machine of a Ray cluster
   # shellcheck source=../../scripts/gpu_process_variables.sh
   source "$ROOT/scripts/gpu_process_variables.sh" "$VERL_ENV"
+  # the all-reduces of the training replicas (their runtime env, pear/configs/base.yaml): vLLM's own, not FlashInfer's
+  export VLLM_ALLREDUCE_USE_FLASHINFER=0
 
   REPLICA_PIDS=()
   # the replicas end with this script, as when a signal ends it; they may have ended already

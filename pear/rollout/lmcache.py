@@ -35,6 +35,9 @@ class LMCacheSidecar:
     EVICTION_WATERMARK = 0.8  # tier fill level that triggers eviction
     POLL_S = 5.0  # between checks of the sidecar's log while it pins
     CLEAR_PATH = "/cache/clear"  # the sidecar's HTTP API path that clears the whole tier
+    # forced: a clear that is not keeps read-locked objects and stores in flight, the KV of the weights just replaced
+    CLEAR_BODY = {"tier": "l1", "force": True}
+    CONNECTOR_MODULE = "lmcache.integration.vllm.lmcache_mp_connector"  # LMCache's own connector, by its module
     CLEAR_TIMEOUT_S = 120.0  # a force-clear is bookkeeping; beyond this the sidecar is stuck
     ERROR_TEXT_CHARS = 200  # of the sidecar's answer, in the error of a failed clear
     NUMA_MIN_LOCAL_FRACTION = 0.95  # share of the sidecar's resident memory that must be on its NUMA node
@@ -42,10 +45,9 @@ class LMCacheSidecar:
         rb"now total is (\d+) MB / (\d+) MB"
     )  # the pin-progress line: MB pinned so far / MB in the tier
 
-    def __init__(self, cuda_visible_devices: str, l1_size_gb: int, chunk_size: int, log_path: Path) -> None:
+    def __init__(self, cuda_visible_devices: str, l1_size_gb: int, log_path: Path) -> None:
         self.cuda_visible_devices = cuda_visible_devices
         self.l1_size_gb = l1_size_gb
-        self.chunk_size = chunk_size
         self.log_path = log_path
 
         gpus = [int(g) for g in cuda_visible_devices.split(",") if g.strip()]
@@ -81,8 +83,8 @@ class LMCacheSidecar:
             str(self.port),
             "--http-port",
             str(self.http_port),
-            "--chunk-size",
-            str(self.chunk_size),
+            # no --chunk-size: LMCache's default is the least chunk, which its vLLM connector raises to a multiple of
+            # the engine's KV cache block (all its groups' blocks) when the replica registers
             "--separate-object-groups",
             "--l1-size-gb",
             str(self.l1_size_gb),
@@ -119,8 +121,18 @@ class LMCacheSidecar:
         """vLLM's kv_transfer_config of the replica whose KV cache this sidecar keeps."""
         return {
             "kv_connector": "LMCacheMPConnector",
+            # named by its module: without it vLLM falls back to its built-in connector, which refuses hybrid models,
+            # whenever LMCache's import fails, and says so only at INFO
+            "kv_connector_module_path": self.CONNECTOR_MODULE,
             "kv_role": "kv_both",
-            "kv_connector_extra_config": {"lmcache.mp.host": f"tcp://{self.HOST}", "lmcache.mp.port": self.port},
+            "kv_connector_extra_config": {
+                "lmcache.mp.host": f"tcp://{self.HOST}",
+                "lmcache.mp.port": self.port,
+                # the next turn carries this turn's generated tokens verbatim: their chunks are stored too
+                "lmcache.mp.save_decode_cache": True,
+                # vLLM's KV cache allocated as the engine sizes it (enable_extensible_kv_cache off), shared over CUDA IPC
+                "lmcache.mp.use_vmm_api": False,
+            },
         }
 
     async def clear(self) -> int:
@@ -128,7 +140,7 @@ class LMCacheSidecar:
         url = f"http://{self.HOST}:{self.http_port}{self.CLEAR_PATH}"
 
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.CLEAR_TIMEOUT_S)) as session:
-            async with session.post(url) as response:
+            async with session.post(url, json=self.CLEAR_BODY) as response:
                 if response.status != 200:
                     raise RuntimeError(
                         f"LMCache invalidate {self.CLEAR_PATH} -> {response.status}: "
@@ -233,7 +245,6 @@ class LMCacheVLLMServer(vLLMHttpServer):
         sidecar = LMCacheSidecar(
             os.environ[get_visible_devices_keyword()],
             int(lmcache_config["l1_size_gb"]),
-            int(lmcache_config["chunk_size"]),
             log_dir / f"lmcache_replica{self.replica_rank}_node{self.node_rank}.log",
         )
         sidecar.start()

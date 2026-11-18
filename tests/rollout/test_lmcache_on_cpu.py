@@ -28,8 +28,9 @@ import sys
 
 class Sidecar(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
         with open(os.environ["SIDECAR_RECORD"] + ".requests", "a") as requests:
-            requests.write(self.path + "\\n")
+            requests.write(json.dumps({"path": self.path, "body": json.loads(body or "null")}) + "\\n")
         self.send_response(int(os.environ.get("SIDECAR_CLEAR_STATUS", "200")))
         self.end_headers()
         self.wfile.write(b"the stand-in's answer")
@@ -79,8 +80,13 @@ class StandIn:
     def record(self) -> dict:
         return json.loads(self.record_path.read_text())
 
+    def clears(self) -> list[dict]:
+        """The clears the stand-in answered, each with its path and its JSON body."""
+        lines = self.requests_path.read_text().splitlines() if self.requests_path.exists() else []
+        return [json.loads(line) for line in lines]
+
     def cleared_paths(self) -> list[str]:
-        return self.requests_path.read_text().split() if self.requests_path.exists() else []
+        return [clear["path"] for clear in self.clears()]
 
     def is_running(self) -> bool:
         stat_path = Path(f"/proc/{self.record()['pid']}/stat")
@@ -140,7 +146,7 @@ class Replica:
     @classmethod
     def server(cls, stand_in: StandIn, enable: bool = True, enable_sleep_mode: bool = False) -> PearVLLMServer:
         server = object.__new__(PearVLLMServer)
-        lmcache_config = {"enable": enable, "log_dir": str(stand_in.log_dir), "l1_size_gb": 1, "chunk_size": 256}
+        lmcache_config = {"enable": enable, "log_dir": str(stand_in.log_dir), "l1_size_gb": 1}
         server.config = SimpleNamespace(
             custom={"lmcache": lmcache_config}, enable_sleep_mode=enable_sleep_mode, fp32_modules=[]
         )
@@ -208,13 +214,13 @@ def test_a_replica_starts_its_sidecar_and_names_it_to_vllm(stand_in, logged_line
     arguments = record["arguments"]
     port = arguments[arguments.index("--port") + 1]
     http_port = arguments[arguments.index("--http-port") + 1]
-    # bound to the NUMA node of its GPUs, the CLI of the replica's own interpreter
+    # bound to the NUMA node of its GPUs, the CLI of the replica's own interpreter; its chunk the one LMCache's
+    # connector settles on with the engine
     assert arguments[:6] == ["--cpunodebind=0", "--membind=0", sys.executable, "-m", "lmcache.cli.main", "server"]
     assert arguments[6:] == [
         *("--host", "127.0.0.1"),
         *("--port", port),
         *("--http-port", http_port),
-        *("--chunk-size", "256"),
         "--separate-object-groups",
         *("--l1-size-gb", "1"),
         *("--eviction-policy", "LRU"),
@@ -231,8 +237,14 @@ def test_a_replica_starts_its_sidecar_and_names_it_to_vllm(stand_in, logged_line
     assert engine_kwargs == {
         "kv_transfer_config": {
             "kv_connector": "LMCacheMPConnector",
+            "kv_connector_module_path": "lmcache.integration.vllm.lmcache_mp_connector",
             "kv_role": "kv_both",
-            "kv_connector_extra_config": {"lmcache.mp.host": "tcp://127.0.0.1", "lmcache.mp.port": int(port)},
+            "kv_connector_extra_config": {
+                "lmcache.mp.host": "tcp://127.0.0.1",
+                "lmcache.mp.port": int(port),
+                "lmcache.mp.save_decode_cache": True,
+                "lmcache.mp.use_vmm_api": False,
+            },
         }
     }
     assert "now total is 1024 MB / 1024 MB" in Replica.log_path(stand_in).read_text()
@@ -284,7 +296,8 @@ def test_the_clear_of_a_replica_s_caches_reaches_its_sidecar_after_vllm_s_own(st
     asyncio.run(server.clear_kv_cache())
 
     assert server.engine.cleared_paths_at_reset == []
-    assert stand_in.cleared_paths() == ["/cache/clear"]
+    # forced: a clear that is not keeps read-locked objects and stores in flight
+    assert stand_in.clears() == [{"path": "/cache/clear", "body": {"tier": "l1", "force": True}}]
     assert logged_lines == [("WARNING", f"LMCache invalidate /cache/clear -> 200 (replica {Replica.RANK})")]
 
 

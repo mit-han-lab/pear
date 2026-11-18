@@ -1,0 +1,443 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [mp] fix: a STORE reads vLLM's current block table, not
+ blocks vLLM has freed
+
+A STORE took its block IDs from the request tracker, which appends the IDs vLLM reports and never learns that vLLM
+freed one: align-mode Mamba frees the state block a request has moved past (MambaManager.remove_skipped_blocks, every
+step), and a sliding window the blocks it has left. A freed block without a prefix-cache hash goes to the head of
+vLLM's free queue, where the next allocation of the same scheduler step takes it, and with vLLM's default
+prefix_cache_retention_interval of 0 the Mamba state at a chunk boundary inside a decode has no hash. With
+save_decode_cache, the STORE of a decode chunk whose end the request passed with accepted draft tokens is built in the
+following step, after vLLM freed the chunk's state block, so it pinned and read a block another request then held:
+that request's state or KV went into LMCache under this chunk's hash, and when the block was that request's
+speculative Mamba block, its relocation on that request's next chunk of several blocks failed vLLM 0.34's assertion
+"Speculative Mamba blocks must be exclusively owned and unhashed before relocation" and stopped the engine.
+
+vLLM hands a producer connector the current block table of every request it schedules (the scheduler output's
+kv_connector_block_state), and its own Mooncake store connector takes a STORE's blocks from it before it references
+them. GetStoreMetadata and GetUnfullChunkStoreMetadata now slice that table (LMCacheMPRequestTracker.current_block_ids):
+a block vLLM freed is the null block there, which a STORE neither pins nor stores. A vLLM without the block state keeps
+the tracked IDs.
+
+tests/v1/test_mp_store_current_block_table.py runs the sequence on vLLM's own BlockPool, MambaManager (align mode,
+three speculative blocks) and FullAttentionManager: the STORE reads the null block for the freed state, the other
+request's speculative block keeps a single reference, and vLLM relocates it. The scheduler output of
+tests/v1/test_mp_connector_unfull_chunk.py carries a KVConnectorBlockState with the trackers' table.
+---
+ .../integration/vllm/lmcache_mp_connector.py  |  10 +-
+ .../integration/vllm/lmcache_mp_metadata.py   |  32 ++-
+ tests/v1/test_mp_connector_unfull_chunk.py    |  13 +-
+ tests/v1/test_mp_store_current_block_table.py | 219 ++++++++++++++++++
+ 4 files changed, 268 insertions(+), 6 deletions(-)
+ create mode 100644 tests/v1/test_mp_store_current_block_table.py
+
+diff --git a/lmcache/integration/vllm/lmcache_mp_connector.py b/lmcache/integration/vllm/lmcache_mp_connector.py
+index 67cf5176130110a03b5a9c31671105ce233ba8cb..776f6f6bb3d84aec705a95acc686da31c0f5750a 100644
+--- a/lmcache/integration/vllm/lmcache_mp_connector.py
++++ b/lmcache/integration/vllm/lmcache_mp_connector.py
+@@ -2053,6 +2053,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+         metadata: LMCacheMPConnectorMetadata,
+     ) -> None:
+         lmcache_tokens_per_chunk = self.scheduler_adapter.lmcache_tokens_per_chunk
++        # vLLM's current block tables; None from a vLLM that offers none.
++        block_state = getattr(scheduler_output, "kv_connector_block_state", None)
+ 
+         for new_request in scheduler_output.scheduled_new_reqs:
+             request_tracker = self._get_request_tracker(new_request.req_id)
+@@ -2071,6 +2073,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+                 lmcache_tokens_per_chunk,
+                 self._group_tokens_per_block,
+                 save_decode_cache=self._save_decode_cache,
++                block_state=block_state,
+             )
+             if r_meta is not None:
+                 # In lazy_offload mode, add to pending queue instead of immediate store
+@@ -2090,6 +2093,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+         metadata: LMCacheMPConnectorMetadata,
+     ) -> None:
+         lmcache_tokens_per_chunk = self.scheduler_adapter.lmcache_tokens_per_chunk
++        # vLLM's current block tables; None from a vLLM that offers none.
++        block_state = getattr(scheduler_output, "kv_connector_block_state", None)
+ 
+         cached_reqs = scheduler_output.scheduled_cached_reqs
+         # vLLM MRV2 readmits resumed requests as full new requests.
+@@ -2120,6 +2125,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+                 lmcache_tokens_per_chunk,
+                 self._group_tokens_per_block,
+                 save_decode_cache=self._save_decode_cache,
++                block_state=block_state,
+             )
+ 
+             if r_meta is not None:
+@@ -2319,8 +2325,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+         """
+         boundary_state_blocks: dict[int, dict[int, int]] = {}
+         pool = self._gpu_block_pool
++        # vLLM's current block tables; None from a vLLM that offers none.
++        block_state = getattr(scheduler_output, "kv_connector_block_state", None)
+         if self._boundary_state_groups:
+-            block_state = scheduler_output.kv_connector_block_state
+             # Without the pool a boundary-state block cannot be pinned.
+             if block_state is None or pool is None:
+                 return
+@@ -2338,6 +2345,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+             self._unfull_chunk_grid,
+             boundary_state_blocks,
+             self._boundary_state_groups,
++            block_state=block_state,
+         ):
+             self._add_store_metadata(metadata, r_meta)
+             tracker.store_scheduled = True
+diff --git a/lmcache/integration/vllm/lmcache_mp_metadata.py b/lmcache/integration/vllm/lmcache_mp_metadata.py
+index 1c3f91026976ed9fd7c6c816219f22ba9fb316f0..cff01230d59a6661e1fb4972e4839191d4960487 100644
+--- a/lmcache/integration/vllm/lmcache_mp_metadata.py
++++ b/lmcache/integration/vllm/lmcache_mp_metadata.py
+@@ -31,6 +31,7 @@ from lmcache.v1.common.token_codec import (
+ 
+ if TYPE_CHECKING:
+     # Third Party
++    from vllm.v1.core.sched.output import KVConnectorBlockState
+     from vllm.v1.request import Request
+ 
+ 
+@@ -242,6 +243,24 @@ class LMCacheMPRequestTracker:
+             for engine_group_idx, blocks in self.allocated_block_ids.items()
+         }
+ 
++    def current_block_ids(
++        self, block_state: "KVConnectorBlockState | None"
++    ) -> Mapping[int, list[int]]:
++        """Return the block IDs a STORE of this step reads, per engine group:
++        vLLM's current block table, or the tracked IDs from a vLLM that offers
++        none (``block_state`` None)."""
++        # vLLM frees a block the request moved past (an align-mode Mamba state, a
++        # block outside a sliding window) without reporting it and may hand it
++        # to another request in the same step; its table holds the null block.
++        if block_state is None:
++            return self.allocated_block_ids
++        block_ids = block_state.get_block_ids(self.request_id)
++        if block_ids is None:
++            raise RuntimeError(
++                f"vLLM offered no block table for request {self.request_id}"
++            )
++        return dict(enumerate(block_ids))
++
+     def get_token_ids(self) -> list[int]:
+         """Return the token ids to use for LMCache key derivation."""
+         if not self.mm_adjusted_prompt_ids:
+@@ -328,6 +347,7 @@ class LMCacheMPRequestMetadata:
+         group_tokens_per_block: list[int],
+         *,
+         save_decode_cache: bool = False,
++        block_state: "KVConnectorBlockState | None" = None,
+     ) -> "LMCacheMPRequestMetadata | None":
+         """
+         Generate the store metadata for the current request tracker.
+@@ -343,6 +363,9 @@ class LMCacheMPRequestMetadata:
+             save_decode_cache: Whether to store chunks containing generated
+                 tokens. Defaults to storing only complete chunks within the
+                 initial prompt, including when decode fills its partial tail.
++            block_state: vLLM's connector block state of this step; the store
++                reads the request's blocks from its current block table
++                (``LMCacheMPRequestTracker.current_block_ids``).
+ 
+         Returns:
+             Metadata for newly storable chunks, or None when no complete
+@@ -408,7 +431,7 @@ class LMCacheMPRequestMetadata:
+             start_token_idx = tracker.num_stored_tokens
+             end_token_idx = start_token_idx + num_chunks * lmcache_tokens_per_chunk
+             block_ids = slice_block_ids_per_group(
+-                tracker.allocated_block_ids,
++                tracker.current_block_ids(block_state),
+                 group_tokens_per_block,
+                 start_token_idx,
+                 end_token_idx,
+@@ -443,6 +466,8 @@ class LMCacheMPRequestMetadata:
+         tail_grid_tokens: int,
+         boundary_state_blocks: Mapping[int, Mapping[int, int]],
+         boundary_state_groups: Collection[int],
++        *,
++        block_state: "KVConnectorBlockState | None" = None,
+     ) -> list[tuple["LMCacheMPRequestMetadata", list[int]]]:
+         """Generate store metadata for the prompt's newly storable unfull chunks.
+ 
+@@ -480,6 +505,9 @@ class LMCacheMPRequestMetadata:
+                 ``{boundary token: {engine group: block id}}``.
+             boundary_state_groups: Engine groups whose state at a grid
+                 boundary must come from ``boundary_state_blocks``.
++            block_state: vLLM's connector block state of this step; the other
++                blocks come from the request's current block table
++                (``LMCacheMPRequestTracker.current_block_ids``).
+ 
+         Returns:
+             One ``(metadata, boundary-state block IDs it reads)`` pair per newly
+@@ -531,7 +559,7 @@ class LMCacheMPRequestMetadata:
+             ):
+                 continue
+             block_ids = slice_block_ids_per_group(
+-                tracker.allocated_block_ids,
++                tracker.current_block_ids(block_state),
+                 group_tokens_per_block,
+                 chunk_start,
+                 boundary,
+diff --git a/tests/v1/test_mp_connector_unfull_chunk.py b/tests/v1/test_mp_connector_unfull_chunk.py
+index 10839b8eb2f512aa2f8cc7f3bab7e42aa861ad16..4a7cb59a9fb0a5e6d4a5c174bb4b2a8e5223fa17 100644
+--- a/tests/v1/test_mp_connector_unfull_chunk.py
++++ b/tests/v1/test_mp_connector_unfull_chunk.py
+@@ -11,6 +11,7 @@ import pytest
+ pytest.importorskip("vllm", reason="MP connector imports vLLM at module top")
+ 
+ # Third Party
++from vllm.v1.core.sched.output import KVConnectorBlockState  # noqa: E402
+ from vllm.v1.request import RequestStatus  # noqa: E402
+ from vllm.v1.utils import ConstantList  # noqa: E402
+ 
+@@ -280,12 +281,18 @@ def _pool() -> MagicMock:
+ 
+ 
+ def _boundary_state_offload() -> SimpleNamespace:
+-    """A scheduler output offering the tail's boundary-state block."""
++    """A scheduler output offering the tail's boundary-state block, with the
++    request's block table as the trackers hold it."""
+     return SimpleNamespace(
+-        kv_connector_block_state=SimpleNamespace(
++        kv_connector_block_state=KVConnectorBlockState(
++            req_ids={"req-0"},
++            resolve_block_ids=lambda request_id: (
++                list(range(-(-PROMPT // 16))),
++                MAMBA_BLOCKS,
++            ),
+             boundary_state_offloads={
+                 "req-0": [(1, BOUNDARY_STATE_BLOCK, TAIL_BOUNDARY)]
+-            }
++            },
+         )
+     )
+ 
+diff --git a/tests/v1/test_mp_store_current_block_table.py b/tests/v1/test_mp_store_current_block_table.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3bb47bd09aa87f7841f98442a43824ce24231872
+--- /dev/null
++++ b/tests/v1/test_mp_store_current_block_table.py
+@@ -0,0 +1,219 @@
++# SPDX-License-Identifier: Apache-2.0
++# Standard
++from types import SimpleNamespace
++
++# Third Party
++import pytest
++
++pytest.importorskip("vllm", reason="MP connector imports vLLM at module top")
++
++# Third Party
++from vllm.v1.core.block_pool import BlockPool  # noqa: E402
++from vllm.v1.core.sched.output import KVConnectorBlockState  # noqa: E402
++from vllm.v1.core.single_type_kv_cache_manager import (  # noqa: E402
++    FullAttentionManager,
++    MambaManager,
++)
++from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec  # noqa: E402
++from vllm.v1.utils import ConstantList  # noqa: E402
++import torch  # noqa: E402
++
++# First Party
++from lmcache.integration.vllm.lmcache_mp_connector import (  # noqa: E402
++    LMCacheMPConnector,
++)
++from lmcache.integration.vllm.lmcache_mp_metadata import (  # noqa: E402
++    LMCacheMPConnectorMetadata,
++    LMCacheMPRequestTracker,
++)
++
++# Tokens per block in both groups, and per LMCache chunk.
++BLOCK = 16
++# Align-mode Mamba keeps one scratch block per draft token (MTP, 3 drafts).
++NUM_SPECULATIVE_BLOCKS = 3
++# Engine groups in vLLM's order for a model whose first layer is linear
++# attention: the Mamba group allocates first.
++MAMBA, ATTENTION = 0, 1
++# Room for both requests' blocks.
++NUM_GPU_BLOCKS = 64
++# The decoding request's prompt ends inside its second block, so its decode
++# crosses token 32.
++PROMPT = 30
++
++
++class _Engine:
++    """vLLM's block pool shared by an align-mode Mamba group and an attention
++    group, allocated per request as ``KVCacheManager.allocate_slots`` does."""
++
++    def __init__(self) -> None:
++        self.pool = BlockPool(
++            num_gpu_blocks=NUM_GPU_BLOCKS, enable_caching=True, hash_block_size=BLOCK
++        )
++        mamba_spec = MambaSpec(
++            block_size=BLOCK,
++            shapes=((1, 1),),
++            dtypes=(torch.float32,),
++            mamba_cache_mode="align",
++            num_speculative_blocks=NUM_SPECULATIVE_BLOCKS,
++        )
++        attention_spec = FullAttentionSpec(
++            block_size=BLOCK, num_kv_heads=1, head_size=1, dtype=torch.float32
++        )
++        self.managers = (
++            MambaManager(
++                mamba_spec,
++                block_pool=self.pool,
++                enable_caching=True,
++                kv_cache_group_id=MAMBA,
++                scheduler_block_size=BLOCK,
++            ),
++            FullAttentionManager(
++                attention_spec,
++                block_pool=self.pool,
++                enable_caching=True,
++                kv_cache_group_id=ATTENTION,
++                scheduler_block_size=BLOCK,
++            ),
++        )
++
++    def schedule(
++        self, request_id: str, num_processed_tokens: int, num_tokens: int
++    ) -> tuple[list[int], ...]:
++        """Run one step's allocation of a request; return the block IDs vLLM
++        reports for it."""
++        for manager in self.managers:
++            manager.remove_skipped_blocks(request_id, num_processed_tokens)
++        return tuple(
++            [
++                block.block_id
++                for block in manager.allocate_new_blocks(
++                    request_id, num_tokens, num_tokens
++                )
++            ]
++            for manager in self.managers
++        )
++
++    def block_table(self, request_id: str) -> tuple[list[int], ...]:
++        """The request's current block IDs, as ``KVCacheManager.get_block_ids``."""
++        return tuple(
++            [block.block_id for block in manager.req_to_blocks[request_id]]
++            for manager in self.managers
++        )
++
++
++def test_store_skips_a_mamba_state_block_vllm_gave_to_another_request():
++    """The STORE of a decoding request's chunk [16, 32), built in the step in
++    which vLLM gave that chunk's freed Mamba state block to a prefilling
++    request as a speculative block, neither pins nor reads the block, which
++    vLLM relocates only while no one else references it."""
++    engine = _Engine()
++    decode_tracker = _tracker(
++        "decode", num_tokens=PROMPT + 1 + NUM_SPECULATIVE_BLOCKS + 1
++    )
++
++    # Step 1: the decoding request prefills its prompt, the prefilling one its
++    # first block. LMCache stores the decoding request's chunk [0, 16).
++    decode_tracker.append_block_ids(
++        engine.schedule("decode", 0, PROMPT), NUM_SPECULATIVE_BLOCKS
++    )
++    decode_tracker.increase_num_stored_tokens(BLOCK)
++    engine.schedule("prefill", 0, BLOCK)
++    state_block_id = engine.block_table("decode")[MAMBA][1]
++
++    # Step 2: the decoding request verifies 3 drafts after its sampled token,
++    # all accepted, which moves its running Mamba state past block 1.
++    num_tokens = PROMPT + 1 + NUM_SPECULATIVE_BLOCKS
++    decode_tracker.append_block_ids(
++        engine.schedule("decode", PROMPT, num_tokens), NUM_SPECULATIVE_BLOCKS
++    )
++
++    # Step 3: vLLM frees the block, and the prefilling request's next chunk
++    # takes it as its newest speculative block; LMCache's tracker still lists it.
++    engine.schedule("decode", num_tokens, num_tokens + 1 + NUM_SPECULATIVE_BLOCKS)
++    engine.schedule("prefill", BLOCK, 2 * BLOCK)
++    assert engine.block_table("prefill")[MAMBA][-1] == state_block_id
++    assert decode_tracker.allocated_block_ids[MAMBA][1] == state_block_id
++
++    connector = _connector(engine.pool, decode_tracker)
++    metadata = LMCacheMPConnectorMetadata()
++    connector._process_cached_requests(
++        _scheduler_output(engine, "decode", num_tokens), metadata
++    )
++
++    (store,) = metadata.requests
++    assert (store.op.start, store.op.end) == (BLOCK, 2 * BLOCK)
++    assert store.op.block_ids == [
++        [engine.pool.null_block.block_id],
++        [engine.block_table("decode")[ATTENTION][1]],
++    ]
++    assert engine.pool.blocks[state_block_id].ref_cnt == 1
++
++    # Step 4: the prefilling request's next chunk spans five blocks, so vLLM
++    # relocates its speculative blocks, this one included.
++    engine.schedule("prefill", 2 * BLOCK, 7 * BLOCK)
++    prefill_mamba_blocks = engine.block_table("prefill")[MAMBA]
++    assert state_block_id in prefill_mamba_blocks[-NUM_SPECULATIVE_BLOCKS:]
++
++
++def test_store_without_vllms_table_for_its_request_is_refused():
++    block_state = KVConnectorBlockState(
++        req_ids=set(),
++        resolve_block_ids=lambda request_id: ([], []),
++        boundary_state_offloads={},
++    )
++
++    with pytest.raises(RuntimeError, match="no block table for request decode"):
++        _tracker("decode", num_tokens=PROMPT).current_block_ids(block_state)
++
++
++def _tracker(request_id: str, num_tokens: int) -> LMCacheMPRequestTracker:
++    """A request of ``PROMPT`` prompt tokens with ``num_tokens`` tokens known."""
++    request = SimpleNamespace(
++        request_id=request_id,
++        cache_salt="",
++        lora_request=None,
++        prompt_token_ids=list(range(PROMPT)),
++        all_token_ids=ConstantList(list(range(num_tokens))),
++        num_prompt_tokens=PROMPT,
++        mm_features=[],
++        sampling_params=SimpleNamespace(extra_args=None, max_tokens=8 * BLOCK),
++    )
++    return LMCacheMPRequestTracker(request)
++
++
++def _connector(pool: BlockPool, tracker: LMCacheMPRequestTracker) -> LMCacheMPConnector:
++    """A scheduler connector that stores decode chunks and pins in ``pool``."""
++    connector = object.__new__(LMCacheMPConnector)
++    connector.scheduler_adapter = SimpleNamespace(lmcache_tokens_per_chunk=BLOCK)
++    connector.request_trackers = {tracker.request_id: tracker}
++    connector._mamba_relocation_window = NUM_SPECULATIVE_BLOCKS
++    connector._group_tokens_per_block = [BLOCK, BLOCK]
++    connector._can_store = True
++    connector._save_decode_cache = True
++    connector._save_unfull_chunk = False
++    connector.lazy_offload = False
++    connector._gpu_block_pool = pool
++    connector._next_store_op_id = 0
++    connector._pinned_store_operations = {}
++    return connector
++
++
++def _scheduler_output(
++    engine: _Engine, request_id: str, num_computed_tokens: int
++) -> SimpleNamespace:
++    """The scheduler output of a step that schedules one draft-verifying
++    decode of ``request_id`` and allocates it no new block."""
++    return SimpleNamespace(
++        scheduled_cached_reqs=SimpleNamespace(
++            req_ids=[request_id],
++            new_block_ids=[None],
++            num_computed_tokens=[num_computed_tokens],
++            resumed_req_ids=set(),
++        ),
++        num_scheduled_tokens={request_id: 1 + NUM_SPECULATIVE_BLOCKS},
++        kv_connector_block_state=KVConnectorBlockState(
++            req_ids={request_id},
++            resolve_block_ids=engine.block_table,
++            boundary_state_offloads={},
++        ),
++    )

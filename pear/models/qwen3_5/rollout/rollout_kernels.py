@@ -1,17 +1,22 @@
+import pkgutil
+
 from vllm.model_executor.models import ModelRegistry
 
 from pear.models.kernels import RolloutKernels
 from pear.models.qwen3_5.gpu_backend import VllmGpuBackend
-from pear.models.qwen3_5.rollout.blackwell.gpu_backend import BlackwellRolloutGpuBackend
-from pear.models.qwen3_5.rollout.hopper.gpu_backend import HopperRolloutGpuBackend
 
 
 class Qwen3_5RolloutKernels(RolloutKernels):
     """The vLLM classes and patches of the replicas of a Qwen3.5 (Gated DeltaNet) model, named by rollout.kernels: in
     each process the backend of its GPU."""
 
-    # the GPU generations' backends, in priority order
-    GPU_BACKENDS = (BlackwellRolloutGpuBackend, HopperRolloutGpuBackend)
+    # the GPU generations' backends, in priority order, as class paths: PEAR's vLLM plugin imports this module in every
+    # vLLM process of an installation, the model server's older vLLM too, and only an engine with the kernels on
+    # imports a backend
+    GPU_BACKENDS = (
+        "pear.models.qwen3_5.rollout.blackwell.gpu_backend.BlackwellRolloutGpuBackend",
+        "pear.models.qwen3_5.rollout.hopper.gpu_backend.HopperRolloutGpuBackend",
+    )
 
     @classmethod
     def configure_server(cls, compilation_config: dict, max_num_seqs: int, max_num_batched_tokens: int) -> None:
@@ -49,5 +54,7 @@ class Qwen3_5RolloutKernels(RolloutKernels):
     def select_gpu_backend(cls, vllm_config=None) -> type[VllmGpuBackend]:
         """The first GPU backend that supports this process's GPU and, given one, the engine config."""
         return VllmGpuBackend.select(
-            cls.GPU_BACKENDS, vllm_config, "no GPU backend of rollout.kernels fits this replica"
+            tuple(pkgutil.resolve_name(path) for path in cls.GPU_BACKENDS),
+            vllm_config,
+            "no GPU backend of rollout.kernels fits this replica",
         )

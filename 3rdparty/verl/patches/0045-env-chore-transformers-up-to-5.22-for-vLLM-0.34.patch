@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [env] chore: transformers up to 5.22 for vLLM 0.34
+
+vLLM 0.34.0 requires transformers>=5.16.1,<5.23.0 and huggingface_hub>=2.0.0 (requirements/common.txt:11-12), and
+transformers accepts huggingface-hub 2 from 5.18.0 on (its setup.py: <2.0 in 5.16.1 and 5.17.0, <3.0 from 5.18.0);
+vLLM's own CI runs 5.22.0 (requirements/test/cuda.in:43). verl's window ended below 5.13, so no transformers
+satisfied both and the environment did not resolve. The upper bound is now vLLM's, <5.23; the lower bound and the
+exclusion of 5.6.0 stay. The uv extras of pyproject.toml, which pin transformers==5.12.1 for verl's own uv
+environments, and uv.lock are left as they are.
+---
+ requirements.txt | 2 +-
+ setup.py         | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/requirements.txt b/requirements.txt
+index 3aba0977261373f9844ffd12e47e023778655d1c..12cded827c7046edbc4af2263b5cc585cca693c4 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -17,7 +17,7 @@ tensordict>=0.8.0,<=0.10.0,!=0.9.0
+ torchdata
+ # 5.6.0 ships a broken flash-attention path (crashes on s_aux=None for sink-less
+ # models like Qwen2/Llama); fixed in 5.6.1. See huggingface/transformers#45588.
+-transformers>=5.5.3,!=5.6.0,<5.13
++transformers>=5.5.3,!=5.6.0,<5.23
+ wandb
+ packaging>=20.0
+ uvicorn
+diff --git a/setup.py b/setup.py
+index 5a6ee256ae34323ab411bae478a4da9924220389..f1b522379860e406f7300b0092687ba222db8792 100644
+--- a/setup.py
++++ b/setup.py
+@@ -40,7 +40,7 @@ install_requires = [
+     "tensordict>=0.8.0,<=0.10.0,!=0.9.0",
+     # 5.6.0 ships a broken flash-attention path (crashes on s_aux=None for
+     # sink-less models); fixed in 5.6.1. See huggingface/transformers#45588.
+-    "transformers>=5.5.3,!=5.6.0,<5.13",
++    "transformers>=5.5.3,!=5.6.0,<5.23",
+     "wandb",
+     "packaging>=20.0",
+     "tensorboard",

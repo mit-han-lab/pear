@@ -10,6 +10,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.triton_utils import tl, triton
 
 from pear.models.qwen3_5.rollout.blackwell.gemm import GemmTableLinearMethod
+from pear.models.qwen3_5.rollout.blackwell.model_state import BlackwellRolloutModelState
 from pear.models.qwen3_5.rollout.blackwell.rope import Fp32Rope
 from pear.models.qwen3_5.rollout.blackwell.triton_launcher import TritonLauncher
 from pear.models.qwen3_5.rollout.model import (
@@ -238,17 +239,19 @@ class HighLowLogitsProcessor(LogitsProcessor):
 
         return (high_low_logits[:n] + high_low_logits[n:]).reshape(*hidden_states.shape[:-1], -1)
 
-    def _get_logits(self, hidden_states, lm_head, embedding_bias):
+    def _get_logits(self, hidden_states, lm_head, embedding_bias, skip_gather=False):
+        # the shard's logits alone (skip_gather): vLLM's path, through _apply_head's high + low parts
         gather = LogitsGatherBuffers.instance
         if not (
-            gather is not None
+            not skip_gather
+            and gather is not None
             and lm_head.tp_size == TP_SIZE
             and hidden_states.dim() == 2
             and hidden_states.shape[0] <= gather.max_rows
             and TP_SIZE * lm_head.weight.shape[0] == gather.vocab_size == self.org_vocab_size
             and self.eligible(lm_head, hidden_states, embedding_bias)
         ):
-            return super()._get_logits(hidden_states, lm_head, embedding_bias)
+            return super()._get_logits(hidden_states, lm_head, embedding_bias, skip_gather)
 
         high_low_logits, n = self.high_low_head(lm_head, hidden_states)
 
@@ -291,6 +294,7 @@ class BlackwellQwen3_5ForConditionalGeneration(Qwen3_5RolloutForConditionalGener
 
     causal_lm_cls = BlackwellQwen3_5ForCausalLM
     linear_method_cls = GemmTableLinearMethod
+    model_state_cls = BlackwellRolloutModelState
 
     def embed_input_ids(self, input_ids, multimodal_embeddings=None, *, is_multimodal=None):
         # the image rows: rank 0 contributes them, the other rank zeros (its text rows are its partial lookup)

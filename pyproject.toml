@@ -26,6 +26,13 @@ verl_gpu = [
     "nvidia-cuda-nvcc", "nvidia-cuda-crt", "nvidia-nvvm", "nvidia-cuda-cccl", "nvidia-cuda-profiler-api",
     "flashinfer-cubin", "ninja", "wheel",
 ]
+# and on a GB300 (aarch64), FlashInfer's prebuilt JIT modules: flashinfer-jit-cache and its packages of the GB300's two
+# architectures, installed without the other architectures' packages it requires
+verl_jit_cache = [
+    "flashinfer-jit-cache; platform_machine == 'aarch64'",
+    "flashinfer-jit-cache-sm100a; platform_machine == 'aarch64'",
+    "flashinfer-jit-cache-sm103a; platform_machine == 'aarch64'",
+]
 # a LIBERO family's simulator environment, next to the family's fork of LIBERO
 libero = [
     "numpy", "pyyaml", "tqdm", "psutil", "requests", "Pillow", "imageio", "imageio-ffmpeg", "torch", "torchvision",
@@ -54,12 +61,13 @@ station = [
     "numpy", "pyyaml", "pydantic", "omegaconf", "ruckig", "aiohttp", "pillow", "imageio-ffmpeg", "openai",
     "pyrealsense2", "lerobot[feetech,kinematics]", "pin", "torch", "torchvision", "pytest", "pytest-xdist", "playwright",
 ]
-# the model server (pear/deploy/server): vLLM with the torch and FlashInfer it brings, Hydra and uvloop, and what the
+# the model server (pear/deploy/server): vLLM with the torch and FlashInfer it brings, Hydra and uvloop, what the
 # model families' kernels compile with at the server's first start (the CUDA compiler with its headers, and ninja) next
-# to FlashInfer's precompiled kernels; installed at the training environment's versions
+# to FlashInfer's precompiled kernels, and the tests; installed at the versions of scripts/install/server
 server = [
     "vllm", "torch", "flashinfer-python", "numpy", "hydra-core", "omegaconf", "uvloop", "nvidia-cuda-nvcc",
     "nvidia-cuda-crt", "nvidia-nvvm", "nvidia-cuda-cccl", "nvidia-cuda-profiler-api", "flashinfer-cubin", "ninja",
+    "pytest",
 ]
 
 # the robot station's command, in the station's environment

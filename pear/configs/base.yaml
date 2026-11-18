@@ -74,6 +74,12 @@ actor_rollout_ref:
       vllm:
         disable_log_stats: false
         enable_log_requests: false
+        # every block boundary's Mamba state stays cached, decode's too: a session's next turn resumes after the
+        # previous answer, where vLLM's default 0 keeps the prompt's last boundary only. The string None is vLLM's
+        # command line's null: verl leaves a YAML null out of the command line
+        prefix_cache_retention_interval: "None"
+        # the GPU workers start without NUMA binding (vLLM's default binds them to their GPU's node where it can)
+        numa_bind: false
     # Weights the vLLM replicas keep in fp32 instead of dtype, by substrings of their names: built in fp32, then loaded
     # and synced in fp32. The weight sync casts every other weight to dtype, so a weight vLLM itself keeps in fp32
     # belongs here too.
@@ -119,6 +125,8 @@ ray_kwargs:
         # allocations get different IMEX channels, so multi-node NVLink fails between them and they use InfiniBand.
         NCCL_LAUNCH_ORDER_IMPLICIT: "1"
         NCCL_MNNVL_ENABLE: "0"
+        # the vLLM replicas' tensor-parallel all-reduces on vLLM's custom all-reduce and NCCL, not on FlashInfer's
+        VLLM_ALLREDUCE_USE_FLASHINFER: "0"
         # verl's own value for a worker is 'true'. With 'false' a tokenizer encodes on the calling thread, not on a
         # pool of every core in each of a machine's processes
         TOKENIZERS_PARALLELISM: "false"

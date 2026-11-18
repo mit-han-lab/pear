@@ -5,12 +5,16 @@ import pytest
 import torch
 import torch.nn.functional as F
 from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config.cache import CacheConfig
 from vllm.distributed.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
     init_distributed_environment,
     initialize_model_parallel,
 )
+from vllm.model_executor.layers.fused_allreduce_gemma_rms_norm import fused_allreduce_gemma_rms_norm
+from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
+from vllm.models.qwen3_5.nvidia.model import Qwen3_5RMSNorm as VllmQwen3_5RMSNorm
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.chunk_delta_h import chunk_gated_delta_rule_fwd_kernel_h_blockdim64
 from vllm.third_party.flash_linear_attention.ops.chunk_o import chunk_fwd_kernel_o
@@ -21,13 +25,16 @@ from vllm.third_party.flash_linear_attention.ops.solve_tril import (
     merge_16x16_to_64x64_inverse_kernel,
 )
 from vllm.third_party.flash_linear_attention.ops.wy_fast import recompute_w_u_fwd_kernel
+from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+from vllm.v1.worker.utils import select_common_block_size
 
-from pear.models.qwen3_5.rollout.hopper.all_reduce import DecodeAllReduce
+from pear.models.qwen3_5.rollout.hopper.all_reduce import AllReduceNorm
 from pear.models.qwen3_5.rollout.hopper.attention import (
     HEAD_DIM,
     QUERY_HEADS,
     HopperFlashAttentionImpl,
-    HopperFlashAttentionMetadataBuilder,
 )
 from pear.models.qwen3_5.rollout.hopper.cudagraph import HopperMixedStepGraphs
 from pear.models.qwen3_5.rollout.hopper.extension import HopperExtension
@@ -51,8 +58,11 @@ SLOTS = 8  # state slots of the pool; slot 0 is the null block, the padding rows
 EPS = 1e-6  # the gated norm's and the RMSNorm's epsilon
 L2_EPS = 1e-6  # vLLM's q / k l2norm epsilon, under the square root
 GRAPH_ROWS = 256  # the token count a mixed-step graph pads the test batch to
+ABOVE_GRAPH_ROWS = HopperMixedStepGraphs.MAX_TOKENS + 8  # a mixed step above the largest mixed-step graph
 KV_BLOCKS = 200  # pages of the attention test's KV cache
-PAGE = HopperFlashAttentionMetadataBuilder.PAGE  # tokens per page
+KV_HEADS = 1  # the attention's KV heads on one of four ranks
+CONV_WIDTH = 4  # the Gated DeltaNet's causal conv taps
+PARTIAL_TILE_PAGE = 784  # a page of twelve of the decode kernel's 64-token tiles and a partial one of 16 tokens
 HIDDEN = 5120  # the model's hidden size
 VOCAB = 248320
 NORM_BIAS = 1.0  # Qwen3.5's RMSNorm scales by 1 + w (FlashInfer's weight_bias)
@@ -261,26 +271,43 @@ def test_the_chunk_kernels_equal_flas():
     assert torch.equal(layer.kv_cache[1][prefills], final)
 
 
-def test_the_split_decode_attention_matches_the_reference():
+def attention_page() -> int:
+    """The tokens per page of an H100 replica's attention as vLLM derives them for Qwen3.8-27B at TP4: the hybrid
+    KV cache block that holds a Gated DeltaNet state (Platform._align_hybrid_block_size from FlashAttention's preferred
+    block), which FlashAttention-3 takes whole (select_common_block_size)."""
+    attention_bytes = FullAttentionSpec(
+        block_size=1, num_kv_heads=KV_HEADS, head_size=HEAD_DIM, dtype=torch.bfloat16
+    ).page_size_bytes
+    shapes = MambaStateShapeCalculator.gated_delta_net_state_shape(TP, TP * H, TP * HV, K, V, CONV_WIDTH)
+    mamba_bytes = MambaSpec(shapes=shapes, dtypes=HopperRolloutGpuBackend.STATE_DTYPES, block_size=-1).page_size_bytes
+    preferred_block = FlashAttentionBackend.get_preferred_block_size(CacheConfig.DEFAULT_BLOCK_SIZE)
+    hybrid_block = preferred_block * cdiv(mamba_bytes, preferred_block * attention_bytes)
+
+    return select_common_block_size(hybrid_block, [FlashAttentionBackend])
+
+
+# the replicas' page, and one whose last tile is partial
+@pytest.mark.parametrize("page", [attention_page(), PARTIAL_TILE_PAGE])
+def test_the_split_decode_attention_matches_the_reference(page):
     HopperExtension.load()
     generator = torch.Generator(device=DEVICE).manual_seed(2)
     rng = np.random.default_rng(2)
-    kv = torch.randn(KV_BLOCKS, PAGE, 1, 2 * HEAD_DIM, generator=generator, device=DEVICE).bfloat16()
+    kv = torch.randn(KV_BLOCKS, page, 1, 2 * HEAD_DIM, generator=generator, device=DEVICE).bfloat16()
     state = HopperFlashAttentionImpl.device_state(kv.device)
     scale = HEAD_DIM**-0.5
     # one token, page multiples and their neighbours, a long sequence beside short ones, a pure decode step
-    cases = [[1], [PAGE, 2 * PAGE, PAGE - 1, PAGE + 1], [40000, 1, 1, 7], rng.integers(1, 3000, 48).tolist()]
+    cases = [[1], [page, 2 * page, page - 1, page + 1], [40000, 1, 1, 7], rng.integers(1, 3000, 48).tolist()]
 
     for lens in cases:
         n = len(lens)
-        pages = [(length + PAGE - 1) // PAGE for length in lens]
+        num_pages = [(length + page - 1) // page for length in lens]
         order = rng.permutation(KV_BLOCKS)
-        table = torch.zeros(n, max(pages) + 2, dtype=torch.int32)
+        table = torch.zeros(n, max(num_pages) + 2, dtype=torch.int32)
         cache = kv.clone()
         for i, length in enumerate(lens):
-            table[i, : pages[i]] = torch.from_numpy(order[sum(pages[:i]) : sum(pages[: i + 1])])
+            table[i, : num_pages[i]] = torch.from_numpy(order[sum(num_pages[:i]) : sum(num_pages[: i + 1])])
             # the rows past the sequence's end in its last page are stale
-            cache[int(table[i, pages[i] - 1]), length - (pages[i] - 1) * PAGE :] = float("nan")
+            cache[int(table[i, num_pages[i] - 1]), length - (num_pages[i] - 1) * page :] = float("nan")
         table = table.to(DEVICE)
         seq_lens = torch.tensor(lens, dtype=torch.int32, device=DEVICE)
         q = (torch.randn(n, QUERY_HEADS + 2, HEAD_DIM, generator=generator, device=DEVICE) * 2).bfloat16()[
@@ -288,7 +315,7 @@ def test_the_split_decode_attention_matches_the_reference():
         ]
         want = []
         for i, length in enumerate(lens):
-            rows = cache[table[i, : pages[i]].long(), :, 0].reshape(-1, 2 * HEAD_DIM)[:length].double()
+            rows = cache[table[i, : num_pages[i]].long(), :, 0].reshape(-1, 2 * HEAD_DIM)[:length].double()
             weights = torch.softmax(q[i].double() @ rows[:, :HEAD_DIM].T * scale, -1)
             want.append(weights @ rows[:, HEAD_DIM:])
         want = torch.stack(want)
@@ -308,23 +335,25 @@ def test_the_split_decode_attention_matches_the_reference():
 
 
 def four_rank_checks(rank: int, port: int) -> None:
-    """The decode all-reduce + residual + RMSNorm on one of four ranks."""
+    """The decode all-reduce + residual + RMSNorm on one of four ranks, and the decoder layers' op on each path (above
+    the mixed-step graphs vLLM's own one for Qwen3.5 on CUDA)."""
     torch.cuda.set_device(rank)
     with set_current_vllm_config(VllmConfig()):
         init_distributed_environment(TP, rank, f"tcp://{LOCALHOST}:{port}", rank)
         initialize_model_parallel(tensor_model_parallel_size=TP)
     HopperExtension.load()
+    AllReduceNorm.register_op()
     ops = torch.ops.pear_rollout_hopper
     generator = torch.Generator(device=DEVICE).manual_seed(6)  # the same draws on every rank
     text_config = types.SimpleNamespace(hidden_size=HIDDEN)
     model = types.SimpleNamespace(config=types.SimpleNamespace(get_text_config=lambda: text_config))
-    DecodeAllReduce.create_workspace(model)
-    workspace = DecodeAllReduce.workspace
+    AllReduceNorm.create_workspace(model)
+    workspace = AllReduceNorm.workspace
     buffers = (
         int(workspace.uc_ptrs_dev),
         int(workspace.uc_ptr_local),
         int(workspace.mc_ptr),
-        DecodeAllReduce.flags,
+        AllReduceNorm.flags,
         int(workspace.rank),
     )
     gamma = (0.1 * torch.randn(HIDDEN, generator=generator, device=DEVICE)).bfloat16()
@@ -352,13 +381,44 @@ def four_rank_checks(rank: int, port: int) -> None:
             partials = [torch.randn(T, HIDDEN, generator=generator, device=DEVICE).bfloat16() for _ in range(TP)]
             stream = stream + sum(p.float() for p in partials).bfloat16().float()
             ops.ar_norm(
-                partials[rank].clone(), residual, gamma, norm_out, *buffers, EPS, NORM_BIAS, DecodeAllReduce.stream32,
+                partials[rank].clone(), residual, gamma, norm_out, *buffers, EPS, NORM_BIAS, AllReduceNorm.stream32,
                 layer == 0,
             )  # fmt: skip
             torch.cuda.synchronize()
-            assert torch.equal(DecodeAllReduce.stream32[:T], stream) and torch.equal(residual, before)
+            assert torch.equal(AllReduceNorm.stream32[:T], stream) and torch.equal(residual, before)
             rms = stream.double() * torch.rsqrt(stream.double().pow(2).mean(-1, keepdim=True) + EPS) * scale
             torch.testing.assert_close(norm_out.double(), rms, rtol=1e-2, atol=1e-2)
+
+    # the decoder layers' op: a pure decode step on the decode kernels (its fp32 stream), a mixed step up to the largest
+    # mixed-step graph on FlashInfer's fused kernel, above it vLLM's all-reduce and FlashInfer's norm (bf16 residuals)
+    norm = types.SimpleNamespace(weight=gamma, variance_epsilon=EPS)
+    for is_pure_decode, T in ((True, 64), (False, 64), (False, ABOVE_GRAPH_ROWS)):
+        residual = (3 * torch.randn(T, HIDDEN, generator=generator, device=DEVICE)).bfloat16()
+        partials = [torch.randn(T, HIDDEN, generator=generator, device=DEVICE).bfloat16() for _ in range(TP)]
+        reduced = sum(p.float() for p in partials)
+        AllReduceNorm.begin_step(is_pure_decode)
+
+        x, new_residual = AllReduceNorm.apply(partials[rank].clone(), residual.clone(), norm, True)
+
+        torch.cuda.synchronize()
+        want = AllReduceNorm.stream32[:T].double() if is_pure_decode else new_residual.double()
+        torch.testing.assert_close(want, residual.double() + reduced.double(), rtol=1e-2, atol=5e-2)
+        rms = want * torch.rsqrt(want.pow(2).mean(-1, keepdim=True) + EPS) * scale
+        torch.testing.assert_close(x.double(), rms, rtol=1e-2, atol=1e-2)
+
+    # above the mixed-step graphs the op is vLLM's eager path for Qwen3.5 on CUDA bit for bit: its all-reduce, then the
+    # CUDA model's norm (FlashInfer's fused add + Gemma RMSNorm), not the unfused native norm
+    vllm_norm = VllmQwen3_5RMSNorm(HIDDEN, EPS).to(device=DEVICE, dtype=torch.bfloat16)
+    vllm_norm.weight.data.copy_(gamma)
+    residual = (3 * torch.randn(ABOVE_GRAPH_ROWS, HIDDEN, generator=generator, device=DEVICE)).bfloat16()
+    partials = [torch.randn(ABOVE_GRAPH_ROWS, HIDDEN, generator=generator, device=DEVICE).bfloat16() for _ in range(TP)]
+    AllReduceNorm.begin_step(False)
+
+    x, new_residual = AllReduceNorm.apply(partials[rank].clone(), residual.clone(), norm, False)
+    want_x, want_residual = fused_allreduce_gemma_rms_norm(partials[rank].clone(), residual.clone(), vllm_norm)
+
+    torch.cuda.synchronize()
+    assert torch.equal(x, want_x) and torch.equal(new_residual, want_residual)
 
     destroy_model_parallel()
     destroy_distributed_environment()
@@ -383,10 +443,9 @@ def test_the_sampler_draws_from_the_softmax(monkeypatch):
     flat = torch.randn(SAMPLER_ROWS, VOCAB, generator=generator, device=DEVICE) * 2
 
     for logits in (peaked, flat, peaked[:1]):
-        result = HopperSampler.sample(logits, temperature, MAX_LOGPROBS)
-        tensors = result.logprobs_tensors
+        sampled, tensors = HopperSampler.draw_rows(logits, temperature[: len(logits)], MAX_LOGPROBS)
         ids, logprobs, ranks = tensors.logprob_token_ids, tensors.logprobs, tensors.selected_token_ranks
-        sampled = result.sampled_token_ids[:, 0].long()
+        assert sampled.dtype == torch.int64
         lp = (logits / temperature[: len(logits), None]).log_softmax(-1)
         top_lp, top_ids = lp.topk(MAX_LOGPROBS, -1)
         sampled_lp = lp.gather(1, sampled[:, None])
@@ -402,7 +461,7 @@ def test_the_sampler_draws_from_the_softmax(monkeypatch):
     logits[:, : len(probs)] = probs.log()
     counts = torch.zeros(len(probs), device=DEVICE)
     for _ in range(DRAWS):
-        sampled = HopperSampler.sample(logits, torch.ones(256, device=DEVICE), MAX_LOGPROBS).sampled_token_ids[:, 0]
+        sampled, _ = HopperSampler.draw_rows(logits, torch.ones(256, device=DEVICE), MAX_LOGPROBS)
         assert (sampled < len(probs)).all()
         counts += torch.bincount(sampled.long(), minlength=len(probs)).float()
     draws = 256 * DRAWS

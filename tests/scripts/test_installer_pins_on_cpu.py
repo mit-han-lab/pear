@@ -11,6 +11,7 @@ INSTALL_DIR = REPO / "scripts/install"
 # constraints.txt: a simulator environment's is under sim/
 ENVIRONMENT_DIRS = {
     "verl": INSTALL_DIR / "verl",
+    "server": INSTALL_DIR / "server",
     "libero": INSTALL_DIR / "sim/libero",
     "libero_plus": INSTALL_DIR / "sim/libero_plus",
     "libero_pro": INSTALL_DIR / "sim/libero_pro",
@@ -20,16 +21,21 @@ ENVIRONMENT_DIRS = {
 }
 ENVIRONMENTS = tuple(ENVIRONMENT_DIRS)
 # the environment whose pins each extra of pyproject.toml is installed at: the one of its name, and the training
-# environment's for what a GPU machine adds to it and for the model server
+# environment's for what a GPU machine adds to it
 ENVIRONMENT_BY_EXTRA = {
     **{environment: environment for environment in ENVIRONMENTS},
     "verl_gpu": "verl",
-    "server": "verl",
+    "verl_jit_cache": "verl",
 }
+# FlashInfer's prebuilt JIT modules of a GB300: the package that names them and those of the GB300's architectures
+JIT_CACHE_PACKAGES = ("flashinfer-jit-cache", "flashinfer-jit-cache-sm100a", "flashinfer-jit-cache-sm103a")
+AARCH64_MARKER = "platform_machine == 'aarch64'"  # a GB300's machine type, to which the JIT modules are kept
+# a pin of the JIT modules in a constraints.in: the package, its version with the local part, its marker
+JIT_CACHE_PIN = re.compile(r"(?m)^(flashinfer-jit-cache[\w-]*)==(\S+) ; (.+)$")
 # the extras of pyproject.toml, by name
 EXTRAS = tomllib.loads((REPO / "pyproject.toml").read_text())["project"]["optional-dependencies"]
 # FlashInfer's own index, the one place that has flashinfer-cubin at this version, publishes no hashes
-PINS_WITHOUT_HASH = {"verl": {"flashinfer-cubin"}}
+PINS_WITHOUT_HASH = {"verl": {"flashinfer-cubin"}, "server": {"flashinfer-cubin"}}
 # what the Mesa prefix and the ImageMagick prefix hold at different versions
 CONDA_PACKAGES_OF_TWO_VERSIONS = {"xorg-libx11", "xorg-libxrender"}
 
@@ -88,8 +94,8 @@ def test_every_extra_of_pyproject_is_installed_at_the_pins_of_an_environment():
 
 @pytest.mark.parametrize(("extra", "environment"), ENVIRONMENT_BY_EXTRA.items())
 def test_every_package_of_an_extra_is_pinned_in_the_environment_it_is_installed_at(extra, environment):
-    # a requirement's name, without the extras it asks of the package
-    package_names = {PinFile.normalized(name.split("[")[0]) for name in EXTRAS[extra]}
+    # a requirement's name, without the extras it asks of the package and its marker
+    package_names = {PinFile.normalized(re.split(r"[\[;\s]", name)[0]) for name in EXTRAS[extra]}
     assert package_names <= set(PinFile.of_environment(environment))
 
 
@@ -98,6 +104,17 @@ def test_flashinfer_s_kernels_are_pinned_at_flashinfer_s_version():
     versions = PinFile.of_environment("verl")
 
     assert versions["flashinfer-cubin"] == versions["flashinfer-python"]
+
+
+def test_flashinfer_s_jit_modules_are_pinned_at_its_version_for_torch_s_cuda_build_on_a_gb300_only():
+    # FlashInfer's index files the modules under the CUDA build's tag; x86_64 machines build them at first use
+    cuda_tag = re.search(r"(?m)^CUDA_TAG=(\S+)$", (INSTALL_DIR / "versions.env").read_text())[1]
+    flashinfer_version = PinFile.of_environment("verl")["flashinfer-python"]
+
+    pins = JIT_CACHE_PIN.findall((ENVIRONMENT_DIRS["verl"] / "constraints.in").read_text())
+
+    assert pins == [(package, f"{flashinfer_version}+{cuda_tag}", AARCH64_MARKER) for package in JIT_CACHE_PACKAGES]
+    assert EXTRAS["verl_jit_cache"] == [f"{package}; {AARCH64_MARKER}" for package in JIT_CACHE_PACKAGES]
 
 
 @pytest.mark.parametrize("package", ["ray", "numpy"])

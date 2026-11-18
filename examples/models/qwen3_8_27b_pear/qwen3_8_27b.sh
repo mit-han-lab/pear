@@ -52,11 +52,7 @@ configure_h100() {
   TRTLLM_ARGS=()
   # LMCache sidecars (a 700 GB tier each: the sizing for 2 TB host RAM), whose host tier keeps the sessions' prefixes
   # that a TP4 replica's KV cache, half of a GB300 TP2 replica's, cannot hold
-  LMCACHE_ARGS=(
-    "+actor_rollout_ref.rollout.custom.lmcache={enable: true, log_dir: $RUN/lmcache, l1_size_gb: 700}"
-    # the chunk in tokens: 3 x 256 image tokens of this model's 512-px frames + text
-    +actor_rollout_ref.rollout.custom.lmcache.chunk_size=784
-  )
+  LMCACHE_ARGS=("+actor_rollout_ref.rollout.custom.lmcache={enable: true, log_dir: $RUN/lmcache, l1_size_gb: 700}")
   SP=8
   FSDP_SIZE=8
   # FA3 for the language model and FA2 for the vision tower: the FA3 build has head dim 256 only, the tower's is 72
@@ -119,8 +115,16 @@ MODEL_TRAINING_ARGS=(
   "+transfer_queue.backend.SimpleStorage.required_node_resource=$TQ_NODE_RESOURCE"
 )
 
-# the general evaluation's servers: the parser that splits the reasoning off, the cache mode of the Mamba layers
+# the general evaluation's servers: the parser that splits the reasoning off, and prefix caching, which keeps the Mamba
+# layers' states at the block boundaries (vLLM's align mode follows it)
 MODEL_SERVER_ARGS=(
   --reasoning-parser qwen3
-  --mamba-cache-mode align
+  --enable-prefix-caching
+  # what the replicas' configs set (pear/configs/base.yaml, pear/models/qwen3_5/config.yaml): every boundary's state
+  # kept, the KV cache sized from vLLM's memory estimate, the pixels normalized on the CPU, no NUMA binding of the
+  # GPU workers
+  --prefix-cache-retention-interval None
+  --no-enable-extensible-kv-cache
+  --no-mm-device-do-normalize
+  --no-numa-bind
 )

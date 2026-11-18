@@ -1,8 +1,10 @@
-import torch
-from vllm.config import CUDAGraphMode
-from vllm.distributed.device_communicators import custom_all_reduce
+from dataclasses import replace
+
+from vllm.config import CUDAGraphMode, set_current_vllm_config
 from vllm.v1.attention.backend import AttentionCGSupport
-from vllm.v1.worker import gpu_model_runner
+from vllm.v1.worker.gpu import model_runner
+from vllm.v1.worker.gpu.attn_utils import get_attn_cg_support
+from vllm.v1.worker.gpu.cudagraph_utils import ModelCudaGraphManager
 
 from pear.models.qwen3_5.rollout.cudagraph import MixedStepGraphs
 
@@ -10,9 +12,6 @@ from pear.models.qwen3_5.rollout.cudagraph import MixedStepGraphs
 class HopperMixedStepGraphs(MixedStepGraphs):
     """FULL CUDA graphs for the mixed steps (a new turn's prefill beside the decoding batch) beside the decode ones."""
 
-    # vLLM 0.28 replays FULL graphs of mixed steps only in cudagraph_mode FULL; FULL_AND_PIECEWISE keeps the decode
-    # graphs (their decode kernels) and runs mixed steps piecewise. Once every attention backend takes FULL mixed
-    # steps (AttentionCGSupport.ALWAYS), the mixed steps get FULL graphs beside the decode ones
     MAX_TOKENS = 1024  # the largest mixed step run as a FULL graph
     MAX_DECODE_TOKENS = 512  # vLLM's largest default graph off datacenter Blackwell
     # the sizes a mixed step pads to
@@ -63,67 +62,75 @@ class HopperMixedStepGraphs(MixedStepGraphs):
     ]
 
     @classmethod
-    def mixed_sizes(cls, max_num_seqs: int, limit: int) -> list[int]:
+    def mixed_sizes(cls, limit: int) -> list[int]:
         """The buckets within the limit."""
         return [size for size in cls.BUCKETS if size <= limit]
 
+
+class HopperCudaGraphManager(ModelCudaGraphManager):
+    """vLLM's CUDA graph manager of the model whose graphs of the mixed steps are FULL, beside the FULL decode graphs
+    (installed in place of vLLM's)."""
+
+    # vLLM's FULL_AND_PIECEWISE gives the mixed steps PIECEWISE graphs and FULL gives every step, decode steps too, a
+    # token-keyed FULL graph without the decode kernels. A FULL mixed graph replays the GDN layout its step's build
+    # fills, which a decode step's build leaves as it was: every decode step must take a decode graph
     @classmethod
     def install(cls) -> None:
-        """Patch vLLM's model runner: once it has resolved its graph mode, the mixed steps get FULL keys if every
-        attention backend takes them."""
-        runner_cls = gpu_model_runner.GPUModelRunner
-        vllm_check_and_update_cudagraph_mode = runner_cls._check_and_update_cudagraph_mode
+        """Build this manager wherever vLLM's V2 model runner builds its own."""
+        model_runner.ModelCudaGraphManager = cls
 
-        def check_and_update_cudagraph_mode(self, attention_backends, kv_cache_groups, is_profiling=False):
-            vllm_check_and_update_cudagraph_mode(self, attention_backends, kv_cache_groups, is_profiling)
+    def capture(
+        self,
+        model,
+        model_state,
+        input_buffers,
+        intermediate_tensors,
+        block_tables,
+        attn_groups,
+        kv_cache_config,
+        **kwargs,
+    ) -> None:
+        self.make_mixed_graphs_full(attn_groups)
 
-            # vLLM's own condition for FULL graphs of mixed steps
-            support_levels = {
-                backend.get_builder_cls().get_cudagraph_support(self.vllm_config, group.kv_cache_spec)
-                for backends, group in zip(attention_backends, kv_cache_groups, strict=True)
-                for backend in backends
-            }
-            if support_levels == {AttentionCGSupport.ALWAYS}:
-                cls.add_mixed_keys(self.cudagraph_dispatcher)
+        super().capture(
+            model,
+            model_state,
+            input_buffers,
+            intermediate_tensors,
+            block_tables,
+            attn_groups,
+            kv_cache_config,
+            **kwargs,
+        )
 
-        runner_cls._check_and_update_cudagraph_mode = check_and_update_cudagraph_mode
-        cls.install_copy_in_all_reduce()
+    def make_mixed_graphs_full(self, attn_groups) -> None:
+        """Turn the PIECEWISE token-keyed graphs into FULL ones of as many requests as tokens (at most the engine's), in
+        the captures and the dispatch; raise unless decode graphs take every decode step and every attention backend
+        takes the FULL mixed steps."""
+        # the decode graphs of one token per request, without LoRA, in one batch, indexed by request count
+        num_decode_descs = len(self._decode_descs.get((1, 0, 1), []))
+        if self.cudagraph_mode.decode_mode() != CUDAGraphMode.FULL or num_decode_descs <= self.max_num_reqs:
+            raise RuntimeError(
+                f"the Hopper rollout kernels run every decode step of up to {self.max_num_reqs} requests as a FULL "
+                f"decode graph; cudagraph_mode is {self.cudagraph_mode.name} with decode graphs of up to "
+                f"{max(num_decode_descs - 1, 0)} requests"
+            )
+        piecewise_descs = self._capture_descs.pop(CUDAGraphMode.PIECEWISE, [])
+        # under the engine's config: vLLM's memory profiling captures outside it, and a backend may read it (FlashInfer)
+        with set_current_vllm_config(self.vllm_config):
+            cg_support = get_attn_cg_support(attn_groups, self.vllm_config)
+        if piecewise_descs and cg_support.min_cg_support != AttentionCGSupport.ALWAYS:
+            raise RuntimeError(
+                f"the Hopper rollout kernels run FULL graphs of mixed steps, which {cg_support.min_cg_attn_backend} "
+                f"supports only as {cg_support.min_cg_support.name}"
+            )
 
-    @classmethod
-    def add_mixed_keys(cls, dispatcher) -> None:
-        """Give the mixed steps of every capture size up to MAX_TOKENS FULL keys in place of their piecewise ones."""
-        # in FULL_AND_PIECEWISE without speculative tokens or LoRA; every step of these sizes then replays a FULL graph
-        # (cascade attention, the one step FULL graphs refuse, is off by vLLM's default)
-        if (
-            dispatcher.cudagraph_mode != CUDAGraphMode.FULL_AND_PIECEWISE
-            or dispatcher.uniform_decode_query_len != 1
-            or dispatcher.vllm_config.lora_config is not None
-        ):
-            return
-
-        for size in dispatcher.compilation_config.cudagraph_capture_sizes:
-            if size <= cls.MAX_TOKENS:
-                descriptor = dispatcher._create_padded_batch_descriptor(size, False, False, 0)
-                dispatcher.add_cudagraph_key(CUDAGraphMode.FULL, descriptor)
-
-        piecewise_keys = dispatcher.cudagraph_keys[CUDAGraphMode.PIECEWISE]
-        dispatcher.cudagraph_keys[CUDAGraphMode.PIECEWISE] = {
-            key for key in piecewise_keys if key.num_tokens > cls.MAX_TOKENS
+        full_descs = {
+            desc: replace(desc, cg_mode=CUDAGraphMode.FULL, num_reqs=min(desc.num_tokens, self.max_num_reqs))
+            for desc in piecewise_descs
         }
-
-    @staticmethod
-    def install_copy_in_all_reduce() -> None:
-        """vLLM's custom all-reduce in its copy-in form inside graphs (into its pre-registered buffer, then reduce)."""
-        # registering a captured graph's own input addresses for IPC fails with the replica's expandable-segment
-        # allocator (cudaIpcGetMemHandle): the mixed-step graphs, above the fused all-reduce + norm's sizes, need this
-        all_reduce_cls = custom_all_reduce.CustomAllreduce
-
-        def copy_in_custom_all_reduce(self, input):
-            if self.disabled or not self.should_custom_ar(input):
-                return None
-            if self._IS_CAPTURING and not torch.cuda.is_current_stream_capturing():
-                return torch.empty_like(input)  # a warm-up inside the capture context, as vLLM does
-
-            return self.all_reduce(input, registered=False)
-
-        all_reduce_cls.custom_all_reduce = copy_in_custom_all_reduce
+        self._capture_descs.setdefault(CUDAGraphMode.FULL, []).extend(full_descs.values())
+        self._capture_descs[CUDAGraphMode.FULL].sort(key=lambda desc: desc.num_tokens, reverse=True)
+        self._candidates = {
+            key: [full_descs.get(desc, desc) for desc in descs] for key, descs in self._candidates.items()
+        }
