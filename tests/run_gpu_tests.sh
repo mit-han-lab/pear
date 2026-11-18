@@ -15,7 +15,9 @@ trap 'rm -rf "$LOCAL_DIR"' EXIT
 source "$ROOT/scripts/gpu_process_variables.sh" "$VERL_ENV"
 
 cd "$ROOT"
-# without the robot station's directory, whose conftest imports the station's packages
-python -m pytest tests --ignore=tests/deploy/station --ignore-glob='*_on_cpu.py' --ignore-glob='*_in_sim.py'
+# without the robot station's and the Claude Code session service's directories, whose conftests import their own
+# environments' packages
+python -m pytest tests --ignore=tests/deploy/station --ignore=tests/deploy/harness/claude_code \
+  --ignore-glob='*_on_cpu.py' --ignore-glob='*_in_sim.py'
 bash 3rdparty/verl/scripts/run_patched_verl_tests.sh gpu
 bash 3rdparty/verl/scripts/run_patched_verl_tests.sh distributed
