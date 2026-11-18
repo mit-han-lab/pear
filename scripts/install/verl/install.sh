@@ -70,7 +70,7 @@ compile_job_n() {
 # available, or less where a cgroup v2 that holds this process (a Slurm job's, a container's) has less left under its
 # limit.
 build_memory_kib() {
-  local memory_kib directory limit
+  local memory_kib directory limit working_set
 
   if [ -n "${MEMORY_GIB:-}" ]; then
     echo $((MEMORY_GIB * 1024 * 1024))
@@ -83,7 +83,10 @@ build_memory_kib() {
   while true; do
     limit=$(cat "$directory/memory.max" 2> /dev/null || echo max)
     if [ "$limit" != max ]; then
-      limit=$(((limit - $(cat "$directory/memory.current")) / 1024))
+      # what the cgroup holds less its inactive page cache (the kubelet's working set): the kernel frees that cache
+      # first, so a cgroup full of cached files still has room for a build
+      working_set=$(($(cat "$directory/memory.current") - $(awk '/^inactive_file / {print $2}' "$directory/memory.stat")))
+      limit=$(((limit - working_set) / 1024))
       memory_kib=$((limit < memory_kib ? limit : memory_kib))
     fi
     if [ "$directory" = /sys/fs/cgroup ]; then

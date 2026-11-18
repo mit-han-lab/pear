@@ -34,6 +34,9 @@ COMMANDS = [*TARGETS, DOWNLOAD_MODEL]
 UV_DEFAULT_LOCK_TIMEOUT_S = 300
 # the mode of the callers of the installer in these tests, with which a directory is made readable by everyone
 CALLER_UMASK = 0o022
+# memory that holds all of LMCache's 32 build jobs of 4 GiB, with a quarter to spare for what the machine allocates
+# while the test runs
+LMCACHE_ROOM_KIB = 160 * 1024 * 1024
 # what a build, a test or a client of the Hub is told through its environment, which a stand-in writes next to its
 # arguments
 RECORDED_VARIABLES = (
@@ -425,6 +428,30 @@ def test_without_a_memory_size_a_build_takes_the_jobs_the_machine_s_available_me
     assert process.returncode == 0, process.stderr
     # a cgroup that holds the test can only lower it
     assert 1 <= job_n <= max(1, min(32, available_kib // (4 * 1024 * 1024)))
+
+
+def test_a_cgroup_s_inactive_page_cache_is_memory_a_build_may_take(installer):
+    # the machine's available memory, lowered by each cgroup that holds this process to its limit less its working set:
+    # what it holds less its inactive page cache, which the kernel frees first
+    available_kib = int(re.search(r"(?m)^MemAvailable:\s+(\d+)", Path("/proc/meminfo").read_text()).group(1))
+    cgroup_line = re.search(r"(?m)^0::(.*)$", Path("/proc/self/cgroup").read_text())
+    directory = Path("/sys/fs/cgroup" + (cgroup_line.group(1) if cgroup_line else ""))
+    for cgroup in (directory, *directory.parents):
+        limit = (cgroup / "memory.max").read_text().strip() if (cgroup / "memory.max").exists() else "max"
+        if limit != "max":
+            memory_stat = dict(line.split() for line in (cgroup / "memory.stat").read_text().splitlines())
+            working_set = int((cgroup / "memory.current").read_text()) - int(memory_stat["inactive_file"])
+            available_kib = min(available_kib, (int(limit) - working_set) // 1024)
+        if cgroup == Path("/sys/fs/cgroup"):
+            break
+    if available_kib < LMCACHE_ROOM_KIB:
+        pytest.skip("this machine's memory holds fewer than all of LMCache's build jobs")
+
+    installer.run("verl", GPU_ARCH="10.3", MEMORY_GIB="")
+
+    [lmcache_build] = installer.calls("build_lmcache_wheel.sh")
+    # a cgroup full of cached files, as a Kubernetes pod's on a node that has read much, leaves the build all its jobs
+    assert lmcache_build.endswith("MAX_JOBS=32")
 
 
 def test_a_second_run_builds_nothing_and_a_changed_input_builds_what_is_made_from_it(installer):
