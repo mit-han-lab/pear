@@ -4,11 +4,11 @@
 # pins) with the SHA-256 of every file of each version, which uv checks at every install. It needs uv and the network,
 # and no work directory.
 #   bash scripts/install/compile_constraints.sh <environment>
-#   environments: verl | server | libero | libero_plus | libero_pro | robodojo | evalscope | station
+#   environments: verl | server | libero | libero_plus | libero_pro | robodojo | evalscope | station | claude_code
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-ENVIRONMENT=${1:?verl | server | libero | libero_plus | libero_pro | robodojo | evalscope | station}
+ENVIRONMENT=${1:?verl | server | libero | libero_plus | libero_pro | robodojo | evalscope | station | claude_code}
 ENVIRONMENT_DIR=$ROOT/scripts/install/$ENVIRONMENT
 # a simulator environment's directory
 SIM_ENVIRONMENT_DIR=$ROOT/scripts/install/sim/$ENVIRONMENT
@@ -53,9 +53,13 @@ case "$ENVIRONMENT" in
     PYTHON_VERSION=$STATION_PYTHON_VERSION
     INDEX_ARGS=(--torch-backend cpu)
     ;;
+  claude_code)
+    PYTHON_VERSION=$CLAUDE_CODE_PYTHON_VERSION
+    ;;
   *)
     echo "unknown environment $ENVIRONMENT" >&2
-    echo "  environments: verl | server | libero | libero_plus | libero_pro | robodojo | evalscope | station" >&2
+    echo "  environments: verl | server | libero | libero_plus | libero_pro | robodojo | evalscope | station" \
+      "| claude_code" >&2
     exit 1
     ;;
 esac

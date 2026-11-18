@@ -26,6 +26,21 @@ bash examples/models/qwen3_8_27b_pear/deploy/run_server.sh
 
 The server answers at `http://<host>:8000/v1` under the name `qwen3_8_27b`.
 
+## Serve through Claude Code
+
+The station can also reach the model through Claude Code, which keeps each task's conversation and compacts it when
+the context fills. On the machine of the GPU, with the server up:
+
+```bash
+export WORK_DIR=<work dir>
+bash scripts/install.sh claude_code
+
+export RUN=<run dir>
+bash examples/models/qwen3_8_27b_pear/deploy/run_claude_code.sh
+```
+
+The service answers at `http://<host>:8001`, one session at a time.
+
 ## Drive a Robot
 
 On the Linux machine the robot is plugged into:
@@ -179,6 +194,9 @@ bash examples/models/qwen3_8_27b_pear/deploy/run_station.sh
 Open the login URL it prints in Chrome on that machine, enable the motors, press Home, then start a task. A run's log,
 the tasks' records and their videos go under `RUN`.
 
+With `CLAUDE_CODE=<service host>:8001`, the page also offers the model through Claude Code
+([Serve through Claude Code](#serve-through-claude-code)).
+
 ## Variables
 
 | Variable | Default | Meaning |
@@ -187,9 +205,10 @@ the tasks' records and their videos go under `RUN`.
 | `MODEL` | Required | The model directory, NVFP4 or bf16 |
 | `DRAFT` | Required | The DFlash draft of the model |
 | `RUN` | Required | The run directory |
-| `PORT` | 8000 | The server's port |
+| `PORT` | 8000 | The server's port; 8001 for the Claude Code service's |
 | `NAME` | `qwen3_8_27b` | The model's name in the API |
 | `STATION_CONFIG` | Required | The station's file |
-| `SERVER` | Required | The server, `host:port` |
+| `SERVER` | Required | The server, `host:port`; for the Claude Code service, `127.0.0.1:8000` by default |
+| `CLAUDE_CODE` | None | The Claude Code service the station also offers, `host:port` |
 
 Extra arguments are Hydra overrides.

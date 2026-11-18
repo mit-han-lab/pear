@@ -62,6 +62,7 @@ bash scripts/install.sh libero_run   # on a GPU node: finds the rest built, and 
 | `numactl` | numactl, on a node that lacks it |
 | `station` | The robot station's environment, on the computer of its robot ([Deploying Qwen3.8-27B-PEAR](../../examples/models/qwen3_8_27b_pear/deploy/README.md#drive-a-robot)) |
 | `server` | The model server's environment, on the machine of its GPU ([Deploying Qwen3.8-27B-PEAR](../../examples/models/qwen3_8_27b_pear/deploy/README.md)) |
+| `claude_code` | The Claude Code session service's environment, beside the model server ([Deploying Qwen3.8-27B-PEAR](../../examples/models/qwen3_8_27b_pear/deploy/README.md#serve-through-claude-code)) |
 
 RoboDojo and RoboLab run Isaac Sim and need more setup. Their guides are coming soon.
 

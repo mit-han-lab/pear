@@ -31,9 +31,10 @@ class NamedModules:
         "pear.rollout.checkpoint_engine": "rollout.checkpoint_engine.custom_backend_module",
         "pear.agent_loop.agent_loop": "the agent loop's _target_",
     }
-    # the robot station's and the model server's modules are their own environments' (the server's has the vLLM of
-    # scripts/install/server): the training environment lacks what they import
-    OTHER_ENVIRONMENT_MODULES = ("pear.deploy.station", "pear.deploy.server")
+    # the robot station's, the model server's and the Claude Code session service's modules are their own
+    # environments' (the server's has the vLLM of scripts/install/server): the training environment lacks what they
+    # import
+    OWN_ENVIRONMENT_MODULES = ("pear.deploy.station", "pear.deploy.server", "pear.deploy.harness.claude_code")
     # interpreters that import at once: one per CPU of this process, at most 8. An import of verl with the
     # external modules takes a CPU and over 1 GB of memory
     IMPORT_WORKER_N = min(len(os.sched_getaffinity(0)), 8)
@@ -58,7 +59,7 @@ class NamedModules:
                     if cls.DOTTED_NAME.fullmatch(node.value):
                         modules.add(cls.module_of(node.value))
 
-        return sorted(module for module in modules - {None} if not module.startswith(cls.OTHER_ENVIRONMENT_MODULES))
+        return sorted(module for module in modules - {None} if not module.startswith(cls.OWN_ENVIRONMENT_MODULES))
 
     @staticmethod
     def module_of(name: str) -> str | None:

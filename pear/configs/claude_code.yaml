@@ -1,0 +1,17 @@
+# The config of `python -m pear.deploy.harness.claude_code.main`: the Claude Code session service beside one model
+# server, which the robot station's ClaudeCodeClient reaches. A model's deploy recipe (examples/models/<model>/deploy)
+# gives the port, the model server, the model's name and the run directory. The model's context is the one the model
+# server reports, and its sampling the model server's own.
+host: 0.0.0.0  # the address the service listens on
+port: ???  # the service's port
+upstream: ???  # the model server, http://<host>:<port>
+model: ???  # the name the model server serves the model under, which the station's client asks for
+run_dir: ???  # each session's working directory and the records of its model requests
+# the chat template's settings of every request, as the station's vLLM client sends them
+chat_template_kwargs: {enable_thinking: true, preserve_thinking: true, reasoning_effort: xhigh}
+# Claude Code's own output limit (its CLAUDE_CODE_MAX_OUTPUT_TOKENS), which it asks every model request for. It caps a
+# compaction's summary alone: the proxy gives a turn's answer all the output its context leaves instead, as the
+# station's direct client does. Claude Code compacts once the context passes the model's context less min(this, 20000)
+# less 13000 tokens: from 20000 on, 33000 tokens before its end.
+cli_max_output_tokens: 32768
+metrics_interval_s: 0.25  # between two readings of the model server's metrics while a request streams

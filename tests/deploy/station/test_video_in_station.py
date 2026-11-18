@@ -730,6 +730,32 @@ def test_turns_map_across_clips_with_actions_and_context_tokens(recorded):
     assert all(type(turn) is TurnSpan for turn in timeline.turns)
 
 
+def test_turns_count_the_conversation_through_a_compaction(tmp_path):
+    task = {
+        "id": "e" * 32,
+        "instruction": "Stack the cubes.",
+        "created": 99.0,
+        "model": "example",
+        "model_label": "Example Model",
+        "images": [],
+    }
+    records = RecordedTask.create(tmp_path / task["id"], task)
+    records.append_event("session", 99.5, {"episode_id": RecordedTask.EPISODE_ID, "message": "Model session started"})
+    # the context and the conversation after each turn: the second turn compacted the context to 6,000 tokens
+    counts = [(150000, 150000), (6000, 158000), (9000, 161000)]
+    for index, (context, conversation) in enumerate(counts):
+        attempt, start = f"turn-{index}", 101.0 + 3 * index
+        records.start_turn(attempt, index + 1, start)
+        context_report = {**REQUEST_CONTEXT_USAGE["context"], "input": context, "conversation_input": conversation}
+        records.append_event("usage", start + 1, {**REQUEST_CONTEXT_USAGE, "context": context_report}, attempt)
+        records.append_event("model_output", start + 2, {"answer": "..."}, attempt)
+
+    timeline = TaskTimeline.load(records.files, [records.segment_clip(1, 100.0, 10.0, [])])
+
+    # The tokens keep counting through the compaction.
+    assert [turn.tokens for turn in timeline.turns] == [150000, 158000, 161000]
+
+
 def test_the_cut_to_motion_keeps_the_turns_that_moved(recorded):
     timeline = TaskTimeline.load(*recorded)
 

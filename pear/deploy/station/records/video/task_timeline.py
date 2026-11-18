@@ -17,7 +17,8 @@ class TurnSpan:
     start_s: float  # from the video's start, where the turn's action begins to show
     end_s: float  # where it stops showing: the next turn's start, or the video's end
     action: dict[str, Any] | None  # the parsed action of the model; None when the turn has none
-    tokens: int | None  # the tokens of the context, shown for the turn
+    # the tokens of the conversation, shown for the turn: its context's, with those a compaction took out of it
+    tokens: int | None
 
 
 @dataclass(frozen=True)
@@ -73,7 +74,7 @@ class TaskTimeline:
     @staticmethod
     def _answers(files: TaskFiles) -> list[tuple[int, float, dict[str, Any] | None, int | None]]:
         """Returns, for each turn the model answered: its number, the monotonic time of the answer, the action or
-        None, and the context's tokens."""
+        None, and the conversation's tokens."""
         usage = ContextUsage()
         turns: dict[str, dict[str, Any]] = {}  # by attempt id, in the order the turns started
 
@@ -99,8 +100,10 @@ class TaskTimeline:
                 # the event file holds the turn's own fields in each event of the turn
                 turn["action"] = {key: value for key, value in data.items() if key not in turn["fields"]}
 
-            # the context after the turn's last event: the snapshot the recorder captions too
-            turn["tokens"] = latest_context["tokens"] if latest_context else None
+            # the context after the turn's last event, the snapshot the recorder captions too, with the tokens the
+            # compactions took out of it where its service counts them: the conversation keeps counting through them
+            conversation = latest_context.get("conversation_input") if latest_context else None
+            turn["tokens"] = conversation if conversation is not None else (latest_context or {}).get("tokens")
 
         return [
             (turn["number"], turn["answered_at"], turn["action"], turn["tokens"])
