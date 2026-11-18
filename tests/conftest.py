@@ -56,3 +56,13 @@ def tq_init(local_ray_cluster):
 def partition_id():
     """A unique partition per test to isolate TransferQueue state across tests."""
     return f"test-{uuid.uuid4().hex}"
+
+
+@pytest.fixture
+def isolated_rope_cache(monkeypatch):
+    """vLLM's rotary embeddings of the test built afresh instead of taken from get_rope's shared objects."""
+    # get_rope hands out one object per parameter set from a module-level dict, and Fp32Rope.install converts the
+    # object it is given in place: without this a test that installs it leaves the next one an fp32 embedding
+    from vllm.model_executor.layers import rotary_embedding
+
+    monkeypatch.setattr(rotary_embedding, "_ROPE_DICT", {})

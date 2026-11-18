@@ -67,6 +67,7 @@ def differing(got: torch.Tensor, want: torch.Tensor) -> str:
     return f"{(got != want).sum().item()} of {got.numel()} differ, max |difference| {largest:.3e}"
 
 
+@pytest.mark.usefixtures("isolated_rope_cache")
 def test_q_k_and_the_gate_come_from_the_layer_s_norms_and_rotary_embedding(replica_ops):
     generator = torch.Generator(device=DEVICE).manual_seed(5)
     layer = attention_layer(generator)

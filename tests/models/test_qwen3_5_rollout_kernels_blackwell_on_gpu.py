@@ -628,6 +628,7 @@ def engine_config():
         yield
 
 
+@pytest.mark.usefixtures("isolated_rope_cache")
 def test_the_rotary_embedding_rotates_in_fp32(engine_config):
     rope = get_rope(HEAD, ROPE_POSITIONS, rope_parameters=ROPE, dtype=torch.bfloat16)
     layer = torch.nn.Module()
