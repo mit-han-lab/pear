@@ -1,3 +1,4 @@
+from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderAttention
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import QwenGatedDeltaNetAttention
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, MambaAttentionBackendEnum, register_backend
 
@@ -9,14 +10,15 @@ from pear.models.qwen3_5.rollout.blackwell.gdn.layer import BlackwellGDNAttentio
 from pear.models.qwen3_5.rollout.blackwell.gemm import DraftGemmTableLinearMethod, GemmTableLinearMethod
 from pear.models.qwen3_5.rollout.blackwell.model import TP_SIZE, BlackwellQwen3_5ForConditionalGeneration
 from pear.models.qwen3_5.rollout.blackwell.mtp import BlackwellQwen3_5MTP
+from pear.models.qwen3_5.rollout.blackwell.vision import BlackwellEncoderAttention, BlackwellEncoderGraphs
 from pear.models.qwen3_5.rollout.gpu_backend import RolloutGpuBackend
 from pear.models.qwen3_5.rollout.nonfinite_logits import NonfiniteCheckedOutput
 
 
 class BlackwellRolloutGpuBackend(RolloutGpuBackend):
     """vLLM classes and patches for the replicas of a Qwen3.5 model on datacenter Blackwell at TP2: the Gated
-    DeltaNet's own kernels, an fp32 residual stream with fused all-reduces, mixed steps as CUDA graphs, the GEMM
-    tables, the fused samplers, the MTP drafter's kernels."""
+    DeltaNet's own kernels, an fp32 residual stream with fused all-reduces, mixed steps and the vision encoder as CUDA
+    graphs, the GEMM tables, the fused samplers, the MTP drafter's kernels."""
 
     generation = GpuGeneration.DATACENTER_BLACKWELL
     tensor_parallel_size = TP_SIZE
@@ -26,6 +28,7 @@ class BlackwellRolloutGpuBackend(RolloutGpuBackend):
     @classmethod
     def configure(cls, compilation_config: dict, max_num_seqs: int, max_num_batched_tokens: int) -> None:
         BlackwellMixedStepGraphs.configure(compilation_config, max_num_seqs, max_num_batched_tokens)
+        BlackwellEncoderGraphs.configure(compilation_config)
 
     @classmethod
     def install(cls, vllm_config) -> None:
@@ -34,8 +37,10 @@ class BlackwellRolloutGpuBackend(RolloutGpuBackend):
         DraftGemmTableLinearMethod.load_table()
 
         # through vLLM's extension points (the model and its model state by PEAR's vLLM plugin,
-        # Qwen3_5RolloutKernels.register): the GDN layer, its metadata builder and the attention backend
+        # Qwen3_5RolloutKernels.register): the GDN layer, the vision encoder's attention, the GDN metadata builder and
+        # the attention backend
         QwenGatedDeltaNetAttention.register_oot(BlackwellGDNAttention)
+        MMEncoderAttention.register_oot(BlackwellEncoderAttention)
         register_backend(MambaAttentionBackendEnum.GDN_ATTN, is_mamba=True)(BlackwellGDNBackend)
         register_backend(AttentionBackendEnum.FLASHINFER)(BlackwellFlashInferBackend)
 

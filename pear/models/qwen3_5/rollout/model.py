@@ -173,6 +173,7 @@ class Qwen3_5RolloutForConditionalGeneration(Qwen3_5ForConditionalGeneration):
 
     VISION_NORM_EPS = 1e-6  # the vision tower's norm epsilon when the config names none (vLLM's default)
     causal_lm_cls: ClassVar[type[Qwen3_5RolloutForCausalLM]] = Qwen3_5RolloutForCausalLM
+    vision_cls: ClassVar[type[Qwen3_VisionTransformer]] = Qwen3_VisionTransformer  # the GPU backend's vision tower
     linear_method_cls: ClassVar[type[UnquantizedLinearMethod]] = UnquantizedLinearMethod
     model_state_cls: ClassVar[type[Qwen3_5RolloutModelState]]  # the GPU backend's model state
 
@@ -196,7 +197,7 @@ class Qwen3_5RolloutForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         self.multiscale_dim = self.visual_dim * self.deepstack_num_level
 
         with self._mark_tower_model(vllm_config, {"image", "video"}):
-            self.visual = Qwen3_VisionTransformer(
+            self.visual = self.vision_cls(
                 config.vision_config,
                 norm_eps=getattr(config, "rms_norm_eps", self.VISION_NORM_EPS),
                 quant_config=vllm_config.quant_config,

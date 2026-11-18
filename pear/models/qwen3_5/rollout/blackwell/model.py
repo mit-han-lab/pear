@@ -16,6 +16,7 @@ from pear.models.qwen3_5.rollout.blackwell.attention import VerifyAttention
 from pear.models.qwen3_5.rollout.blackwell.gemm import GemmTableLinearMethod, PartialSumsLinearMethod, StreamGemm
 from pear.models.qwen3_5.rollout.blackwell.model_state import BlackwellRolloutModelState
 from pear.models.qwen3_5.rollout.blackwell.rope import Fp32Rope
+from pear.models.qwen3_5.rollout.blackwell.vision import BlackwellVisionTransformer
 from pear.models.qwen3_5.rollout.gdn import GDNProjection
 from pear.models.qwen3_5.rollout.model import (
     Qwen3_5RolloutDecoderLayer,
@@ -364,6 +365,7 @@ class BlackwellQwen3_5ForConditionalGeneration(Qwen3_5RolloutForConditionalGener
     """The Qwen3.5 vision-language model of a datacenter Blackwell replica, its linear layers on the GEMM table."""
 
     causal_lm_cls = BlackwellQwen3_5ForCausalLM
+    vision_cls = BlackwellVisionTransformer
     linear_method_cls = GemmTableLinearMethod
     model_state_cls = BlackwellRolloutModelState
 
