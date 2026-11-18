@@ -5,13 +5,14 @@ import gc
 import torch
 
 from pear.models.kernels import RolloutKernels
+from pear.rollout.top_p import ExactMaxTopP
 from pear.rollout.vllm_patches import Fp32Modules
 from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension
 
 
 class PearVLLMWorkerExtension(vLLMColocateWorkerExtension):
-    """verl's vLLM worker extension with the weights kept in fp32, a model family's rollout kernels and the checks of
-    a sync."""
+    """verl's vLLM worker extension with the weights kept in fp32, vLLM's top-p shifted by each row's exact max, a
+    model family's rollout kernels and the checks of a sync."""
 
     ERROR_NAME_LIMIT = 4  # a failed check's error names at most this many of the parameters it found
 
@@ -21,6 +22,8 @@ class PearVLLMWorkerExtension(vLLMColocateWorkerExtension):
         fp32_modules = Fp32Modules.from_env()
         if fp32_modules is not None:
             fp32_modules.install()
+        # vLLM's own sampler, whatever the model and the GPU: its top-p without top-k on PEAR's exact-max copy
+        ExactMaxTopP.install()
         # the model family's vLLM classes and patches (rollout.kernels, named by PearVLLMServer)
         kernels = RolloutKernels.from_env()
         if kernels is not None:
