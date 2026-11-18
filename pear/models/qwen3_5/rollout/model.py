@@ -37,6 +37,8 @@ class Qwen3_5RolloutDecoderLayer(Qwen3_5DecoderLayer):
     TEXT_MODEL_TYPE = "qwen3_5_text"  # the dense model's text config, the one the layer is built for
     # whether the row-parallel projections all-reduce their outputs (otherwise the GPU backend's next norm does)
     reduce_results: ClassVar[bool] = True
+    mlp_cls: ClassVar[type[Qwen3NextMLP]] = Qwen3NextMLP  # the GPU backend's dense MLP
+    attention_cls: ClassVar[type[Qwen3NextAttention]] = Qwen3NextAttention  # the GPU backend's gated full attention
 
     def __init__(self, vllm_config: VllmConfig, layer_type: str, prefix: str = "") -> None:
         # vLLM's Qwen3_5DecoderLayer.__init__ for the dense model: no MoE, no layer scale
@@ -61,7 +63,7 @@ class Qwen3_5RolloutDecoderLayer(Qwen3_5DecoderLayer):
                 reduce_results=self.reduce_results,
             )
         elif layer_type == "full_attention":
-            self.self_attn = Qwen3NextAttention(
+            self.self_attn = self.attention_cls(
                 config,
                 model_config=vllm_config.model_config,
                 cache_config=vllm_config.cache_config,
@@ -76,7 +78,7 @@ class Qwen3_5RolloutDecoderLayer(Qwen3_5DecoderLayer):
         else:
             raise ValueError(f"Invalid layer_type {layer_type}")
 
-        self.mlp = Qwen3NextMLP(
+        self.mlp = self.mlp_cls(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,

@@ -1,0 +1,180 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [rollout] fix: the partial-rollout client sums the
+ speculative-decoding counts of every attempt
+
+---
+ .../test_llm_server_spec_counts_on_cpu.py     | 74 +++++++++++++++++++
+ .../agent_loop/tool_agent_loop.py             |  8 +-
+ verl/workers/rollout/llm_server.py            | 13 +++-
+ verl/workers/rollout/replica.py               |  7 ++
+ 4 files changed, 94 insertions(+), 8 deletions(-)
+ create mode 100644 tests/workers/rollout/test_llm_server_spec_counts_on_cpu.py
+
+diff --git a/tests/workers/rollout/test_llm_server_spec_counts_on_cpu.py b/tests/workers/rollout/test_llm_server_spec_counts_on_cpu.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6a32a695cd464616cda7bdb455aedf756b646886
+--- /dev/null
++++ b/tests/workers/rollout/test_llm_server_spec_counts_on_cpu.py
+@@ -0,0 +1,74 @@
++# Copyright 2026 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import asyncio
++from types import SimpleNamespace
++
++import pytest
++
++from verl.workers.rollout import llm_server
++from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient
++from verl.workers.rollout.replica import TokenOutput
++
++
++def _counts(drafts: int, accepted: int, verify_steps: int) -> dict:
++    """A generation's speculative-decoding counts as the server reports them."""
++    return {
++        "spec_num_draft_tokens": drafts,
++        "spec_num_accepted_tokens": accepted,
++        "spec_num_verify_steps": verify_steps,
++    }
++
++
++def _generate(monkeypatch: pytest.MonkeyPatch, segments: list[TokenOutput]) -> TokenOutput:
++    """The client's generation when each resume attempt returns the next segment (the base class is patched)."""
++    pending = iter(segments)
++
++    async def fake_generate(self, request_id, *, prompt_ids, **kwargs):
++        return next(pending)
++
++    monkeypatch.setattr(llm_server.LLMServerClient, "generate", fake_generate)
++    real_sleep = asyncio.sleep
++
++    async def no_wait(_delay, *args, **kwargs):
++        return await real_sleep(0, *args, **kwargs)
++
++    monkeypatch.setattr(llm_server.asyncio, "sleep", no_wait)
++    client = FullyAsyncLLMServerClient(config=SimpleNamespace(), load_balancer_handle=None)
++    return asyncio.run(client.generate(request_id="req-0", prompt_ids=[1, 2, 3], sampling_params={}))
++
++
++def test_spec_counts_of_every_attempt_are_summed(monkeypatch):
++    """An abort with counts, an abort before any token (the server reports none), then completion: the sums."""
++    segments = [
++        TokenOutput(token_ids=[101, 102], stop_reason="aborted", extra_fields={"global_steps": 5, **_counts(6, 4, 2)}),
++        TokenOutput(token_ids=[], stop_reason="aborted", extra_fields={"global_steps": 5}),
++        TokenOutput(
++            token_ids=[103, 104, 105], stop_reason="completed", extra_fields={"global_steps": 6, **_counts(9, 3, 3)}
++        ),
++    ]
++
++    output = _generate(monkeypatch, segments)
++
++    assert output.token_ids == [101, 102, 103, 104, 105]
++    assert {key: output.extra_fields[key] for key in _counts(0, 0, 0)} == _counts(15, 7, 5)
++
++
++def test_generation_without_a_drafter_carries_no_spec_counts(monkeypatch):
++    """A server without speculative decoding reports no counts, and the client adds none."""
++    segment = TokenOutput(token_ids=[101], stop_reason="completed", extra_fields={"global_steps": 5})
++
++    output = _generate(monkeypatch, [segment])
++
++    assert not any(key in output.extra_fields for key in _counts(0, 0, 0))
+diff --git a/verl/experimental/agent_loop/tool_agent_loop.py b/verl/experimental/agent_loop/tool_agent_loop.py
+index dde4dfc6a6afdf8fd8c5014fb8f861220182d5c0..5ea76527857f9a0d39f5d26a3ac5a73af23be0f9 100644
+--- a/verl/experimental/agent_loop/tool_agent_loop.py
++++ b/verl/experimental/agent_loop/tool_agent_loop.py
+@@ -34,17 +34,11 @@ from verl.tools.function_tool import FunctionTool, normalize_function_tool_retur
+ from verl.tools.schemas import OpenAIFunctionCallSchema, OpenAIFunctionParsedSchema, ToolResponse
+ from verl.utils.profiler import simple_timer
+ from verl.utils.rollout_trace import rollout_trace_op
+-from verl.workers.rollout.replica import TokenOutput
++from verl.workers.rollout.replica import SPEC_DECODE_EXTRA_KEYS, TokenOutput
+ 
+ logger = logging.getLogger(__file__)
+ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+ 
+-SPEC_DECODE_EXTRA_KEYS = (
+-    "spec_num_draft_tokens",
+-    "spec_num_accepted_tokens",
+-    "spec_num_verify_steps",
+-)
+-
+ 
+ class AgentState(Enum):
+     PENDING = "pending"
+diff --git a/verl/workers/rollout/llm_server.py b/verl/workers/rollout/llm_server.py
+index 5b878337596efad7bd218b8af9ef7636fffd7d8e..379929921e9347e4e1e25079304f853f36ab37a6 100644
+--- a/verl/workers/rollout/llm_server.py
++++ b/verl/workers/rollout/llm_server.py
+@@ -32,7 +32,12 @@ from verl.utils import normalize_token_ids
+ from verl.utils.ray_utils import auto_await
+ from verl.utils.rollout_trace import rollout_trace_op
+ from verl.utils.tracking import RLInsightLogger
+-from verl.workers.rollout.replica import RolloutReplica, TokenOutput, get_rollout_replica_class
++from verl.workers.rollout.replica import (
++    SPEC_DECODE_EXTRA_KEYS,
++    RolloutReplica,
++    TokenOutput,
++    get_rollout_replica_class,
++)
+ from verl.workers.rollout.router import GlobalRequestLoadBalancer  # noqa: F401
+ from verl.workers.rollout.utils import update_prometheus_config
+ 
+@@ -288,6 +293,8 @@ class FullyAsyncLLMServerClient(LLMServerClient):
+         # The sampler's top-k heads (score centering) belong to the generated tokens: one (ids, log-probs) part per
+         # attempt, concatenated like the log-probs
+         topk_parts = []
++        # the speculative-decoding counts of every attempt, summed: a resumed request is one generation
++        spec_counts = {}
+ 
+         while True:
+             # 1. generate tokens
+@@ -319,6 +326,9 @@ class FullyAsyncLLMServerClient(LLMServerClient):
+                 topk_parts.append(
+                     (output.extra_fields["response_topk_ids"], output.extra_fields["response_topk_log_probs"])
+                 )
++            for key in SPEC_DECODE_EXTRA_KEYS:
++                if key in output.extra_fields:
++                    spec_counts[key] = spec_counts.get(key, 0) + int(output.extra_fields[key])
+             if output.num_preempted is not None:
+                 final_output.num_preempted += output.num_preempted
+             final_output.stop_reason = output.stop_reason
+@@ -355,6 +365,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
+         final_output.extra_fields["min_global_steps"] = min_global_steps
+         final_output.extra_fields["max_global_steps"] = max_global_steps
+         final_output.extra_fields["num_cached_tokens"] = num_cached_tokens
++        final_output.extra_fields.update(spec_counts)
+         if topk_parts:
+             topk_ids = np.concatenate([ids for ids, _ in topk_parts])
+             if len(topk_ids) != len(final_output.token_ids):
+diff --git a/verl/workers/rollout/replica.py b/verl/workers/rollout/replica.py
+index a48a3e7eff295d33ba0a209e5a83ec9f9ae8f815..b4d9068b31224c74a90032526f44784a1778f9ed 100644
+--- a/verl/workers/rollout/replica.py
++++ b/verl/workers/rollout/replica.py
+@@ -35,6 +35,13 @@ logger = logging.getLogger(__file__)
+ # excluding calls to generate method.
+ CONTROL_METHOD_CONCURRENCY = 16
+ 
++# A generation's speculative-decoding counts, the rollout-common names its TokenOutput's extra_fields carries them under
++SPEC_DECODE_EXTRA_KEYS = (
++    "spec_num_draft_tokens",
++    "spec_num_accepted_tokens",
++    "spec_num_verify_steps",
++)
++
+ 
+ class TokenOutput(BaseModel):
+     token_ids: list[int]

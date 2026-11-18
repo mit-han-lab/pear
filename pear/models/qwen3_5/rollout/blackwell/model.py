@@ -12,13 +12,13 @@ from vllm.triton_utils import tl, triton
 from pear.models.qwen3_5.rollout.blackwell.gemm import GemmTableLinearMethod
 from pear.models.qwen3_5.rollout.blackwell.model_state import BlackwellRolloutModelState
 from pear.models.qwen3_5.rollout.blackwell.rope import Fp32Rope
-from pear.models.qwen3_5.rollout.blackwell.triton_launcher import TritonLauncher
 from pear.models.qwen3_5.rollout.model import (
     Qwen3_5RolloutDecoderLayer,
     Qwen3_5RolloutForCausalLM,
     Qwen3_5RolloutForConditionalGeneration,
     Qwen3_5RolloutModel,
 )
+from pear.models.qwen3_5.rollout.triton_launcher import TritonLauncher
 
 TP_SIZE = 2  # the fused all-reduce and the logits gather exchange with one peer
 

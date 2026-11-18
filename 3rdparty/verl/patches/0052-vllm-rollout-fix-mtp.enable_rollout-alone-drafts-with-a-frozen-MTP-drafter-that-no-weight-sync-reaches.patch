@@ -1,0 +1,364 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [vllm, rollout] fix: mtp.enable_rollout alone drafts with a
+ frozen MTP drafter that no weight sync reaches
+
+The rollout drafted with MTP only with mtp.enable as well (launch_server's speculative config, the acceptance counts of
+generate and _resolve_sleep_level in vllm_async_server.py, the acceptance metrics in trainer_base.py), and mtp.enable
+keeps the MTP layers in the actor's model config (workers/config/model.py:243-251), which every checkpoint the actor
+saves carries. An actor without MTP layers then exports a config that claims one: an FSDP actor has none, as
+transformers 5.22.2's Qwen3_5 builds no MTP module and drops a checkpoint's mtp.* weights at load
+(modeling_qwen3_5.py:912). The weight sync also reached the drafter whenever vLLM's method was mtp
+(_use_mtp_drafter_weight_sync): with no MTP weight among the actor's, it loaded the actor's embedding and lm_head a
+second time into the modules the drafter shares with the model, and post-processed them again.
+
+mtp.enable_rollout now switches the rollout's MTP drafter on by itself; launch_server's part moves into
+_apply_mtp_rollout_config, which the tests reach. mtp.enable keeps its meaning, an actor that carries MTP layers, and
+also decides the drafter's weight sync: the server passes it to the engine's workers as
+VERL_VLLM_MTP_DRAFTER_WEIGHT_SYNC, and without it the drafter stays at the weights of its own checkpoint
+(speculative_config.model, or the model's own MTP layers). With both set, nothing changes. The SGLang rollout still
+requires both.
+---
+ docs/advance/mtp.md                           |  1 +
+ ...test_mtp_hybrid_sleep_acceptance_on_cpu.py |  6 +-
+ .../test_mtp_rollout_config_on_cpu.py         | 54 +++++++++++++++
+ .../test_vllm_weight_update_utils_on_cpu.py   | 67 ++++++++++++++-----
+ verl/trainer/ppo/v1/trainer_base.py           |  2 +-
+ verl/workers/config/model.py                  |  4 +-
+ verl/workers/rollout/vllm_rollout/utils.py    | 17 ++++-
+ .../rollout/vllm_rollout/vllm_async_server.py | 41 +++++++-----
+ 8 files changed, 154 insertions(+), 38 deletions(-)
+ create mode 100644 tests/workers/rollout/rollout_vllm/test_mtp_rollout_config_on_cpu.py
+
+diff --git a/docs/advance/mtp.md b/docs/advance/mtp.md
+index 25d83b434b1889f0c3dc218160daf54f37c16a0b..6e505239401ea1fc64d537bf529bf3d551eaba14 100644
+--- a/docs/advance/mtp.md
++++ b/docs/advance/mtp.md
+@@ -32,6 +32,7 @@ The MTP training process can be flexibly controlled through the following config
+ | Full-Parameter MTP Training | `enable=True`<br>`enable_train=True`<br>`mtp_loss_scaling_factor=0.1`                                                                                                                                                                                                                              | MTP Loss will apply to all model parameters                            |
+ | MTP Parameter-Only Training | `enable=True`<br>`enable_train=True`<br>`detach_encoder=True`                                                                                                                                                                                                                                      | Freeze the Encoder layer, update only MTP module parameters, MTP Loss applies only to MTP parameters |
+ | MTP Accelerated Rollout | 1. vLLM configuration:<br>`enable=True`<br>`enable_rollout=True`<br>`method="mtp"`<br>`num_speculative_tokens=1`<br>2. SGLang configuration:<br>`enable=True`<br>`enable_rollout=True`<br>`speculative_algorithm="EAGLE"`<br>`speculative_num_steps=2`<br>`speculative_eagle_topk=2`<br>`speculative_num_draft_tokens=4` | Achieve inference acceleration during the Rollout phase based on MTP                      |
++| MTP Accelerated Rollout with a Frozen Drafter | vLLM configuration:<br>`enable_rollout=True`<br>`method="mtp"`<br>`num_speculative_tokens=1`<br>`actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.model=<a checkpoint with the MTP layers>` (optional) | The actor carries no MTP parameters and no weight sync reaches the drafter, which keeps the weights of its own checkpoint |
+ 
+ ## 3. Experimental Results
+ 
+diff --git a/tests/workers/rollout/rollout_vllm/test_mtp_hybrid_sleep_acceptance_on_cpu.py b/tests/workers/rollout/rollout_vllm/test_mtp_hybrid_sleep_acceptance_on_cpu.py
+index 51a7d16e26b5ec71ef712b17e736d27dd5ff4e8f..93a90f0d955174b6b0477683c3e3351318c0d63d 100644
+--- a/tests/workers/rollout/rollout_vllm/test_mtp_hybrid_sleep_acceptance_on_cpu.py
++++ b/tests/workers/rollout/rollout_vllm/test_mtp_hybrid_sleep_acceptance_on_cpu.py
+@@ -49,11 +49,13 @@ class _FakeMtpEngine:
+         return num_draft_tokens, num_accepted_tokens, num_verify_steps
+ 
+ 
+-def test_mtp_hybrid_sleep_keeps_drafter_available_for_nonzero_acceptance(monkeypatch):
++# an actor that carries the MTP layers its drafter takes at every sync, and a frozen drafter of the rollout alone
++@pytest.mark.parametrize("enable", [True, False])
++def test_mtp_hybrid_sleep_keeps_drafter_available_for_nonzero_acceptance(monkeypatch, enable):
+     monkeypatch.setattr(vllm_async_server, "is_torch_npu_available", lambda check_device=False: False)
+ 
+     server = object.__new__(vllm_async_server.vLLMHttpServer)
+-    server.config = SimpleNamespace(mtp=SimpleNamespace(enable=True, enable_rollout=True))
++    server.config = SimpleNamespace(mtp=SimpleNamespace(enable=enable, enable_rollout=True))
+     server.model_config = SimpleNamespace(lora_rank=0, lora={})
+     server.engine = _FakeMtpEngine()
+ 
+diff --git a/tests/workers/rollout/rollout_vllm/test_mtp_rollout_config_on_cpu.py b/tests/workers/rollout/rollout_vllm/test_mtp_rollout_config_on_cpu.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a918e307292456bcfd0d766996af52e5f040d2aa
+--- /dev/null
++++ b/tests/workers/rollout/rollout_vllm/test_mtp_rollout_config_on_cpu.py
+@@ -0,0 +1,54 @@
++# Copyright 2026 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import os
++from types import SimpleNamespace
++
++import pytest
++
++pytest.importorskip("ray")
++pytest.importorskip("vllm")
++
++from verl.workers.config.model import MtpConfig
++from verl.workers.rollout.vllm_rollout.utils import VLLM_MTP_DRAFTER_WEIGHT_SYNC_ENV
++from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
++
++
++def _engine_args(mtp, engine_args):
++    """The engine arguments the server makes of a rollout config's mtp and the engine's own arguments."""
++    server = object.__new__(vLLMHttpServer)
++    server.config = SimpleNamespace(mtp=mtp)
++    server._apply_mtp_rollout_config(engine_args)
++    return engine_args
++
++
++@pytest.mark.parametrize(("enable", "weight_sync"), [(True, "1"), (False, "0")])
++def test_mtp_rollout_drafts_whether_or_not_the_actor_carries_mtp(monkeypatch, enable, weight_sync):
++    """enable_rollout alone gives the engine its MTP drafter; enable decides whether the weight sync reaches it."""
++    monkeypatch.setenv(VLLM_MTP_DRAFTER_WEIGHT_SYNC_ENV, "")
++    mtp = MtpConfig(enable=enable, enable_rollout=True, method="mtp", num_speculative_tokens=3)
++
++    args = _engine_args(mtp, {"speculative_config": {"model": "/draft"}})
++
++    assert args["speculative_config"] == {"method": "mtp", "num_speculative_tokens": 3, "model": "/draft"}
++    assert args["per_request_spec_decode_metrics"] == "summary"
++    assert os.environ[VLLM_MTP_DRAFTER_WEIGHT_SYNC_ENV] == weight_sync
++
++
++@pytest.mark.parametrize("mtp", [None, MtpConfig(), MtpConfig(enable=True)])
++def test_no_mtp_drafter_without_enable_rollout(monkeypatch, mtp):
++    monkeypatch.setenv(VLLM_MTP_DRAFTER_WEIGHT_SYNC_ENV, "")
++
++    assert _engine_args(mtp, {}) == {}
++    assert os.environ[VLLM_MTP_DRAFTER_WEIGHT_SYNC_ENV] == ""
+diff --git a/tests/workers/rollout/test_vllm_weight_update_utils_on_cpu.py b/tests/workers/rollout/test_vllm_weight_update_utils_on_cpu.py
+index 3134998ea7ab30297dae329482f61ac311c9f62b..3881e9136539fe0e88c5a68085e4425b850cbe80 100644
+--- a/tests/workers/rollout/test_vllm_weight_update_utils_on_cpu.py
++++ b/tests/workers/rollout/test_vllm_weight_update_utils_on_cpu.py
+@@ -254,36 +254,69 @@ def test_vllm_update_weights_loads_params_and_buffers():
+     )
+ 
+ 
++class _SpecConfig:
++    method = "mtp"
++    draft_model_config = object()
++
++
++class _Drafter:
++    def __init__(self, m):
++        self.model = m
++
++
++def _mtp_worker(main_model, drafter_model, owner_attr):
++    """A worker whose model runner drafts with MTP, the drafter held by the V1 or the V2 owner."""
++    worker = object.__new__(vLLMColocateWorkerExtension)
++    worker.model_runner = _FakeModelRunner(main_model, speculative_config=_SpecConfig())
++    setattr(worker.model_runner, owner_attr, _Drafter(drafter_model))
++    return worker
++
++
++_MTP_WEIGHTS = [
++    ("model.layers.0.linear.weight", torch.ones(4, 4, dtype=torch.float32)),
++    ("model.layers.0.e_score_correction_bias", torch.arange(4, dtype=torch.float32) + 5),
++]
++
++
+ @pytest.mark.parametrize("owner_attr", ["drafter", "speculator"])
+-def test_vllm_update_weights_syncs_buffers_to_mtp_drafter(owner_attr):
+-    """MTP buffers must stay in sync with either the V1 or V2 draft-model owner."""
++def test_vllm_update_weights_syncs_buffers_to_mtp_drafter(monkeypatch, owner_attr):
++    """MTP buffers must stay in sync with either the V1 or V2 draft-model owner of an actor that carries MTP."""
++    monkeypatch.setenv(_vllm_rollout_utils.VLLM_MTP_DRAFTER_WEIGHT_SYNC_ENV, "1")
+     main_model = _ToyModel()
+     drafter_model = _ToyModel()
+     main_model.load_weights = lambda weights: None
+     drafter_model.load_weights = lambda weights: None
++    worker = _mtp_worker(main_model, drafter_model, owner_attr)
+ 
+-    class _SpecConfig:
+-        method = "mtp"
+-        draft_model_config = object()
++    worker._update_weights(_MTP_WEIGHTS, peft_config=None, base_sync_done=False)
+ 
+-    class _Drafter:
+-        def __init__(self, m):
+-            self.model = m
++    expected = torch.tensor([5, 6, 7, 8], dtype=torch.float32)
++    torch.testing.assert_close(main_model.model.layers[0].e_score_correction_bias, expected)
++    torch.testing.assert_close(drafter_model.model.layers[0].e_score_correction_bias, expected)
+ 
+-    worker = object.__new__(vLLMColocateWorkerExtension)
+-    worker.model_runner = _FakeModelRunner(main_model, speculative_config=_SpecConfig())
+-    setattr(worker.model_runner, owner_attr, _Drafter(drafter_model))
+ 
+-    weights = [
+-        ("model.layers.0.linear.weight", torch.ones(4, 4, dtype=torch.float32)),
+-        ("model.layers.0.e_score_correction_bias", torch.arange(4, dtype=torch.float32) + 5),
+-    ]
++@pytest.mark.parametrize("sync_flag", ["0", None])
++@pytest.mark.parametrize("owner_attr", ["drafter", "speculator"])
++def test_vllm_update_weights_leaves_a_frozen_mtp_drafter_alone(monkeypatch, owner_attr, sync_flag):
++    """A drafter of the rollout alone (mtp.enable_rollout without mtp.enable) keeps its own checkpoint's weights."""
++    if sync_flag is None:
++        monkeypatch.delenv(_vllm_rollout_utils.VLLM_MTP_DRAFTER_WEIGHT_SYNC_ENV, raising=False)
++    else:
++        monkeypatch.setenv(_vllm_rollout_utils.VLLM_MTP_DRAFTER_WEIGHT_SYNC_ENV, sync_flag)
++    main_model = _ToyModel()
++    drafter_model = _ToyModel()
++    main_model.load_weights = lambda weights: None
++    drafter_loads = []
++    drafter_model.load_weights = drafter_loads.append
++    worker = _mtp_worker(main_model, drafter_model, owner_attr)
+ 
+-    worker._update_weights(weights, peft_config=None, base_sync_done=False)
++    worker._update_weights(_MTP_WEIGHTS, peft_config=None, base_sync_done=False)
+ 
+     expected = torch.tensor([5, 6, 7, 8], dtype=torch.float32)
+     torch.testing.assert_close(main_model.model.layers[0].e_score_correction_bias, expected)
+-    torch.testing.assert_close(drafter_model.model.layers[0].e_score_correction_bias, expected)
++    torch.testing.assert_close(drafter_model.model.layers[0].e_score_correction_bias, torch.zeros(4))
++    assert drafter_loads == []
++    assert list(worker._iter_all_models()) == [main_model]
+ 
+ 
+ @pytest.mark.parametrize("owner_attr", ["drafter", "speculator"])
+diff --git a/verl/trainer/ppo/v1/trainer_base.py b/verl/trainer/ppo/v1/trainer_base.py
+index 764cb99217613f1a8c8ab4f21aadfec0bfb39aaf..46cfaee7043a43d29bbc5675673e6fa8ea3d4877 100644
+--- a/verl/trainer/ppo/v1/trainer_base.py
++++ b/verl/trainer/ppo/v1/trainer_base.py
+@@ -1978,7 +1978,7 @@ class PPOTrainer(ABC):
+         # Only fetch speculative decoding stats when rollout writes them.
+         spec_drafts = spec_accepts = spec_verifies = None
+         mtp_config = getattr(self.config.actor_rollout_ref.model, "mtp", None)
+-        if mtp_config is not None and mtp_config.enable and mtp_config.enable_rollout:
++        if mtp_config is not None and mtp_config.enable_rollout:
+             spec_data = tq.kv_batch_get(
+                 keys=batch.keys,
+                 partition_id=batch.partition_id,
+diff --git a/verl/workers/config/model.py b/verl/workers/config/model.py
+index 0472044abbd64a9909f6f3bcad1e05cae3001ee1..ebcd34094219dc602631c0be81b403738a9258ea 100644
+--- a/verl/workers/config/model.py
++++ b/verl/workers/config/model.py
+@@ -34,7 +34,9 @@ class MtpConfig(BaseConfig):
+     enable: Enable loading and saving of MTP parameters, but do not use them
+ 
+     enable_train: Whether to enable using MTP parameters during training
+-    enable_rollout: Whether to enable using MTP parameters during rollout
++    enable_rollout: Whether to enable using MTP parameters during rollout. With enable, the vLLM rollout's drafter
++        takes the actor's MTP parameters at every weight sync; without it, the drafter is frozen at those of its own
++        checkpoint (rollout.engine_kwargs.vllm.speculative_config.model, or the model's own MTP layers)
+ 
+     Training parameters:
+         detach_encoder: Whether to detach encoder parameters during MTP training
+diff --git a/verl/workers/rollout/vllm_rollout/utils.py b/verl/workers/rollout/vllm_rollout/utils.py
+index 2287ec63c3d2ad57bc65d65e6aeeaf4ef83500df..9e1ea47f8577dc1c936b6dc4fc5c9c7c3c14c6c8 100644
+--- a/verl/workers/rollout/vllm_rollout/utils.py
++++ b/verl/workers/rollout/vllm_rollout/utils.py
+@@ -47,6 +47,10 @@ VLLM_LORA_PATH = "simon_lora_path"
+ 
+ VLLM_ASCEND_REQUIRED_ENV_VARS = {"VLLM_ALL2ALL_BACKEND": "flashinfer_all2allv", "VLLM_ASCEND_ENABLE_NZ": "0"}
+ 
++# "1" when the actor carries the MTP layers the rollout's MTP drafter takes at every weight sync (mtp.enable), set by
++# the server for the engine processes it starts; otherwise the drafter keeps the weights of its own checkpoint
++VLLM_MTP_DRAFTER_WEIGHT_SYNC_ENV = "VERL_VLLM_MTP_DRAFTER_WEIGHT_SYNC"
++
+ 
+ def _resolve_vllm_weight_sync_local_rank(worker_local_rank: int, parallel_config: Any) -> int:
+     worker_local_rank = int(worker_local_rank)
+@@ -226,9 +230,18 @@ class vLLMColocateWorkerExtension:
+         return spec.draft_model_config if spec is not None and spec.draft_model_config is not None else None
+ 
+     def _use_mtp_drafter_weight_sync(self):
+-        """Return whether the vLLM MTP drafter should receive actor weights."""
++        """Return whether the vLLM MTP drafter should receive actor weights.
++
++        Only an actor that carries MTP layers (mtp.enable) has weights for it. A drafter of the rollout alone
++        (mtp.enable_rollout without mtp.enable) is frozen at the weights of its own checkpoint.
++        """
+         spec = self.model_runner.vllm_config.speculative_config
+-        return spec is not None and spec.method == "mtp" and self._get_drafter_model() is not None
++        return (
++            os.environ.get(VLLM_MTP_DRAFTER_WEIGHT_SYNC_ENV) == "1"
++            and spec is not None
++            and spec.method == "mtp"
++            and self._get_drafter_model() is not None
++        )
+ 
+     def _iter_all_models(self):
+         """Yield models that need weight updates.
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+index a369c825ceddd7694a03888025d9937452b561f0..d710a363268e8e551c373f6591e3d42af56bdaf3 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -65,6 +65,7 @@ from verl.workers.rollout.vllm_rollout.utils import (
+     VLLM_LORA_INT_ID,
+     VLLM_LORA_NAME,
+     VLLM_LORA_PATH,
++    VLLM_MTP_DRAFTER_WEIGHT_SYNC_ENV,
+     SuppressSignalInThread,
+     build_cli_args_from_config,
+     build_mtp_speculative_config,
+@@ -381,14 +382,7 @@ class vLLMHttpServer:
+                     served_model_name = served_model_name.split("/")[-1]
+                 args["served_model_name"] = served_model_name
+ 
+-        if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:
+-            args["speculative_config"] = build_mtp_speculative_config(
+-                self.config.mtp.method,
+-                self.config.mtp.num_speculative_tokens,
+-                args.get("speculative_config"),
+-            )
+-            # each finished request's acceptance counts, read from its output's spec_decode_metrics
+-            args["per_request_spec_decode_metrics"] = "summary"
++        self._apply_mtp_rollout_config(args)
+ 
+         if self.config.data_parallel_size > 1:
+             assert self.gpus_per_node % self.config.tensor_model_parallel_size == 0, (
+@@ -767,7 +761,7 @@ class vLLMHttpServer:
+         if response_kv_transfer_params is not None:
+             extra_fields["kv_transfer_params"] = response_kv_transfer_params
+ 
+-        if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:
++        if self.config.mtp is not None and self.config.mtp.enable_rollout:
+             extra_fields.update(self.spec_decode_fields(final_res.outputs[0]))
+         return TokenOutput(
+             token_ids=token_ids,
+@@ -1236,6 +1230,26 @@ class vLLMHttpServer:
+     def _postprocess_compilation_config(self, compilation_config: dict) -> None:
+         """Mutate the compilation config in-place before it is serialized into the CLI args."""
+ 
++    def _apply_mtp_rollout_config(self, args: dict) -> None:
++        """Draft with MTP when the rollout asks for it (mtp.enable_rollout).
++
++        The drafter takes the actor's MTP weights at every weight sync when the actor carries MTP layers (mtp.enable).
++        Otherwise it drafts frozen, with the weights of its own checkpoint: speculative_config.model, or the model's
++        own MTP layers.
++        """
++        mtp_config = self.config.mtp
++        if mtp_config is None or not mtp_config.enable_rollout:
++            return
++        args["speculative_config"] = build_mtp_speculative_config(
++            mtp_config.method,
++            mtp_config.num_speculative_tokens,
++            args.get("speculative_config"),
++        )
++        # each finished request's acceptance counts, read from its output's spec_decode_metrics
++        args["per_request_spec_decode_metrics"] = "summary"
++        # read by the engine's worker processes, which inherit this process's environment
++        os.environ[VLLM_MTP_DRAFTER_WEIGHT_SYNC_ENV] = "1" if mtp_config.enable else "0"
++
+     def _get_override_generation_config(self) -> dict:
+         """Return the override_generation_config dict."""
+         # Override default generation config from hugging face model config,
+@@ -1332,16 +1346,13 @@ class vLLMHttpServer:
+         """Deepest sleep level whose discarded state a subsequent weight sync can restore.
+ 
+         MTP drafter-only weights are initialized by vLLM and are not guaranteed
+-        to be restored by actor weight sync after level 2 sleep discards them.
++        to be restored by actor weight sync after level 2 sleep discards them;
++        a frozen drafter's (mtp.enable_rollout without mtp.enable) get no sync at all.
+         lora only update adapter weights, so set sleep level to 1.
+         vllm_ascend not support sleep_level now. Enabling EP during training may lead to accuracy issues.
+         """
+         mtp_config = getattr(self.config, "mtp", None)
+-        mtp_rollout_enabled = (
+-            mtp_config is not None
+-            and getattr(mtp_config, "enable", False)
+-            and getattr(mtp_config, "enable_rollout", False)
+-        )
++        mtp_rollout_enabled = mtp_config is not None and getattr(mtp_config, "enable_rollout", False)
+         if mtp_rollout_enabled or self.lora_as_adapter or is_torch_npu_available(check_device=False):
+             return 1
+         return 2

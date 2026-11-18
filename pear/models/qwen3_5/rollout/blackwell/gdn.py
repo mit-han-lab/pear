@@ -14,9 +14,9 @@ from vllm.v1.attention.backends.gdn_attn import (
 
 from pear.models.qwen3_5.gdn_constants import L2_NORM_EPS
 from pear.models.qwen3_5.rollout.blackwell.flashinfer_launchers import FlashInferChunk
-from pear.models.qwen3_5.rollout.blackwell.triton_launcher import TritonLauncher
 from pear.models.qwen3_5.rollout.gdn import RolloutGDNAttention, RolloutGDNMetadataBuilder
 from pear.models.qwen3_5.rollout.gdn_dims import GDNDims
+from pear.models.qwen3_5.rollout.triton_launcher import TritonLauncher
 
 CONV_TOKENS = 8  # tokens per conv program: vLLM's causal-conv metadata (batch_ptr, token_chunk_offset_ptr) uses 8
 CONV_CHANNELS = 256  # channels per conv program

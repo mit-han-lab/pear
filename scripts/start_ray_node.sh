@@ -25,8 +25,9 @@ VERL_ENV=${VERL_ENV:-$WORK_DIR/envs/verl}
 LOCAL_DIR=${LOCAL_DIR:-/var/tmp/${USER:-$(id -un)}/pear}
 PORT=${PORT:-6379}        # of the head
 NUM_CPUS=${NUM_CPUS:-120} # the CPU slots a trainer or rollout machine offers
-# a rollout machine's LIBERO servers, one CPU slot each: a run starts one per slot of its cluster
-LIBERO_SERVERS_PER_NODE=${LIBERO_SERVERS_PER_NODE:-16}
+# a rollout machine's LIBERO servers, one CPU slot each: a run starts one per slot of its cluster; enough that the
+# machine's sessions seldom queue for a simulator, speculative decoding's shorter generation included
+LIBERO_SERVERS_PER_NODE=${LIBERO_SERVERS_PER_NODE:-32}
 # shared memory next to the replicas' LMCache tiers and TransferQueue's storage units, so not Ray's default (up to
 # 30% of RAM)
 OBJECT_STORE_GB=${OBJECT_STORE_GB:-64}

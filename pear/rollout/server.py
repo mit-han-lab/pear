@@ -13,10 +13,13 @@ from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
 
 class PearVLLMServer(LMCacheVLLMServer):
     """The vLLM server of PEAR's replicas: weights kept in fp32, a model family's rollout kernels, a checked weight
-    sync."""
+    sync, a frozen drafter's weights from the files."""
 
     # by name: vLLM imports the class in each worker process, and importing its module here would be circular there
     WORKER_EXTENSION = "pear.rollout.worker_extension.PearVLLMWorkerExtension"
+    # the speculative_config of a replica drafting with rollout.mtp, under the engine's own: its drafter's weights load
+    # from the files whatever the replicas' load_format, as no weight sync carries them (an FSDP actor has no MTP layer)
+    DRAFTER_CONFIG = {"draft_load_config": {"load_format": "auto"}}
 
     def _preprocess_engine_kwargs(self, engine_kwargs: dict) -> None:
         # NCCL's implicit launch ordering (base.yaml sets it for the Ray workers) hangs the replica after a weight
@@ -26,6 +29,10 @@ class PearVLLMServer(LMCacheVLLMServer):
         super()._preprocess_engine_kwargs(engine_kwargs)
         # the worker processes started below inherit this environment: the weights they keep in fp32
         Fp32Modules.export(self.config.fp32_modules)
+        # verl adds rollout.mtp's method and number of tokens to this speculative_config, on the same condition
+        mtp = self.config.mtp
+        if mtp is not None and mtp.enable_rollout:
+            engine_kwargs["speculative_config"] = {**self.DRAFTER_CONFIG, **engine_kwargs.get("speculative_config", {})}
 
     def _postprocess_compilation_config(self, compilation_config: dict) -> None:
         if self.config.kernels:

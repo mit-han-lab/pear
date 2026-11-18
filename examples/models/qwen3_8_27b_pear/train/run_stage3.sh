@@ -40,6 +40,10 @@ MAX_RESPONSE=${MAX_RESPONSE:-256000}
 ROBODOJO_APPS_PER_GPU=${ROBODOJO_APPS_PER_GPU:-}
 # pickup_align's episodes stop at 160k tokens, LIBERO's at MAX_RESPONSE
 export ROBODOJO_RESPONSE_BUDGET=${ROBODOJO_RESPONSE_BUDGET:-160000}
+# speculative decoding in the vLLM replicas: the tokens the model's MTP layer, frozen, proposes per step, empty for none
+SPECULATIVE_TOKENS=${SPECULATIVE_TOKENS:-}
+# the directory of the MTP layer's weights, empty for the base model's (README.md)
+DRAFT_MODEL=${DRAFT_MODEL:-}
 # add "wandb" for Weights & Biases (WANDB_API_KEY in the machines' environment)
 LOGGER=${LOGGER:-'["console","file","tensorboard"]'}
 # ---- end user-adjustable ----

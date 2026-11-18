@@ -3,7 +3,8 @@
 # longest sequence, at most the model's 262144). It gets the model's arguments of every run (MODEL_ARGS), its replicas'
 # and its actor's on the GPU (MODEL_ROLLOUT_ARGS, MODEL_TRAINING_ARGS), a plain vLLM server's (MODEL_SERVER_ARGS), the
 # modules verl imports for it (MODEL_MODULES), the sizes its own arithmetic needs (GPUS_PER_NODE, TP and
-# SESSIONS_PER_REPLICA; a TP or SESSIONS_PER_REPLICA the recipe set wins) and model_image_tokens.
+# SESSIONS_PER_REPLICA; a TP or SESSIONS_PER_REPLICA the recipe set wins) and model_image_tokens. Its replicas decode
+# speculatively when the recipe sets SPECULATIVE_TOKENS.
 
 # the base model on the Hugging Face Hub and its revision, which scripts/download_model.sh downloads
 MODEL_REPO=Qwen/Qwen3.8-27B
@@ -77,6 +78,22 @@ case "$GPU" in
     ;;
 esac
 
+# Speculative decoding in the replicas with the model's MTP layer, frozen, proposing SPECULATIVE_TOKENS tokens a step:
+# verl's MTP rollout keys of the model switch it on and give vLLM's speculative_config the family's method, which drafts
+# on the model's M-RoPE positions. The actor keeps no MTP layer (mtp.enable stays off), so no weight sync reaches the
+# drafter, whose config and weights are DRAFT_MODEL's: the base model's unless the recipe set it, as a model exported
+# from a checkpoint has no MTP layer.
+SPECULATIVE_ARGS=()
+if [[ -n "${SPECULATIVE_TOKENS:-}" ]]; then
+  DRAFT_MODEL=${DRAFT_MODEL:-$WORK_DIR/models/Qwen3.8-27B}
+  SPECULATIVE_ARGS=(
+    actor_rollout_ref.model.mtp.enable_rollout=true
+    actor_rollout_ref.model.mtp.method=pear_mtp
+    actor_rollout_ref.model.mtp.num_speculative_tokens="$SPECULATIVE_TOKENS"
+    "+actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config={model: $DRAFT_MODEL}"
+  )
+fi
+
 MODEL_ARGS=(
   # the Qwen3.5 family's own config (pear/models/qwen3_5/config.yaml): its training kernels and its rollout
   # kernels, with their GPU backends for Blackwell and Hopper, and what stays in fp32. The training kernels' GPU
@@ -92,6 +109,7 @@ MODEL_ROLLOUT_ARGS=(
   actor_rollout_ref.rollout.tensor_model_parallel_size="$TP"
   "${TRTLLM_ARGS[@]}"
   "${LMCACHE_ARGS[@]}"
+  "${SPECULATIVE_ARGS[@]}"
   # what a replica's engine takes of its GPUs: the weight sync's receiver (its NCCL buffers, 2 x the bucket, and
   # its merge buffer for the largest tensor) and the LMCache sidecar's CUDA context must fit in the rest
   actor_rollout_ref.rollout.standalone_gpu_memory_utilization=0.85
