@@ -14,7 +14,7 @@ from vllm.v1.attention.backends.gdn_attn import (
 
 from pear.models.qwen3_5.rollout.gdn import RolloutGDNAttention, RolloutGDNMetadataBuilder
 from pear.models.qwen3_5.rollout.gdn_dims import GDNDims
-from pear.models.qwen3_5.rollout.hopper.staging import StagedBuffer
+from pear.models.qwen3_5.rollout.staged_buffer import StagedBuffer
 
 CHUNK = 64  # FLA's chunk size (csrc/gdn_chunk.cu BT)
 

@@ -9,7 +9,7 @@ from vllm.v1.attention.backends.flash_attn import (
 )
 from vllm.v1.kv_cache_interface import is_quantized_kv_cache
 
-from pear.models.qwen3_5.rollout.hopper.staging import StagedBuffer
+from pear.models.qwen3_5.rollout.staged_buffer import StagedBuffer
 
 HEAD_DIM = 256  # the attention layers' head dim (csrc/split_attn.cu HD)
 QUERY_HEADS = 6  # query heads per KV head at TP4 (csrc/split_attn.cu HQ)

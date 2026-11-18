@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import QwenGatedDeltaNetAttention
 from vllm.utils.torch_utils import _encode_layer_name
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
@@ -34,6 +35,53 @@ class RolloutGDNAttention(QwenGatedDeltaNetAttention):
         return output
 
 
+class GDNProjection:
+    """One GEMM for a Gated DeltaNet layer's in_proj_qkvz and in_proj_ba, over one weight both are views of."""
+
+    # in_proj_ba costs a launch per layer at any batch size. The views are made as the layer is built, so the loaders
+    # write into the one tensor; every consumer takes the output's row strides
+    @staticmethod
+    def merge(layer) -> None:
+        """Make the two projections' weights views of one [qkvz; ba] tensor, before the weights load."""
+        qkvz, ba = layer.in_proj_qkvz, layer.in_proj_ba
+        if (
+            getattr(qkvz, "bias", None) is not None
+            or getattr(ba, "bias", None) is not None
+            or not isinstance(qkvz.quant_method, UnquantizedLinearMethod)
+            or not isinstance(ba.quant_method, UnquantizedLinearMethod)
+            or layer.disable_tp_for_ba_proj
+            or layer.gqa_interleaved_layout
+        ):
+            return
+
+        w1, w2 = qkvz.weight, ba.weight
+        if w1.dtype != w2.dtype or w1.shape[1] != w2.shape[1] or not w1.is_contiguous() or not w2.is_contiguous():
+            return
+
+        n = w1.shape[0]
+        qkvzba = torch.empty((n + w2.shape[0], w1.shape[1]), dtype=w1.dtype, device=w1.device)
+        w1.data = qkvzba[:n]
+        w2.data = qkvzba[n:]
+        layer.register_buffer("qkvzba_weight", qkvzba, persistent=False)
+        layer.qkvz_out = n
+
+    @staticmethod
+    def eligible(layer, hidden_states) -> bool:
+        """A merged weight, and activations the layer's core computes."""
+        return getattr(layer, "qkvzba_weight", None) is not None and layer.computes_core(hidden_states)
+
+    @staticmethod
+    def check(model) -> None:
+        """Raise unless every merged layer's projections still view its merged weight (a loader replaced one)."""
+        for module in model.modules():
+            qkvzba = getattr(module, "qkvzba_weight", None)
+            if qkvzba is None:
+                continue
+            qkvz, ba = module.in_proj_qkvz.weight, module.in_proj_ba.weight
+            if qkvz.data_ptr() != qkvzba.data_ptr() or ba.data_ptr() != qkvzba[module.qkvz_out :].data_ptr():
+                raise RuntimeError(f"{module.prefix}: in_proj_qkvz / in_proj_ba no longer view the merged weight")
+
+
 class RolloutGDNMetadataBuilder(GDNAttentionMetadataBuilder):
     """vLLM's GDN metadata builder whose other KV cache groups derive their metadata from the first group's, on the
     state slots vLLM's model state computes for every group at once."""
@@ -42,7 +90,7 @@ class RolloutGDNMetadataBuilder(GDNAttentionMetadataBuilder):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
 
         # vLLM opts in its own class only. The GDN groups differ only in their state slots: the runner builds the first
-        # group's metadata and derives the others' (update_block_table)
+        # group's metadata and derives the others' (update_block_table re-gathers a speculative step's slots too)
         self.supports_update_block_table = True
         # under mamba_cache_mode align, this group's state slots of the step, which vLLM's model state computes for
         # every group in one launch for the builders that declare them
