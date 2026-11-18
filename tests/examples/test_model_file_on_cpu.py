@@ -19,6 +19,11 @@ PINNED_FIELDS = (
     "mm_device_do_normalize",
     "numa_bind",
 )
+# a recipe's work directory, which holds the drafter's weights by default, and the drafter's directory a recipe leaves
+# empty
+DRAFTER_SETTINGS = "WORK_DIR=/work DRAFT_MODEL="
+SPECULATIVE_CONFIG = "actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config"
+ROLLOUT_ARGUMENTS = 'printf "%s\\n" "${MODEL_ROLLOUT_ARGS[@]}"'  # the replicas' arguments, one per line
 
 
 def sourced(gpu: str, command: str, settings: str = "") -> subprocess.CompletedProcess:
@@ -76,3 +81,26 @@ def test_the_general_evaluation_s_servers_take_the_training_replicas_engine_sett
 
     # every boundary's state kept, the KV cache from vLLM's estimate, the pixels normalized on the CPU, no NUMA binding
     assert server == replica == dict(zip(PINNED_FIELDS, (None, False, False, False), strict=True))
+
+
+@pytest.mark.parametrize("gpu", ["gb300", "h100"])
+def test_speculative_tokens_give_the_replicas_the_model_s_mtp_layer(gpu):
+    plain = sourced(gpu, ROLLOUT_ARGUMENTS).stdout.splitlines()
+    process = sourced(gpu, ROLLOUT_ARGUMENTS, f"{DRAFTER_SETTINGS} SPECULATIVE_TOKENS=3")
+
+    # verl's switch of the replicas' speculative decoding alone (the actor keeps no MTP layer), the family's MTP method,
+    # the tokens and the drafter's weights, the base model's
+    assert [argument for argument in process.stdout.splitlines() if argument not in plain] == [
+        "actor_rollout_ref.model.mtp.enable_rollout=true",
+        "actor_rollout_ref.model.mtp.method=pear_mtp",
+        "actor_rollout_ref.model.mtp.num_speculative_tokens=3",
+        f"+{SPECULATIVE_CONFIG}={{model: /work/models/Qwen3.8-27B}}",
+    ]
+
+
+def test_the_drafter_s_weights_the_recipe_set_win():
+    settings = "WORK_DIR=/work SPECULATIVE_TOKENS=3 DRAFT_MODEL=/draft"
+
+    arguments = sourced("gb300", ROLLOUT_ARGUMENTS, settings).stdout.splitlines()
+
+    assert f"+{SPECULATIVE_CONFIG}={{model: /draft}}" in arguments

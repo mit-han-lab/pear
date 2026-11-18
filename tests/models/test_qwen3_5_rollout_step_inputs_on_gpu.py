@@ -71,6 +71,7 @@ def hopper_model_state(model) -> HopperRolloutModelState:
         prompt_embeds_state=None,
         num_accepted_tokens_gpu=torch.ones(MAX_NUM_REQS, dtype=torch.int32, device=DEVICE),
         _align_mode=False,
+        replay_state=None,
     )
 
     return model_state

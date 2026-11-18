@@ -1,3 +1,4 @@
+import inspect
 import pkgutil
 import subprocess
 import sys
@@ -13,58 +14,81 @@ from vllm.config import CacheConfig, get_current_vllm_config
 from vllm.config.compilation import CompilationConfig, CUDAGraphMode
 from vllm.model_executor.layers.mamba.abstract import get_mamba_prefill_checkpoint_alignment
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import QwenGatedDeltaNetAttention
+from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
 from vllm.model_executor.models import ModelRegistry
 from vllm.model_executor.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from vllm.models import qwen3_5
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.sampling_params import SamplingParams
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.attention.backends import flashinfer as vllm_flashinfer
+from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
 from vllm.v1.attention.backends.flashinfer import FlashInferImpl
 from vllm.v1.attention.backends.gdn_attn import FLASHINFER_GDN_CHECKPOINT_ALIGNMENT
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout
+from vllm.v1.worker.gpu import model_runner
+from vllm.v1.worker.gpu.async_utils import AsyncOutput
 from vllm.v1.worker.gpu.cudagraph_utils import ModelCudaGraphManager
 from vllm.v1.worker.gpu.model_states import init_model_state, resolve_model_state_cls
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.sample.sampler import Sampler
+from vllm.v1.worker.gpu.spec_decode import speculator_config as vllm_speculator_config
+from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
+from vllm.v1.worker.utils import select_common_block_size
 
+from host_staged_buffer import HostStagedBuffer
 from pear.models.kernels import RolloutKernels
 from pear.models.qwen3_5.gpu_backend import VllmGpuBackend
 from pear.models.qwen3_5.rollout import model as rollout_model
+from pear.models.qwen3_5.rollout.blackwell import attention as blackwell_attention
 from pear.models.qwen3_5.rollout.blackwell.attention import (
     SPLIT_FACTOR,
     AttentionStep,
     BlackwellFlashInferImpl,
     DecodeSplit,
+    VerifyAttention,
 )
 from pear.models.qwen3_5.rollout.blackwell.cudagraph import BlackwellMixedStepGraphs
-from pear.models.qwen3_5.rollout.blackwell.gdn import BlackwellGDNAttention, GDNCore
+from pear.models.qwen3_5.rollout.blackwell.gdn.core import GDNCore
+from pear.models.qwen3_5.rollout.blackwell.gdn.layer import BlackwellGDNAttention
 from pear.models.qwen3_5.rollout.blackwell.gpu_backend import BlackwellRolloutGpuBackend
 from pear.models.qwen3_5.rollout.blackwell.model_state import BlackwellRolloutModelState
-from pear.models.qwen3_5.rollout.blackwell.sampler import BlackwellSampler
+from pear.models.qwen3_5.rollout.blackwell.mtp import BlackwellQwen3_5MTP
+from pear.models.qwen3_5.rollout.blackwell.sampler import BlackwellRejectionSampler, BlackwellSampler
 from pear.models.qwen3_5.rollout.gdn import RolloutGDNMetadataBuilder
 from pear.models.qwen3_5.rollout.hopper.all_reduce import AllReduceNorm
-from pear.models.qwen3_5.rollout.hopper.attention import HEAD_DIM, QUERY_HEADS, AttentionStepBuffers
+from pear.models.qwen3_5.rollout.hopper.attention import (
+    HEAD_DIM,
+    QUERY_HEADS,
+    AttentionStepBuffers,
+    HopperFlashAttentionMetadataBuilder,
+)
 from pear.models.qwen3_5.rollout.hopper.cudagraph import HopperCudaGraphManager, HopperMixedStepGraphs
-from pear.models.qwen3_5.rollout.hopper.gdn import HopperGDNAttention
+from pear.models.qwen3_5.rollout.hopper.gdn import HopperGDNAttention, HopperGDNMetadataBuilder
 from pear.models.qwen3_5.rollout.hopper.gpu_backend import HopperRolloutGpuBackend
 from pear.models.qwen3_5.rollout.hopper.model import HopperQwen3_5ForConditionalGeneration
 from pear.models.qwen3_5.rollout.hopper.model_state import HopperRolloutModelState
-from pear.models.qwen3_5.rollout.hopper.sampler import HopperSampler
-from pear.models.qwen3_5.rollout.hopper.staging import StagedBuffer
+from pear.models.qwen3_5.rollout.hopper.mtp import HopperQwen3_5MTP
+from pear.models.qwen3_5.rollout.hopper.sampler import HopperRejectionSampler, HopperSampler
 from pear.models.qwen3_5.rollout.hopper.step_input_arrays import StepInputArrays
 from pear.models.qwen3_5.rollout.model import Qwen3_5RolloutDecoderLayer
+from pear.models.qwen3_5.rollout.model_state import Qwen3_5RolloutModelState
+from pear.models.qwen3_5.rollout.nonfinite_logits import NonfiniteCheckedOutput, NonfiniteLogits
 from pear.models.qwen3_5.rollout.rollout_kernels import Qwen3_5RolloutKernels
 from pear.models.qwen3_5.rollout.sampler import RolloutSampler
+from pear.models.qwen3_5.rollout.speculator_config import Qwen3_5MTPSpeculatorConfig
 from pear.rollout.config import PearRolloutConfig
 from repository import REPO
 
 KERNELS = "pear.models.qwen3_5.rollout.rollout_kernels.Qwen3_5RolloutKernels"  # the recipes' rollout.kernels
 PYPROJECT = REPO / "pyproject.toml"  # it names PEAR's vLLM plugin
 ARCHITECTURE = VllmGpuBackend.ARCHITECTURE  # the replicas' model, which a GPU backend's model replaces
+DRAFT_ARCHITECTURE = Qwen3_5RolloutKernels.DRAFT_ARCHITECTURE  # their MTP drafter, which a GPU backend may replace
 SORT_MIN_ROWS = AttentionStep.SORT_MIN_ROWS  # decode rows from which the longest contexts launch first
 MAX_NUM_SEQS = 128  # the replicas' decode slots
 TOKEN_BUDGET = 8192  # their max_num_batched_tokens
@@ -89,9 +113,27 @@ MODEL_STATES = [
 # the methods of vLLM's V2 sampler the samplers override: vLLM calls the others itself, on the batches the kernels
 # leave to it (its __call__ samples them through its sample)
 SAMPLER_OVERRIDES = {"__init__", "add_request", "__call__"}
-# Qwen3.8-27B's Gated DeltaNet: its key and value heads (all ranks'), their head dim
-GDN_K_HEADS, GDN_V_HEADS, GDN_HEAD_DIM = 16, 48, 128
+SPECULATIVE_METHOD = Qwen3_5RolloutKernels.SPECULATIVE_METHOD  # the family's drafter, rollout.mtp.method
+NUM_SPECULATIVE_TOKENS = 3  # the MTP drafter's tokens a step
+DEEP_DRAFT_TOKENS = 7  # a deeper drafter's tokens a step
+# Qwen3.8-27B's Gated DeltaNet: its key and value heads (all ranks'), their head dim and its causal conv's taps
+GDN_K_HEADS, GDN_V_HEADS, GDN_HEAD_DIM, CONV_WIDTH = 16, 48, 128, 4
 KV_HEADS = 1  # its attention's KV heads on one of an H100 replica's four ranks
+
+
+def drafter_config(custom_method: str | None, method: str = "mtp") -> types.SimpleNamespace:
+    """The parts of a SpeculativeConfig vLLM resolved that the GPU backends and the rejection sampler read: a custom
+    method moved to custom_method, method its base."""
+    return types.SimpleNamespace(
+        method=method,
+        custom_method=custom_method,
+        num_speculative_tokens=NUM_SPECULATIVE_TOKENS,
+        enable_adaptive_verification=False,
+        rejection_sample_method="standard",
+        draft_sample_method="greedy",
+        fly_entropy_threshold=None,
+        fly_entropy_top_k=None,
+    )
 
 
 def test_the_kernels_need_the_vllm_rollout_without_sleep():
@@ -110,8 +152,10 @@ def engine_config(tp: int, architecture: str = ARCHITECTURE) -> types.SimpleName
         parallel_config=types.SimpleNamespace(
             tensor_parallel_size=tp, pipeline_parallel_size=1, enable_batch_sharded_sampling=False
         ),
-        # the checkpoint's mamba_ssm_dtype, which vLLM takes for the recurrent states
-        cache_config=types.SimpleNamespace(mamba_cache_dtype="auto", mamba_ssm_cache_dtype="float32"),
+        # vLLM's default KV cache (the model's dtype), the checkpoint's mamba_ssm_dtype for the recurrent states
+        cache_config=types.SimpleNamespace(
+            cache_dtype="auto", mamba_cache_dtype="auto", mamba_ssm_cache_dtype="float32"
+        ),
         lora_config=None,
         speculative_config=None,
     )
@@ -150,8 +194,13 @@ def test_the_replica_selects_the_gpu_backend_of_its_gpu_and_engine_config(
         ("parallel_config", "pipeline_parallel_size", 2, "one pipeline stage"),
         ("parallel_config", "enable_batch_sharded_sampling", True, "batch-sharded sampling"),
         ("cache_config", "mamba_ssm_cache_dtype", "auto", "states of"),  # bf16 recurrent states
+        ("cache_config", "cache_dtype", "fp8", "KV cache of bfloat16, not fp8"),  # an fp8 KV cache
+        ("cache_config", "cache_dtype", "float16", "KV cache of bfloat16, not float16"),
         (None, "lora_config", object(), "LoRA"),
-        (None, "speculative_config", object(), "without a drafter"),
+        # vLLM's own MTP drafter (1-D positions), an EAGLE-3 drafter, a DFlash draft (its auxiliary hidden states)
+        (None, "speculative_config", drafter_config(None), f"{SPECULATIVE_METHOD}, not mtp"),
+        (None, "speculative_config", drafter_config(None, "eagle3"), f"{SPECULATIVE_METHOD}, not eagle3"),
+        (None, "speculative_config", drafter_config(None, "dflash"), f"{SPECULATIVE_METHOD}, not dflash"),
     ],
 )
 def test_the_gpu_backends_refuse_what_their_kernels_do_not_compute(
@@ -166,18 +215,81 @@ def test_the_gpu_backends_refuse_what_their_kernels_do_not_compute(
 
 
 @pytest.mark.parametrize("capability, gpu_backend", GPU_BACKENDS)
+@pytest.mark.parametrize("cache_dtype", ["auto", "bfloat16"])  # the bf16 model's dtype, and bf16 by name
+def test_the_gpu_backends_take_a_bf16_kv_cache(monkeypatch, capability, gpu_backend, cache_dtype):
+    monkeypatch.setattr(current_platform, "get_device_capability", lambda device_id=0: capability)
+    vllm_config = engine_config(gpu_backend.tensor_parallel_size)
+    vllm_config.cache_config.cache_dtype = cache_dtype
+
+    assert Qwen3_5RolloutKernels.select_gpu_backend(vllm_config) is gpu_backend
+
+
+@pytest.mark.parametrize("capability, gpu_backend", GPU_BACKENDS)
+def test_the_gpu_backends_draft_with_the_family_s_mtp_method(monkeypatch, capability, gpu_backend):
+    monkeypatch.setattr(current_platform, "get_device_capability", lambda device_id=0: capability)
+    vllm_config = engine_config(gpu_backend.tensor_parallel_size)
+    vllm_config.speculative_config = drafter_config(SPECULATIVE_METHOD)
+
+    assert Qwen3_5RolloutKernels.select_gpu_backend(vllm_config) is gpu_backend
+
+
+@pytest.mark.parametrize("capability, gpu_backend", GPU_BACKENDS)
+def test_a_drafter_s_replica_fails_to_start_where_vllm_s_gdn_decode_kernel_is_not_the_fused_one(
+    monkeypatch, capability, gpu_backend
+):
+    # VLLM_GDN_DECODE_KERNEL=triton hands a Gated DeltaNet layer's core to vLLM (RolloutGDNAttention.computes_core),
+    # whose path does not run the verify steps' metadata of the backends' builders
+    monkeypatch.setattr(current_platform, "get_device_capability", lambda device_id=0: capability)
+    monkeypatch.setenv("VLLM_GDN_DECODE_KERNEL", "triton")
+    vllm_config = engine_config(gpu_backend.tensor_parallel_size)
+    assert Qwen3_5RolloutKernels.select_gpu_backend(vllm_config) is gpu_backend  # without a drafter, vLLM's GDN core
+
+    vllm_config.speculative_config = drafter_config(SPECULATIVE_METHOD)
+
+    with pytest.raises(ValueError, match="speculative_config's drafts under VLLM_GDN_DECODE_KERNEL=cuda, not triton"):
+        Qwen3_5RolloutKernels.select_gpu_backend(vllm_config)
+
+
+def test_the_family_s_mtp_method_is_vllms_mtp_with_a_local_argmax():
+    spec = types.SimpleNamespace(
+        use_local_argmax_reduction=False,
+        draft_lm_head_quantization=None,
+        draft_model_config=None,
+        index_share_for_mtp_iteration=None,
+    )
+
+    Qwen3_5MTPSpeculatorConfig.apply_options(spec)
+
+    assert spec.use_local_argmax_reduction
+    # vLLM resolves the method to its base: vLLM's MTP code and verl's weight sync see mtp
+    assert Qwen3_5MTPSpeculatorConfig.base_method == "mtp"
+    assert issubclass(pkgutil.resolve_name(Qwen3_5MTPSpeculatorConfig.speculator_class), MTPSpeculator)
+    # no quantized copy of the lm_head, which no weight sync refreshes; no prefill context parallelism
+    assert "draft_lm_head_quantization" not in Qwen3_5MTPSpeculatorConfig.supported_options
+    assert not Qwen3_5MTPSpeculatorConfig.supports_pcp
+
+
+@pytest.mark.parametrize("capability, gpu_backend", GPU_BACKENDS)
 def test_the_plugin_registers_the_model_where_the_server_switched_the_kernels_on(monkeypatch, capability, gpu_backend):
     monkeypatch.setattr(current_platform, "get_device_capability", lambda device_id=0: capability)
-    monkeypatch.setattr(ModelRegistry, "models", dict(ModelRegistry.models))  # the registry as it was, afterwards
+    # the registries as they were, afterwards
+    monkeypatch.setattr(ModelRegistry, "models", dict(ModelRegistry.models))
+    monkeypatch.setattr(vllm_speculator_config, "_CUSTOM_CONFIGS", {})
     monkeypatch.setenv(RolloutKernels.ENV, "")
 
     Qwen3_5RolloutKernels.register()  # a worker process of a server without the kernels
     assert ModelRegistry._try_load_model_cls(ARCHITECTURE) is qwen3_5.Qwen3_5ForConditionalGeneration
+    assert ModelRegistry._try_load_model_cls(DRAFT_ARCHITECTURE) is qwen3_5.Qwen3_5MTP
+    assert SPECULATIVE_METHOD not in vllm_speculator_config.registered_speculative_methods()
 
     # the server's environment, inherited
     RolloutKernels.export(KERNELS).configure_server({}, MAX_NUM_SEQS, TOKEN_BUDGET)
     Qwen3_5RolloutKernels.register()
     assert ModelRegistry._try_load_model_cls(ARCHITECTURE) is gpu_backend.model_cls
+    # the MTP drafter: the GPU backend's own class, else vLLM's
+    assert ModelRegistry._try_load_model_cls(DRAFT_ARCHITECTURE) is (gpu_backend.draft_model_cls or qwen3_5.Qwen3_5MTP)
+    custom_config_cls = vllm_speculator_config.get_custom_speculator_config_class(SPECULATIVE_METHOD)
+    assert custom_config_cls is Qwen3_5MTPSpeculatorConfig
 
 
 def test_pyproject_s_vllm_plugin_is_the_family_s_registration():
@@ -243,9 +355,18 @@ def vllm_sampler(**options) -> Sampler:
     return sampler
 
 
+def model_state_of(model_state_cls, speculative_config) -> Qwen3_5RolloutModelState:
+    """A GPU backend's model state, reduced to what its sampler hook reads."""
+    model_state = model_state_cls.__new__(model_state_cls)
+    model_state.vllm_config = types.SimpleNamespace(speculative_config=speculative_config)
+    model_state.device = torch.device("cpu")
+
+    return model_state
+
+
 @pytest.mark.parametrize("gpu_backend, model_state_cls, sampler_cls", MODEL_STATES)
 def test_the_model_state_samples_with_the_gpu_backend_s_sampler(gpu_backend, model_state_cls, sampler_cls):
-    model_state = model_state_cls.__new__(model_state_cls)
+    model_state = model_state_of(model_state_cls, None)
     vllm_sampler_of_the_runner = vllm_sampler()
 
     sampler, rejection_sampler = model_state.custom_sampler(vllm_sampler_of_the_runner)
@@ -255,6 +376,53 @@ def test_the_model_state_samples_with_the_gpu_backend_s_sampler(gpu_backend, mod
     # vLLM's sampler stays for the engine options the kernels do not compute
     for options in ({"logprobs_mode": "raw_logprobs"}, {"use_fp64_gumbel": True}, {"return_sampling_mask": True}):
         assert model_state.custom_sampler(vllm_sampler(**options)) is None
+
+
+@pytest.mark.parametrize(
+    "gpu_backend, model_state_cls, sampler_cls, rejection_sampler_cls",
+    [
+        pytest.param(*MODEL_STATES[0].values, BlackwellRejectionSampler, id="blackwell"),
+        pytest.param(*MODEL_STATES[1].values, HopperRejectionSampler, id="hopper"),
+    ],
+)
+def test_with_a_drafter_the_gpu_backend_s_rejection_sampler_verifies_over_its_sampler(
+    gpu_backend, model_state_cls, sampler_cls, rejection_sampler_cls
+):
+    model_state = model_state_of(model_state_cls, drafter_config(SPECULATIVE_METHOD))
+
+    sampler, rejection_sampler = model_state.custom_sampler(vllm_sampler())
+
+    # the verification reads the request states and the processing of the sampler the runner adds requests to: the
+    # GPU backend's fused verify sampler
+    assert type(sampler) is sampler_cls
+    assert type(rejection_sampler) is rejection_sampler_cls and rejection_sampler.sampler is sampler
+    assert rejection_sampler.num_speculative_steps == NUM_SPECULATIVE_TOKENS
+
+
+@pytest.mark.parametrize(
+    "options, is_served",
+    [
+        ({}, True),  # greedy drafts, the lossless rule: the replicas' drafter
+        ({"rejection_sample_method": "synthetic", "synthetic_acceptance_rates": [0.6, 0.4, 0.3]}, True),
+        ({"rejection_sample_method": "block"}, False),
+        ({"draft_sample_method": "probabilistic"}, False),  # drafts sampled from the drafter's distribution
+        ({"enable_adaptive_verification": True}, False),
+    ],
+)
+def test_the_fused_verify_sampler_serves_greedy_drafts_under_the_lossless_or_synthetic_rule(options, is_served):
+    spec_config = drafter_config(SPECULATIVE_METHOD)
+    spec_config.__dict__.update(options)
+
+    rejection_sampler = BlackwellRejectionSampler(BlackwellSampler(vllm_sampler()), spec_config, torch.device("cpu"))
+
+    # the other rules, adaptive verification and sampled drafts stay vLLM's
+    assert rejection_sampler.is_served is is_served
+    assert rejection_sampler.rates.numel() == (NUM_SPECULATIVE_TOKENS if "synthetic_acceptance_rates" in options else 0)
+
+
+def test_the_replicas_draft_with_their_gpu_backend_s_own_mtp_drafter():
+    assert BlackwellRolloutGpuBackend.draft_model_cls is BlackwellQwen3_5MTP
+    assert HopperRolloutGpuBackend.draft_model_cls is HopperQwen3_5MTP
 
 
 @pytest.mark.parametrize(
@@ -284,16 +452,19 @@ def test_a_request_is_the_kernels_when_vllm_leaves_its_logits_to_the_temperature
 
 
 @pytest.mark.parametrize(
-    "ineligible_row, num_logprobs, dtype, vocab",
+    "ineligible_row, num_logprobs, dtype, vocab, rows_per_request",
     [
-        (2, 1, torch.float32, VOCAB),  # a row vLLM processes
-        (None, NO_LOGPROBS, torch.float32, VOCAB),  # no log-probs
-        (None, BlackwellSampler.MAX_LOGPROBS + 1, torch.float32, VOCAB),  # more log-probs than the kernels keep
-        (None, 1, torch.bfloat16, VOCAB),  # bf16 logits
-        (None, 1, torch.float32, VOCAB + 1),  # rows the kernels cannot read as float4
+        (2, 1, torch.float32, VOCAB, 1),  # a row vLLM processes
+        (None, NO_LOGPROBS, torch.float32, VOCAB, 1),  # no log-probs
+        (None, BlackwellSampler.MAX_LOGPROBS + 1, torch.float32, VOCAB, 1),  # more log-probs than the kernels keep
+        (None, 1, torch.bfloat16, VOCAB, 1),  # bf16 logits
+        (None, 1, torch.float32, VOCAB + 1, 1),  # rows the kernels cannot read as float4
+        (None, 1, torch.float32, VOCAB, NUM_SPECULATIVE_TOKENS + 1),  # several rows per request
     ],
 )
-def test_vllm_samples_the_batches_the_kernels_do_not_take(monkeypatch, ineligible_row, num_logprobs, dtype, vocab):
+def test_vllm_samples_the_batches_the_kernels_do_not_take(
+    monkeypatch, ineligible_row, num_logprobs, dtype, vocab, rows_per_request
+):
     monkeypatch.setattr(Sampler, "__call__", lambda self, logits, input_batch: "vllm")
     sampler = BlackwellSampler(vllm_sampler())
     sampler.is_eligible[:4] = True
@@ -302,7 +473,7 @@ def test_vllm_samples_the_batches_the_kernels_do_not_take(monkeypatch, ineligibl
     sampler.sampling_states = types.SimpleNamespace(max_num_logprobs=lambda idx_mapping_np: num_logprobs)
     input_batch = types.SimpleNamespace(idx_mapping_np=np.arange(4))
 
-    assert sampler(torch.zeros(4, vocab, dtype=dtype), input_batch) == "vllm"
+    assert sampler(torch.zeros(4 * rows_per_request, vocab, dtype=dtype), input_batch) == "vllm"
 
 
 @pytest.mark.parametrize("sampler_cls", [RolloutSampler, BlackwellSampler, HopperSampler])
@@ -315,6 +486,36 @@ def test_the_samplers_override_no_other_method_of_vllms_sampler(sampler_cls):
 
     overridden = (vllm_methods & set(vars(sampler_cls))) - SAMPLER_OVERRIDES
     assert not overridden, f"{sampler_cls.__name__} overrides vLLM's Sampler.{sorted(overridden)}"
+
+
+def test_a_kernel_s_nan_and_inf_counts_raise_naming_the_step_the_kernel_and_each_row_s_request():
+    # a verify step of three requests of four rows each: nine offending rows, the first eight named
+    counts = torch.tensor([0, 2, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1], dtype=torch.int32)
+    nonfinite_logits = NonfiniteLogits("the verify sampler", counts, ["a", "b", "c"], np.array([0, 4, 8, 12]))
+    nonfinite_logits.copy_to_host()
+
+    with pytest.raises(RuntimeError) as error:
+        nonfinite_logits.raise_if_any(3)
+
+    assert str(error.value) == (
+        "step 3: the verify sampler found NaN or +inf logits, corrupted ones, in 9 of its rows: row 1 (request a) has "
+        "2; row 4 (request b) has 1; row 5 (request b) has 1; row 6 (request b) has 1; row 7 (request b) has 1; row 8 "
+        "(request c) has 1; row 9 (request c) has 1; row 10 (request c) has 1; and 1 more"
+    )
+    # counts of none return
+    clean_logits = NonfiniteLogits("the fused sampler", torch.zeros(3, dtype=torch.int32), ["a", "b", "c"], None)
+    clean_logits.copy_to_host()
+    clean_logits.raise_if_any(4)
+
+
+def test_vllms_runner_builds_each_step_s_output_as_the_one_that_raises_on_nan_and_inf_logits(monkeypatch):
+    # vLLM's V2 runner builds a step's output by its module's name AsyncOutput, which the GPU backends' install sets
+    assert model_runner.AsyncOutput is AsyncOutput and "AsyncOutput(" in inspect.getsource(model_runner)
+    monkeypatch.setattr(model_runner, "AsyncOutput", AsyncOutput)  # vLLM's again after the test
+
+    NonfiniteCheckedOutput.install()
+
+    assert model_runner.AsyncOutput is NonfiniteCheckedOutput
 
 
 def test_the_blackwell_mixed_steps_take_a_graph_every_32_tokens_then_every_64():
@@ -481,27 +682,45 @@ def test_the_hopper_graphs_ask_the_attention_backends_under_the_engine_s_config(
 
 
 @pytest.mark.parametrize(
-    "for_capture, input_batch, is_pure_decode",
+    "speculative_config, cg_support",
+    [
+        (None, AttentionCGSupport.ALWAYS),  # any step on the mixed-step layout, in FULL graphs too
+        (drafter_config(SPECULATIVE_METHOD), AttentionCGSupport.UNIFORM_BATCH),  # vLLM's metadata of the mixed steps
+    ],
+)
+def test_with_a_drafter_the_hopper_gdn_graphs_take_uniform_batches_alone(speculative_config, cg_support):
+    vllm_config = types.SimpleNamespace(speculative_config=speculative_config)
+
+    assert HopperGDNMetadataBuilder.get_cudagraph_support(vllm_config, None) == cg_support
+
+
+@pytest.mark.parametrize(
+    "for_capture, input_batch, is_uniform_decode",
     [
         (True, {"max_query_len": 1}, True),  # a decode graph's capture
+        (True, {"max_query_len": 1 + NUM_SPECULATIVE_TOKENS}, True),  # a verify graph's capture
         (True, {"max_query_len": 256}, False),  # a mixed graph's capture: a query as long as the graph
         (False, {"decode_graph_eligible": True, "num_tokens": 40, "num_reqs": 40}, True),  # a decode step
+        (False, {"decode_graph_eligible": True, "num_tokens": 160, "num_reqs": 40}, True),  # a verify step
         (False, {"decode_graph_eligible": False, "num_tokens": 40, "num_reqs": 40}, False),  # with a new prompt token
+        (False, {"decode_graph_eligible": True, "num_tokens": 90, "num_reqs": 40}, False),  # rows of other lengths
         (False, {"decode_graph_eligible": False, "num_tokens": 900, "num_reqs": 40}, False),  # a mixed step
     ],
 )
-def test_the_hopper_all_reduce_takes_the_decode_kernels_in_a_pure_decode_step(
-    monkeypatch, for_capture, input_batch, is_pure_decode
+def test_the_hopper_all_reduce_takes_the_decode_kernels_in_a_uniform_decode_step(
+    monkeypatch, for_capture, input_batch, is_uniform_decode
 ):
     monkeypatch.setattr(MambaHybridModelState, "prepare_attn", lambda self, *args: {})
-    monkeypatch.setattr(AllReduceNorm, "is_pure_decode", not is_pure_decode)
+    monkeypatch.setattr(AllReduceNorm, "is_uniform_decode", not is_uniform_decode)
     model_state = HopperRolloutModelState.__new__(HopperRolloutModelState)
+    # a replica of three drafts: a uniform decode step gives every request one token, or one and its drafts
+    model_state.vllm_config = types.SimpleNamespace(uniform_decode_query_len=1 + NUM_SPECULATIVE_TOKENS)
 
     model_state.prepare_attn(
         types.SimpleNamespace(**input_batch), CUDAGraphMode.NONE, None, None, None, None, for_capture=for_capture
     )
 
-    assert AllReduceNorm.is_pure_decode is is_pure_decode
+    assert AllReduceNorm.is_uniform_decode is is_uniform_decode
 
 
 def common_metadata(query_lens: list[int], seq_lens: list[int], is_prefilling: list[bool]) -> CommonAttentionMetadata:
@@ -603,8 +822,8 @@ class StandInAttention(torch.nn.Module):
 
 def test_the_decoder_layer_s_attention_takes_no_fused_q_k_norm_rope_kernel(monkeypatch):
     # the attention alone: the layer's MLP, norms and M-RoPE factor are vLLM's, which need an engine
-    monkeypatch.setattr(rollout_model, "Qwen3NextAttention", StandInAttention)
-    monkeypatch.setattr(rollout_model, "Qwen3NextMLP", lambda **kwargs: torch.nn.Identity())
+    monkeypatch.setattr(Qwen3_5RolloutDecoderLayer, "attention_cls", StandInAttention)
+    monkeypatch.setattr(Qwen3_5RolloutDecoderLayer, "mlp_cls", staticmethod(lambda **kwargs: torch.nn.Identity()))
     monkeypatch.setattr(rollout_model, "Qwen3_5RMSNorm", lambda *args, **kwargs: torch.nn.Identity())
     monkeypatch.setattr(rollout_model, "mrope_positions_factor", lambda vllm_config: 1)
     text_config = types.SimpleNamespace(
@@ -643,9 +862,16 @@ def test_the_decode_attention_splits_over_more_ctas(monkeypatch):
 def test_the_longest_decode_contexts_launch_first(monkeypatch):
     monkeypatch.setattr(vllm_flashinfer, "_get_trtllm_workspace_buffer", lambda: torch.zeros(16, dtype=torch.uint8))
     lens = torch.randperm(SORT_MIN_ROWS) + 1
-    decode = types.SimpleNamespace(block_tables=lens[:, None] * 10, seq_lens=lens, max_seq_len=SORT_MIN_ROWS)
+    decode = types.SimpleNamespace(
+        block_tables=lens[:, None] * 10, seq_lens=lens, max_seq_len=SORT_MIN_ROWS, q_len_per_req=1
+    )
     md = types.SimpleNamespace(
-        num_decode_tokens=SORT_MIN_ROWS, num_actual_tokens=SORT_MIN_ROWS, num_prefills=0, prefill=None, decode=decode
+        num_decodes=SORT_MIN_ROWS,
+        num_decode_tokens=SORT_MIN_ROWS,
+        num_actual_tokens=SORT_MIN_ROWS,
+        num_prefills=0,
+        prefill=None,
+        decode=decode,
     )
 
     step = AttentionStep(md)
@@ -653,8 +879,147 @@ def test_the_longest_decode_contexts_launch_first(monkeypatch):
     tables, seq_lens, _ = step.decode_args
     assert seq_lens.tolist() == sorted(lens.tolist(), reverse=True)
     assert torch.equal(tables[:, 0], seq_lens * 10)  # the rows move with their lengths
-    md.num_decode_tokens = md.num_actual_tokens = SORT_MIN_ROWS - 1
+    md.num_decodes = md.num_decode_tokens = md.num_actual_tokens = SORT_MIN_ROWS - 1
     assert AttentionStep(md).order is None  # fewer rows keep their order
+
+
+def trtllm_decode(num_decodes: int, q_len: int, is_ragged: bool = False):
+    """vLLM's TRT-LLM decode metadata of num_decodes rows of q_len query tokens each."""
+    lens = torch.arange(num_decodes, dtype=torch.int32) + q_len
+    return vllm_flashinfer.FlashInferTrtllmAPIDecode(
+        kernel=vllm_flashinfer.FlashInferDecodeKernel.TRTLLM_GEN,
+        block_tables=torch.zeros(num_decodes, 1, dtype=torch.int32),
+        seq_lens=lens,
+        max_seq_len=int(lens.max()),
+        q_len_per_req=q_len,
+        q_cu_seq_lens=torch.arange(num_decodes + 1, dtype=torch.int32) * q_len if is_ragged else None,
+    )
+
+
+@pytest.mark.parametrize(
+    "q_len, has_prefill_rows, is_ragged, is_eligible",
+    [
+        (1, False, False, True),  # a decode step
+        (1, True, False, True),  # a mixed step
+        (NUM_SPECULATIVE_TOKENS + 1, True, False, True),  # verify rows beside a new turn's prefill rows
+        (NUM_SPECULATIVE_TOKENS + 1, False, False, False),  # a verify step: vLLM's FULL decode graphs
+        (NUM_SPECULATIVE_TOKENS + 1, True, True, False),  # verify rows of several query lengths
+    ],
+)
+def test_the_blackwell_attention_takes_verify_rows_beside_prefill_rows(q_len, has_prefill_rows, is_ragged, is_eligible):
+    impl = BlackwellFlashInferImpl.__new__(BlackwellFlashInferImpl)
+    impl.__dict__.update(dcp_world_size=1, sinks=None, bmm1_scale=1.0, o_sf_scale=None, window_left=-1)
+    num_decodes = 4
+    decode = trtllm_decode(num_decodes, q_len, is_ragged)
+    prefill = None
+    if has_prefill_rows:
+        prefill = vllm_flashinfer.TRTLLMPrefill(
+            block_tables=torch.zeros(1, 1, dtype=torch.int32),
+            seq_lens=torch.tensor([100], dtype=torch.int32),
+            cum_seq_lens_q=torch.tensor([0, 100], dtype=torch.int32),
+            cum_seq_lens_kv=torch.tensor([0, 100], dtype=torch.int32),
+            max_q_len=100,
+            max_seq_len=100,
+        )
+    md = types.SimpleNamespace(
+        prefill=prefill, decode=decode, num_decodes=num_decodes, num_decode_tokens=num_decodes * q_len
+    )
+
+    assert impl.eligible(md, torch.zeros(1, dtype=torch.bfloat16), None) == is_eligible
+
+
+@pytest.mark.parametrize(
+    "q_len, is_eligible",
+    [
+        (1, False),  # a decode step: TRT-LLM's decode kernel
+        (NUM_SPECULATIVE_TOKENS + 1, True),  # a verify step
+    ],
+)
+def test_pear_s_attention_kernel_takes_the_verify_steps_alone(q_len, is_eligible):
+    num_decodes = 4
+    md = types.SimpleNamespace(
+        prefill=None,
+        decode=trtllm_decode(num_decodes, q_len),
+        causal=True,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decodes * q_len,
+    )
+
+    assert VerifyAttention.eligible(md, QUERY_HEADS, KV_HEADS) == is_eligible
+
+
+def test_a_decode_step_stays_on_trtllm_s_decode_kernel(monkeypatch):
+    monkeypatch.setattr(
+        blackwell_attention,
+        "get_forward_context",
+        lambda: types.SimpleNamespace(slot_mapping={"attn": torch.zeros(1, dtype=torch.int64)}),
+    )
+    monkeypatch.setattr(FlashInferImpl, "forward", lambda self, *args: "vllm")
+    monkeypatch.setattr(BlackwellFlashInferImpl, "attend", lambda self, query, kv_cache, md, output: "trtllm")
+    monkeypatch.setattr(BlackwellFlashInferImpl, "attend_verify", lambda self, *args: "pear verify")
+    monkeypatch.setattr(BlackwellFlashInferImpl, "do_kv_cache_update", lambda self, *args: None)
+    impl = BlackwellFlashInferImpl.__new__(BlackwellFlashInferImpl)
+    impl.__dict__.update(
+        kv_sharing_target_layer_name=None, num_heads=QUERY_HEADS, num_kv_heads=KV_HEADS, dcp_world_size=1, sinks=None,
+        bmm1_scale=1.0, o_sf_scale=None, window_left=-1,
+    )  # fmt: skip
+    num_decodes = 4
+    md = types.SimpleNamespace(
+        prefill=None, decode=trtllm_decode(num_decodes, 1), causal=True, num_decodes=num_decodes,
+        num_decode_tokens=num_decodes,
+    )  # fmt: skip
+    kv_cache = torch.zeros(1, dtype=torch.bfloat16)
+
+    # a T = 1 step never takes PEAR's kernel: the target's layers TRT-LLM's decode kernel launched directly, a
+    # drafter's layers vLLM's path to the same kernel
+    paths = [
+        impl.forward(types.SimpleNamespace(is_draft_layer=is_draft_layer, layer_name="attn"), None, torch.zeros(1),
+                     torch.zeros(1), kv_cache, md, None)
+        for is_draft_layer in (False, True)
+    ]  # fmt: skip
+
+    assert paths == ["trtllm", "vllm"]
+
+
+@pytest.mark.parametrize(
+    "is_verify_step, paths, updates",
+    [
+        # verify steps on PEAR's kernel, which writes the keys and values, the drafter's layers too
+        (True, ("pear verify", "pear verify"), []),
+        # a decode or mixed step's keys and values written first; then the TRT-LLM kernels, a drafter's layers vLLM's
+        # path (its fused draft steps advance one metadata object's lengths in place)
+        (False, ("pear", "vllm"), [False, True]),
+    ],
+)
+def test_the_attention_layers_take_their_steps_paths(monkeypatch, is_verify_step, paths, updates):
+    slot_mapping = torch.zeros(1, dtype=torch.int64)
+    monkeypatch.setattr(
+        blackwell_attention,
+        "get_forward_context",
+        lambda: types.SimpleNamespace(slot_mapping={"attn": slot_mapping}),
+    )
+    monkeypatch.setattr(FlashInferImpl, "forward", lambda self, *args: "vllm")
+    monkeypatch.setattr(BlackwellFlashInferImpl, "has_plain_cache", lambda self, md, kv_cache, output_scale: True)
+    monkeypatch.setattr(BlackwellFlashInferImpl, "eligible", lambda self, md, kv_cache, output_scale: True)
+    monkeypatch.setattr(BlackwellFlashInferImpl, "attend", lambda self, query, kv_cache, md, output: "pear")
+    monkeypatch.setattr(BlackwellFlashInferImpl, "attend_verify", lambda self, *args: "pear verify")
+    monkeypatch.setattr(
+        VerifyAttention, "eligible", classmethod(lambda cls, md, num_heads, num_kv_heads: is_verify_step)
+    )
+    written = []
+    monkeypatch.setattr(
+        BlackwellFlashInferImpl,
+        "do_kv_cache_update",
+        lambda self, layer, key, value, kv_cache, mapping: written.append(layer.is_draft_layer),
+    )
+    impl = BlackwellFlashInferImpl.__new__(BlackwellFlashInferImpl)
+    impl.__dict__.update(kv_sharing_target_layer_name=None, num_heads=QUERY_HEADS, num_kv_heads=KV_HEADS)
+
+    for is_draft_layer, path in zip((False, True), paths, strict=True):
+        layer = types.SimpleNamespace(is_draft_layer=is_draft_layer, layer_name="attn")
+        assert impl.forward(layer, None, torch.zeros(1), torch.zeros(1), None, None, None) == path
+
+    assert written == updates
 
 
 def test_the_blackwell_attention_keeps_no_kv_cache_vllm_released(monkeypatch):
@@ -681,6 +1046,7 @@ def test_the_blackwell_attention_keeps_no_kv_cache_vllm_released(monkeypatch):
     )
     del memory
     md = types.SimpleNamespace(
+        num_decodes=0,
         num_decode_tokens=0,
         num_actual_tokens=0,
         num_prefills=0,
@@ -729,9 +1095,13 @@ def test_the_blackwell_attention_takes_the_views_of_the_kv_cache_vllm_binds_next
     )
     # a step of one decode row
     decode = types.SimpleNamespace(
-        block_tables=torch.zeros(1, 1, dtype=torch.int32), seq_lens=torch.ones(1, dtype=torch.int32), max_seq_len=1
+        block_tables=torch.zeros(1, 1, dtype=torch.int32),
+        seq_lens=torch.ones(1, dtype=torch.int32),
+        max_seq_len=1,
+        q_len_per_req=1,
     )
     md = types.SimpleNamespace(
+        num_decodes=1,
         num_decode_tokens=1,
         num_actual_tokens=1,
         num_prefills=0,
@@ -783,21 +1153,74 @@ def test_the_blackwell_gdn_layer_keeps_no_kv_cache_vllm_released():
     assert memory_ref() is None
 
 
-class HostStagedBuffer:
-    """StagedBuffer's construction and upload on a machine without a GPU driver: pageable host buffers, plain copies,
-    no upload events."""
+def hopper_attention_page(num_speculative_tokens: int) -> int:
+    """The tokens per page of an H100 replica's attention as vLLM 0.34 derives them for Qwen3.8-27B at TP4 with a
+    drafter's tokens: the hybrid KV cache block that holds a Gated DeltaNet state (Platform._align_hybrid_block_size
+    from FlashAttention's preferred block), which FlashAttention-3 takes whole (select_common_block_size)."""
+    attention_bytes = FullAttentionSpec(
+        block_size=1, num_kv_heads=KV_HEADS, head_size=HEAD_DIM, dtype=torch.bfloat16
+    ).page_size_bytes
+    shapes = MambaStateShapeCalculator.gated_delta_net_state_shape(
+        HopperRolloutGpuBackend.tensor_parallel_size,
+        GDN_K_HEADS,
+        GDN_V_HEADS,
+        GDN_HEAD_DIM,
+        GDN_HEAD_DIM,
+        CONV_WIDTH,
+        num_speculative_tokens,
+    )
+    mamba_bytes = MambaSpec(shapes=shapes, dtypes=HopperRolloutGpuBackend.STATE_DTYPES, block_size=-1).page_size_bytes
+    preferred_block = FlashAttentionBackend.get_preferred_block_size(CacheConfig.DEFAULT_BLOCK_SIZE)
+    hybrid_block = preferred_block * cdiv(mamba_bytes, preferred_block * attention_bytes)
 
-    @staticmethod
-    def init(buffer: StagedBuffer, size: int, device) -> None:
-        buffer.device_buffer = torch.zeros(size, dtype=torch.int32, device=device)
-        buffer.stages = [torch.zeros(size, dtype=torch.int32) for _ in range(StagedBuffer.BUFFERS)]
-        buffer.upload_events = [None] * StagedBuffer.BUFFERS
-        buffer.turn = 0
+    return select_common_block_size(hybrid_block, [FlashAttentionBackend])
 
-    @staticmethod
-    def upload(buffer: StagedBuffer, size: int) -> None:
-        buffer.device_buffer[:size].copy_(buffer.stages[buffer.turn][:size])
-        buffer.turn ^= 1
+
+@pytest.mark.parametrize(
+    "num_speculative_tokens, max_query_len, is_eligible",
+    [
+        (0, 1, True),  # a decode step
+        (0, 300, True),  # a mixed step: the host's KV lengths are exact
+        (NUM_SPECULATIVE_TOKENS, 1, True),  # a decode step, or a drafter's step
+        (NUM_SPECULATIVE_TOKENS, NUM_SPECULATIVE_TOKENS + 1, True),  # a verify step: the kernel at its query length
+        (NUM_SPECULATIVE_TOKENS, 300, False),  # a mixed step
+        (DEEP_DRAFT_TOKENS, 1, True),  # a deeper drafter's step
+        (DEEP_DRAFT_TOKENS, DEEP_DRAFT_TOKENS + 1, True),  # its verify step
+    ],
+)
+def test_the_hopper_decode_kernel_takes_its_steps_at_the_block_vllm_gives_an_h100_replica(
+    num_speculative_tokens, max_query_len, is_eligible
+):
+    # the KV cache block of vLLM's own derivation, which a drafter's states can grow: the kernel takes the cache's
+    # pages as they are, so no block of the engine's sends its steps to FA3
+    speculative_config = drafter_config(SPECULATIVE_METHOD) if num_speculative_tokens else None
+    builder = HopperFlashAttentionMetadataBuilder.__new__(HopperFlashAttentionMetadataBuilder)
+    builder.__dict__.update(
+        aot_schedule=True,
+        dcp_world_size=1,
+        headdim=HEAD_DIM,
+        num_heads_kv=KV_HEADS,
+        num_heads_q=QUERY_HEADS,
+        block_size=hopper_attention_page(num_speculative_tokens),
+        kv_cache_dtype=torch.bfloat16,
+        rswa_window=None,
+        aot_sliding_window=None,
+        vllm_config=types.SimpleNamespace(
+            scheduler_config=types.SimpleNamespace(max_num_seqs=MAX_NUM_SEQS), speculative_config=speculative_config
+        ),
+        # a verify step's query length, both drafters' among those the kernel takes
+        verify_query_len=1 + num_speculative_tokens if num_speculative_tokens else None,
+    )
+    num_reqs = 4
+    m = types.SimpleNamespace(
+        num_reqs=num_reqs,
+        causal=True,
+        mm_req_doc_ranges=None,
+        max_query_len=max_query_len,
+        num_actual_tokens=num_reqs * max_query_len,
+    )
+
+    assert builder.eligible(m) == is_eligible
 
 
 @pytest.mark.parametrize(
@@ -808,8 +1231,7 @@ class HostStagedBuffer:
     ],
 )
 def test_a_hopper_step_s_attention_arguments_land_in_their_sections(monkeypatch, num_decode_rows, qlens, klens):
-    monkeypatch.setattr(StagedBuffer, "__init__", HostStagedBuffer.init)
-    monkeypatch.setattr(StagedBuffer, "upload", HostStagedBuffer.upload)
+    HostStagedBuffer.install(monkeypatch)
     buffers = AttentionStepBuffers(MAX_NUM_SEQS, "cpu")
     n = len(qlens)
     starts = np.cumsum([0, *qlens[:-1]])
@@ -894,6 +1316,7 @@ def hopper_model_state(rope_state: RecordedRopeState, model) -> HopperRolloutMod
         prompt_embeds_state=None,
         num_accepted_tokens_gpu=torch.zeros(2, dtype=torch.int32),
         _align_mode=False,
+        replay_state=None,
     )
 
     return model_state

@@ -28,12 +28,16 @@ from vllm.third_party.flash_linear_attention.ops.wy_fast import recompute_w_u_fw
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
 from vllm.v1.worker.utils import select_common_block_size
 
+from nonfinite_rows import NonfiniteRows
 from pear.models.qwen3_5.rollout.hopper.all_reduce import AllReduceNorm
 from pear.models.qwen3_5.rollout.hopper.attention import (
     HEAD_DIM,
     QUERY_HEADS,
+    VERIFY_QUERY_LENS,
+    AttentionStepBuffers,
     HopperFlashAttentionImpl,
 )
 from pear.models.qwen3_5.rollout.hopper.cudagraph import HopperMixedStepGraphs
@@ -63,12 +67,21 @@ KV_HEADS = 1  # the attention's KV heads on one of four ranks
 CONV_WIDTH = 4  # the Gated DeltaNet's causal conv taps
 PARTIAL_TILE_PAGE = 784  # a page of twelve of the decode kernel's 64-token tiles and a partial one of 16 tokens
 HIDDEN = 5120  # the model's hidden size
+VERIFY_ROWS = 64 * 4  # a verify step's rows: 64 requests' last tokens and three drafts each
+UNIFORM_DECODE_ROWS = 128 * 4  # the uniform decode steps' rows at most: max_num_seqs of 128 at three drafts
 VOCAB = 248320
 NORM_BIAS = 1.0  # Qwen3.5's RMSNorm scales by 1 + w (FlashInfer's weight_bias)
 SAMPLER_ROWS = 64  # a decode step's rows
 MAX_LOGPROBS = HopperSampler.MAX_LOGPROBS  # the largest top-K the sampler's kernels keep
 DRAWS = 50  # sampler calls of the distribution check, over 256 rows each
 SAMPLER_SEED = 5  # the seed of the sampler's draws in its test
+TOO_MANY_ROWS = 65536  # one row more than a grid's y dimension takes (65535)
+SHORT_VOCAB = 128  # a vocabulary short enough for that many rows
+ROW_RECORD_BYTES = 512  # more than one row's records in the sampler's workspace: its chunk's and its own
+UNWRITTEN = -1  # an id and a rank no pass of the sampler writes
+REFUSED_LAUNCH = "CUDA error: invalid (configuration )?argument"  # the runtime's errors for launch parameters
+NONFINITE_TEMPERATURE = 0.8  # the temperature of the sampler's rows of NaN and infinite logits
+NONFINITE_REQUESTS = ["a-finite-request", "the-request"]  # the step's requests: a finite row, then the row of a kind
 
 
 def gdn_layer(generator: torch.Generator) -> types.SimpleNamespace:
@@ -284,10 +297,9 @@ def attention_page() -> int:
     return select_common_block_size(hybrid_block, [FlashAttentionBackend])
 
 
-# the replicas' page, and one whose last tile is partial
-@pytest.mark.parametrize("page", [attention_page(), PARTIAL_TILE_PAGE])
-def test_the_split_decode_attention_matches_the_reference(page):
+def test_the_split_decode_attention_matches_the_reference():
     HopperExtension.load()
+    page = attention_page()
     generator = torch.Generator(device=DEVICE).manual_seed(2)
     rng = np.random.default_rng(2)
     kv = torch.randn(KV_BLOCKS, page, 1, 2 * HEAD_DIM, generator=generator, device=DEVICE).bfloat16()
@@ -318,18 +330,133 @@ def test_the_split_decode_attention_matches_the_reference(page):
             want.append(weights @ rows[:, HEAD_DIM:])
         want = torch.stack(want)
 
-        # all rows decoding, or the leading half (a mixed step's: FlashAttention-3 computes the others)
+        # all rows decoding, or the leading half (a mixed step's: FlashAttention-3 computes the others); a pure decode
+        # step's kernel runs alone
         for decodes in (n, n // 2):
             for ctas in (HopperFlashAttentionImpl.MIXED_CTAS, HopperFlashAttentionImpl.DECODE_CTAS):
                 out = torch.full((n, QUERY_HEADS, HEAD_DIM), 7.0, dtype=torch.bfloat16, device=DEVICE)
                 num_decode_rows = torch.tensor([decodes], dtype=torch.int32, device=DEVICE)
+                is_alone = ctas == HopperFlashAttentionImpl.DECODE_CTAS
                 torch.ops.pear_rollout_hopper.split_decode_attention(
-                    q, cache, table, seq_lens, num_decode_rows, out, state["part_o"], state["part_ml"],
-                    state["counters"], scale, ctas, n,
+                    q, cache, table, seq_lens, num_decode_rows, out, state["part_o"], state["part_ml"], scale, ctas,
+                    n, 1, is_alone,
                 )  # fmt: skip
                 torch.cuda.synchronize()
                 torch.testing.assert_close(out[:decodes].double(), want[:decodes], rtol=0, atol=2e-2)
-                assert (out[decodes:] == 7.0).all() and not state["counters"].any()
+                assert (out[decodes:] == 7.0).all()
+
+
+def test_the_split_decode_attention_refuses_a_page_of_a_partial_tile():
+    # the kernel reads whole 64-token tiles of a page (vLLM 0.34's H100 page is thirteen)
+    HopperExtension.load()
+    kv = torch.zeros(KV_BLOCKS, PARTIAL_TILE_PAGE, 1, 2 * HEAD_DIM, dtype=torch.bfloat16, device=DEVICE)
+    state = HopperFlashAttentionImpl.device_state(kv.device)
+    q = torch.zeros(1, QUERY_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=DEVICE)
+
+    with pytest.raises(RuntimeError, match="pages of whole 64-token tiles"):
+        torch.ops.pear_rollout_hopper.split_decode_attention(
+            q, kv, torch.zeros(1, 1, dtype=torch.int32, device=DEVICE), torch.ones(1, dtype=torch.int32, device=DEVICE),
+            torch.ones(1, dtype=torch.int32, device=DEVICE), torch.empty_like(q), state["part_o"], state["part_ml"],
+            HEAD_DIM**-0.5, HopperFlashAttentionImpl.DECODE_CTAS, 1, 1, True,
+        )  # fmt: skip
+
+
+class TestSplitDecodeAttentionAtQueryLengths:
+    """split_decode_attention against fp64 attention, causal within a request's block of query tokens, at the query
+    lengths of a decode step and of the verify steps of three and seven drafts."""
+
+    TOLERANCE = 5e-3  # a query row's relative L2 error; the kernel's is about 2e-3 (bf16 output)
+    CASES = {
+        "tile and page boundaries": [8, 9, 63, 64, 65, 127, 128, 129, 831, 832, 833, 1663, 1664, 1665, 4000, 10000],
+        "one sequence over every CTA": [160000],
+        "the most requests": [100 + 7 * i for i in range(256)],
+        "empty requests among others": [0, 3000, 0, 50000, 0, 0, 900, 0],
+        "unequal lengths": [70000, 70],
+    }
+    MIXED_STEP_LENGTHS = [5000, 20000, 300, 7000, 64, 128]  # its first rows decode, the others are prefill rows
+    MIXED_STEP_DECODE_ROWS = 3
+
+    @pytest.mark.parametrize("query_len", [1, *VERIFY_QUERY_LENS])
+    @pytest.mark.parametrize("case", list(CASES))
+    def test_every_row_matches_fp64(self, case, query_len):
+        lengths = [length if length == 0 else max(length, query_len) for length in self.CASES[case]]
+        n = len(lengths)
+        error = self.max_error(lengths, query_len, n, HopperFlashAttentionImpl.DECODE_CTAS, True)
+        assert error < self.TOLERANCE
+
+    def test_the_decode_rows_of_a_mixed_step_match_fp64(self):
+        lengths, decodes = self.MIXED_STEP_LENGTHS, self.MIXED_STEP_DECODE_ROWS
+        assert self.max_error(lengths, 1, decodes, HopperFlashAttentionImpl.MIXED_CTAS, False) < self.TOLERANCE
+
+    @staticmethod
+    def max_error(lengths, query_len: int, num_decode_rows: int, ctas: int, is_alone: bool) -> float:
+        """The largest relative error of the decode rows' outputs, pages in random order."""
+        HopperExtension.load()
+        page = attention_page()
+        generator = torch.Generator(device=DEVICE).manual_seed(0)
+        n, T = len(lengths), query_len
+        pages = [max(1, -(-length // page)) for length in lengths]
+        cache = torch.randn(sum(pages) + 1, page, 1, 2 * HEAD_DIM, generator=generator, device=DEVICE).bfloat16()
+        order = torch.randperm(sum(pages), generator=generator, device=DEVICE).int() + 1  # block 0 unused
+        table = torch.zeros(n, max(pages), dtype=torch.int32, device=DEVICE)
+        for i, count in enumerate(pages):
+            table[i, :count] = order[sum(pages[:i]) : sum(pages[: i + 1])]
+        q = torch.randn(n * T, QUERY_HEADS, HEAD_DIM, generator=generator, device=DEVICE).bfloat16()
+        out = torch.full_like(q, float("nan"))
+        state = HopperFlashAttentionImpl.device_state(cache.device)
+
+        torch.ops.pear_rollout_hopper.split_decode_attention(
+            q, cache, table, torch.tensor(lengths, dtype=torch.int32, device=DEVICE),
+            torch.tensor([num_decode_rows], dtype=torch.int32, device=DEVICE), out, state["part_o"], state["part_ml"],
+            HEAD_DIM**-0.5, ctas, n, T, is_alone,
+        )  # fmt: skip
+
+        worst = 0.0
+        for i, length in enumerate(lengths[:num_decode_rows]):
+            if length == 0:
+                continue
+            rows = cache[table[i, : -(-length // page)].long()].reshape(-1, 2 * HEAD_DIM)[:length].double()
+            keys, values = rows[:, :HEAD_DIM], rows[:, HEAD_DIM:]
+            scores = torch.einsum("thd,ld->thl", q[i * T : (i + 1) * T].double(), keys) * HEAD_DIM**-0.5
+            # query token t sees the keys up to length - T + t
+            sees = (
+                torch.arange(length, device=DEVICE)[None, :] <= (length - T + torch.arange(T, device=DEVICE))[:, None]
+            )
+            weights = scores.masked_fill(~sees[:, None, :], float("-inf")).softmax(-1)
+            reference = torch.einsum("thl,ld->thd", weights, values)
+            got = out[i * T : (i + 1) * T].double()
+            error = ((got - reference).norm(dim=-1) / reference.norm(dim=-1)).max().item()
+            worst = max(worst, error if error == error else float("inf"))
+        return worst
+
+
+def test_a_pure_decode_step_s_padding_rows_take_no_work():
+    # a pure decode step counts every row as a decode row, a FULL graph's padding requests (no context) among them
+    HopperExtension.load()
+    generator = torch.Generator(device=DEVICE).manual_seed(3)
+    page = attention_page()
+    kv = torch.randn(KV_BLOCKS, page, 1, 2 * HEAD_DIM, generator=generator, device=DEVICE).bfloat16()
+    state = HopperFlashAttentionImpl.device_state(kv.device)
+    scale = HEAD_DIM**-0.5
+    lens = [300, page + 5, 0, 0]
+    rows, real_rows = len(lens), 2
+    table = torch.tensor([[3, 0], [1, 2], [0, 0], [0, 0]], dtype=torch.int32, device=DEVICE)
+    seq_lens = torch.tensor(lens, dtype=torch.int32, device=DEVICE)
+    q = (torch.randn(rows, QUERY_HEADS, HEAD_DIM, generator=generator, device=DEVICE) * 2).bfloat16()
+    out = torch.full((rows, QUERY_HEADS, HEAD_DIM), 7.0, dtype=torch.bfloat16, device=DEVICE)
+    decode_rows = AttentionStepBuffers(rows, torch.device(DEVICE)).row_counts[rows : rows + 1]
+
+    torch.ops.pear_rollout_hopper.split_decode_attention(
+        q, kv, table, seq_lens, decode_rows, out, state["part_o"], state["part_ml"], scale,
+        HopperFlashAttentionImpl.DECODE_CTAS, rows, 1, True,
+    )  # fmt: skip
+
+    torch.cuda.synchronize()
+    for i, length in enumerate(lens[:real_rows]):
+        context = kv[table[i, : -(-length // page)].long(), :, 0].reshape(-1, 2 * HEAD_DIM)[:length].double()
+        weights = torch.softmax(q[i].double() @ context[:, :HEAD_DIM].T * scale, -1)
+        torch.testing.assert_close(out[i].double(), weights @ context[:, HEAD_DIM:], rtol=0, atol=2e-2)
+    assert (out[real_rows:] == 7.0).all()
 
 
 def four_rank_checks(rank: int, rendezvous: str) -> None:
@@ -343,9 +470,7 @@ def four_rank_checks(rank: int, rendezvous: str) -> None:
     AllReduceNorm.register_op()
     ops = torch.ops.pear_rollout_hopper
     generator = torch.Generator(device=DEVICE).manual_seed(6)  # the same draws on every rank
-    text_config = types.SimpleNamespace(hidden_size=HIDDEN)
-    model = types.SimpleNamespace(config=types.SimpleNamespace(get_text_config=lambda: text_config))
-    AllReduceNorm.create_workspace(model)
+    AllReduceNorm.create_workspace(HIDDEN, UNIFORM_DECODE_ROWS)
     workspace = AllReduceNorm.workspace
     buffers = (
         int(workspace.uc_ptrs_dev),
@@ -357,8 +482,9 @@ def four_rank_checks(rank: int, rendezvous: str) -> None:
     gamma = (0.1 * torch.randn(HIDDEN, generator=generator, device=DEVICE)).bfloat16()
     scale = gamma.double() + NORM_BIAS
 
-    # the bf16 residual: the reduced rows (fp32 sums over the ranks in rank order, rounded) added in bf16
-    for T in (1, 7, 64, 128):
+    # the bf16 residual: the reduced rows (fp32 sums over the ranks in rank order, rounded) added in bf16; up to a
+    # verify step's rows
+    for T in (1, 7, 64, 128, VERIFY_ROWS, UNIFORM_DECODE_ROWS):
         residual = (3 * torch.randn(T, HIDDEN, generator=generator, device=DEVICE)).bfloat16()
         partials = [torch.randn(T, HIDDEN, generator=generator, device=DEVICE).bfloat16() for _ in range(TP)]
         want = (residual.float() + sum(p.float() for p in partials).bfloat16().float()).bfloat16()
@@ -369,8 +495,8 @@ def four_rank_checks(rank: int, rendezvous: str) -> None:
         rms = want.double() * torch.rsqrt(want.double().pow(2).mean(-1, keepdim=True) + EPS) * scale
         torch.testing.assert_close(norm_out.double(), rms, rtol=1e-2, atol=1e-2)
 
-    # a decode step's fp32 stream: the first layer starts it from the bf16 residual, which stays as it was
-    for T in (7, 64):
+    # a uniform decode step's fp32 stream: the first layer starts it from the bf16 residual, which stays as it was
+    for T in (7, 64, VERIFY_ROWS):
         residual = (3 * torch.randn(T, HIDDEN, generator=generator, device=DEVICE)).bfloat16()
         before = residual.clone()
         stream = residual.float()
@@ -387,19 +513,20 @@ def four_rank_checks(rank: int, rendezvous: str) -> None:
             rms = stream.double() * torch.rsqrt(stream.double().pow(2).mean(-1, keepdim=True) + EPS) * scale
             torch.testing.assert_close(norm_out.double(), rms, rtol=1e-2, atol=1e-2)
 
-    # the decoder layers' op: a pure decode step on the decode kernels (its fp32 stream), a mixed step up to the largest
-    # mixed-step graph on FlashInfer's fused kernel, above it vLLM's all-reduce and FlashInfer's norm (bf16 residuals)
+    # the decoder layers' op: a uniform decode step (a pure decode or a verify step) on the decode kernels (its fp32
+    # stream), a mixed step up to the largest mixed-step graph on FlashInfer's fused kernel, above it vLLM's all-reduce
+    # and FlashInfer's norm (bf16 residuals)
     norm = types.SimpleNamespace(weight=gamma, variance_epsilon=EPS)
-    for is_pure_decode, T in ((True, 64), (False, 64), (False, ABOVE_GRAPH_ROWS)):
+    for is_uniform_decode, T in ((True, 64), (True, VERIFY_ROWS), (False, 64), (False, ABOVE_GRAPH_ROWS)):
         residual = (3 * torch.randn(T, HIDDEN, generator=generator, device=DEVICE)).bfloat16()
         partials = [torch.randn(T, HIDDEN, generator=generator, device=DEVICE).bfloat16() for _ in range(TP)]
         reduced = sum(p.float() for p in partials)
-        AllReduceNorm.begin_step(is_pure_decode)
+        AllReduceNorm.begin_step(is_uniform_decode)
 
         x, new_residual = AllReduceNorm.apply(partials[rank].clone(), residual.clone(), norm, True)
 
         torch.cuda.synchronize()
-        want = AllReduceNorm.stream32[:T].double() if is_pure_decode else new_residual.double()
+        want = AllReduceNorm.stream32[:T].double() if is_uniform_decode else new_residual.double()
         torch.testing.assert_close(want, residual.double() + reduced.double(), rtol=1e-2, atol=5e-2)
         rms = want * torch.rsqrt(want.pow(2).mean(-1, keepdim=True) + EPS) * scale
         torch.testing.assert_close(x.double(), rms, rtol=1e-2, atol=1e-2)
@@ -443,9 +570,9 @@ def test_the_sampler_draws_from_the_softmax(monkeypatch):
     flat = torch.randn(SAMPLER_ROWS, VOCAB, generator=generator, device=DEVICE) * 2
 
     for logits in (peaked, flat, peaked[:1]):
-        sampled, tensors = HopperSampler.draw_rows(logits, temperature[: len(logits)], MAX_LOGPROBS)
+        sampled, tensors, nonfinite = HopperSampler.draw_rows(logits, temperature[: len(logits)], MAX_LOGPROBS)
         ids, logprobs, ranks = tensors.logprob_token_ids, tensors.logprobs, tensors.selected_token_ranks
-        assert sampled.dtype == torch.int64
+        assert sampled.dtype == torch.int64 and (nonfinite == 0).all()
         lp = (logits / temperature[: len(logits), None]).log_softmax(-1)
         top_lp, top_ids = lp.topk(MAX_LOGPROBS, -1)
         sampled_lp = lp.gather(1, sampled[:, None])
@@ -461,8 +588,71 @@ def test_the_sampler_draws_from_the_softmax(monkeypatch):
     logits[:, : len(probs)] = probs.log()
     counts = torch.zeros(len(probs), device=DEVICE)
     for _ in range(DRAWS):
-        sampled, _ = HopperSampler.draw_rows(logits, torch.ones(256, device=DEVICE), MAX_LOGPROBS)
+        sampled, _, _ = HopperSampler.draw_rows(logits, torch.ones(256, device=DEVICE), MAX_LOGPROBS)
         assert (sampled < len(probs)).all()
         counts += torch.bincount(sampled.long(), minlength=len(probs)).float()
     draws = 256 * DRAWS
     assert ((counts / draws - probs).abs() < 4 * (probs * (1 - probs) / draws).sqrt()).all()
+
+
+def test_the_sampler_raises_a_refused_launch_at_the_call():
+    HopperExtension.load()
+    logits = torch.zeros(TOO_MANY_ROWS, SHORT_VOCAB, device=DEVICE)
+    workspace = torch.zeros(TOO_MANY_ROWS * ROW_RECORD_BYTES, dtype=torch.uint8, device=DEVICE)
+    sampled = torch.full((TOO_MANY_ROWS,), UNWRITTEN, device=DEVICE)
+    ids = torch.full((TOO_MANY_ROWS, MAX_LOGPROBS + 1), UNWRITTEN, dtype=torch.int32, device=DEVICE)
+    logprobs = torch.empty(TOO_MANY_ROWS, MAX_LOGPROBS + 1, device=DEVICE)
+    ranks = torch.full((TOO_MANY_ROWS,), UNWRITTEN, device=DEVICE)
+    nonfinite = torch.full((TOO_MANY_ROWS,), UNWRITTEN, dtype=torch.int32, device=DEVICE)
+
+    # the first pass takes a grid row per logits row: the GPU refuses its launch, and the call raises
+    with pytest.raises(RuntimeError, match=REFUSED_LAUNCH):
+        torch.ops.pear_rollout_hopper.fused_sample(
+            logits,
+            torch.ones(TOO_MANY_ROWS, device=DEVICE),
+            SAMPLER_SEED,
+            0,
+            MAX_LOGPROBS,
+            workspace,
+            sampled,
+            ids,
+            logprobs,
+            ranks,
+            nonfinite,
+        )
+
+    # no later pass ran over the unwritten records, and no error is left for a later launch or synchronize
+    assert (sampled == UNWRITTEN).all() and (ids == UNWRITTEN).all() and (ranks == UNWRITTEN).all()
+    assert (nonfinite == UNWRITTEN).all()
+
+
+@pytest.mark.parametrize("kind", NonfiniteRows.KINDS)
+def test_the_sampler_counts_nan_and_inf_logits_and_samples_the_other_rows_as_vllm(monkeypatch, kind):
+    HopperExtension.load()
+    monkeypatch.setattr(HopperSampler, "seed", SAMPLER_SEED)
+    monkeypatch.setattr(HopperSampler, "calls", 0)
+    generator = torch.Generator(device=DEVICE).manual_seed(6)
+    # a finite row, then the row of the kind, last in the logits' allocation
+    logits = torch.stack([NonfiniteRows.row("finite", VOCAB, generator), NonfiniteRows.row(kind, VOCAB, generator)])
+    temperature = torch.full((len(logits),), NONFINITE_TEMPERATURE, device=DEVICE)
+
+    sampled, tensors, nonfinite = HopperSampler.draw_rows(logits, temperature, MAX_LOGPROBS)
+
+    # every row's token inside the vocabulary (the next step's input), the corrupted row's logits counted
+    count = NonfiniteRows.count(kind, VOCAB)
+    assert ((sampled >= 0) & (sampled < VOCAB)).all()
+    assert nonfinite.tolist() == [0, count]
+
+    # the rows a step samples: a token of a finite logit, vLLM's top-K, a rank within an fp32 step of vLLM's
+    sampled_rows = 1 if kind in NonfiniteRows.CORRUPTED_KINDS else len(logits)
+    processed = logits[:sampled_rows] / NONFINITE_TEMPERATURE
+    tokens = sampled[:sampled_rows]
+    want = compute_topk_scores(processed, MAX_LOGPROBS, tokens)
+    assert torch.isfinite(processed.gather(1, tokens[:, None])).all()
+    assert torch.equal(tensors.logprob_token_ids[:sampled_rows].long(), want.logprob_token_ids)
+    torch.testing.assert_close(tensors.logprobs[:sampled_rows], want.logprobs, rtol=0, atol=1e-4)
+    assert ((tensors.selected_token_ranks[:sampled_rows] - want.selected_token_ranks).abs() <= 1).all()
+
+    # the step's output raises on the corrupted row as it reaches the host, naming the step, the kernel and the row
+    want_rows = [(1, NONFINITE_REQUESTS[1], count)] if count else []
+    NonfiniteRows.assert_step_output(HopperSampler.KERNEL, nonfinite, NONFINITE_REQUESTS, want_rows)

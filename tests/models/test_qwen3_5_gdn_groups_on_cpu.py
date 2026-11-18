@@ -6,7 +6,9 @@ import torch
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata, GDNAttentionMetadataBuilder
 
-from pear.models.qwen3_5.rollout.blackwell.gdn import CONV_TOKENS, BlackwellGDNMetadataBuilder, StagedBuffers
+from host_staged_buffer import HostStagedBuffer
+from pear.models.qwen3_5.rollout.blackwell.gdn.kernels import CONV_TOKENS
+from pear.models.qwen3_5.rollout.blackwell.gdn.layer import BlackwellGDNMetadataBuilder
 from pear.models.qwen3_5.rollout.hopper.gdn import HopperGDNMetadataBuilder
 
 MAX_NUM_SEQS = 8  # of the engine config the builders read
@@ -18,23 +20,15 @@ IS_PREFILLING = [False, False, True, True, True]
 NUM_DECODES = 2  # the one-token prompt has no state before it: a prefill row
 
 
-class HostStagedBuffers:
-    """StagedBuffers' construction on a machine without a GPU driver: pageable host buffers, its device buffers on the
-    host."""
+def vllm_builder(monkeypatch, use_spec_decode: bool) -> None:
+    """vLLM's GDN builder reduced to what decides the builders' paths, whether the engine drafts tokens; the step's
+    uploads on the host."""
 
-    @staticmethod
-    def init(buffers: StagedBuffers, device) -> None:
-        slots, count = StagedBuffers.SLOTS, StagedBuffers.BUFFERS
-        buffers.host_buffers = [torch.empty(slots, dtype=torch.int32) for _ in range(count)]
-        buffers.device_buffers = [torch.empty(slots, dtype=torch.int32, device=device) for _ in range(count)]
-        buffers.turn = 0
+    def vllm_init(self, kv_cache_spec, layer_names, vllm_config, device):
+        self.use_spec_decode = use_spec_decode
 
-
-def vllm_builder(monkeypatch) -> None:
-    """vLLM's GDN builder reduced to nothing the builders' paths read; the step's uploads on the host, a test's own."""
-    monkeypatch.setattr(GDNAttentionMetadataBuilder, "__init__", lambda self, *args: None)
-    monkeypatch.setattr(StagedBuffers, "__init__", HostStagedBuffers.init)
-    monkeypatch.setattr(StagedBuffers, "instance", None)
+    monkeypatch.setattr(GDNAttentionMetadataBuilder, "__init__", vllm_init)
+    HostStagedBuffer.install(monkeypatch)
 
 
 def engine_config() -> types.SimpleNamespace:
@@ -70,17 +64,19 @@ def block_table(first_slot: int) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("builder_cls", [BlackwellGDNMetadataBuilder, HopperGDNMetadataBuilder])
-def test_the_runner_derives_the_other_gdn_groups_metadata_from_the_first_group_s(monkeypatch, builder_cls):
-    vllm_builder(monkeypatch)
+@pytest.mark.parametrize("use_spec_decode", [False, True])
+def test_every_gdn_group_derives_its_metadata_from_the_first_group_s(monkeypatch, builder_cls, use_spec_decode):
+    vllm_builder(monkeypatch, use_spec_decode)
 
     builder = builder_cls(None, [], engine_config(), "cpu")
 
-    # vLLM's builder opts in its own class only
+    # the runner builds the first group's metadata and derives the others' (update_block_table), with a drafter too:
+    # vLLM's re-gathers a speculative step's slots, the Blackwell builder's a replayed step's prefill rows'
     assert builder.supports_update_block_table
 
 
 def test_a_blackwell_mixed_step_s_metadata_is_one_host_layout(monkeypatch):
-    vllm_builder(monkeypatch)
+    vllm_builder(monkeypatch, use_spec_decode=False)
     builder = BlackwellGDNMetadataBuilder(None, [], engine_config(), "cpu")
 
     md = builder.build(0, common_metadata(block_table(1)))
@@ -98,7 +94,7 @@ def test_a_blackwell_mixed_step_s_metadata_is_one_host_layout(monkeypatch):
 
 
 def test_another_blackwell_gdn_group_takes_the_mixed_step_with_its_own_state_slots(monkeypatch):
-    vllm_builder(monkeypatch)
+    vllm_builder(monkeypatch, use_spec_decode=False)
     first, other = (BlackwellGDNMetadataBuilder(None, [], engine_config(), "cpu") for _ in range(2))
     md = first.build(0, common_metadata(block_table(1)))
     slot_mapping = torch.zeros(sum(QUERY_LENS), dtype=torch.int64)
@@ -114,7 +110,7 @@ def test_another_blackwell_gdn_group_takes_the_mixed_step_with_its_own_state_slo
 
 
 def test_another_hopper_gdn_group_takes_the_mixed_step_with_its_own_state_slots(monkeypatch):
-    vllm_builder(monkeypatch)
+    vllm_builder(monkeypatch, use_spec_decode=False)
     first, other = (HopperGDNMetadataBuilder(None, [], engine_config(), "cpu") for _ in range(2))
     num_reqs = len(QUERY_LENS)
     layout = types.SimpleNamespace(
@@ -134,7 +130,7 @@ def test_another_hopper_gdn_group_takes_the_mixed_step_with_its_own_state_slots(
 
 @pytest.mark.parametrize("builder_cls", [BlackwellGDNMetadataBuilder, HopperGDNMetadataBuilder])
 def test_another_gdn_group_takes_a_decode_step_as_vllm_derives_it(monkeypatch, builder_cls):
-    vllm_builder(monkeypatch)
+    vllm_builder(monkeypatch, use_spec_decode=False)
     derived = []
     monkeypatch.setattr(
         GDNAttentionMetadataBuilder,
