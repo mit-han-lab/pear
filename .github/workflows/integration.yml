@@ -40,5 +40,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: ./.github/actions/training-env
       # by the marker, as ci.yml leaves them out: a test marked in any file runs here; without the robot station's
-      # directory, as in ci.yml
-      - run: $PEAR_PYTHON -m pytest tests --ignore=tests/deploy/station --ignore-glob='*_on_gpu.py' -m integration
+      # directory and the Claude Code session service's, as in ci.yml
+      - run: >-
+          $PEAR_PYTHON -m pytest tests --ignore=tests/deploy/station --ignore=tests/deploy/harness/claude_code
+          --ignore-glob='*_on_gpu.py' -m integration

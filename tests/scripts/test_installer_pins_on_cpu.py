@@ -17,6 +17,7 @@ ENVIRONMENT_DIRS = {
     "robodojo": INSTALL_DIR / "sim/robodojo",
     "evalscope": INSTALL_DIR / "evalscope",
     "station": INSTALL_DIR / "station",
+    "claude_code": INSTALL_DIR / "claude_code",
 }
 ENVIRONMENTS = tuple(ENVIRONMENT_DIRS)
 # the environment whose pins each extra of pyproject.toml is installed at: the one of its name, and the training

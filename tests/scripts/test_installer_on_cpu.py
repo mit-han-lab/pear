@@ -18,6 +18,7 @@ TARGETS = [
     "numactl",
     "station",
     "server",
+    "claude_code",
     "libero",
     "libero_plus",
     "libero_pro",

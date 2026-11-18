@@ -45,10 +45,12 @@ repos:
       # the training environment's runners leave that directory out, and choose among the others by the suffix.
       - id: test-file-names
         name: a test file is named for where it runs
-        entry: a test file ends with _on_cpu.py, _on_gpu.py or _in_sim.py, the robot station's with _in_station.py
+        entry: >-
+          a test file ends with _on_cpu.py, _on_gpu.py or _in_sim.py, the robot station's with _in_station.py, the
+          Claude Code session service's with _in_claude_code.py
         language: fail
         files: ^tests/(.*/)?test_[^/]*\.py$
-        exclude: ^tests/deploy/station/.*_in_station\.py$|^tests/(?!deploy/station/).*_(on_cpu|on_gpu|in_sim)\.py$
+        exclude: ^tests/deploy/station/.*_in_station\.py$|^tests/deploy/harness/claude_code/.*_in_claude_code\.py$|^tests/(?!deploy/(station|harness/claude_code)/).*_(on_cpu|on_gpu|in_sim)\.py$
 
       # A test starts its Ray cluster through tests/conftest.py (local_ray_cluster), which turns off Ray's usage
       # report and its OpenTelemetry thread; a cluster in a process of its own says where it gets that environment.

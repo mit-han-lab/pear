@@ -20,6 +20,8 @@ engine:
   # would decode every request on vLLM's sampler
   override_generation_config: {temperature: 1.0, top_k: -1, top_p: 0.95, repetition_penalty: 1.0}
   limit_mm_per_prompt: {image: 1016}  # the images of a full context: max_model_len over an image's tokens
+  # the thinking before the answer, which the APIs return apart from the answer: as reasoning, as thinking blocks
+  reasoning_parser: qwen3
   compilation_config:
     cudagraph_mode: FULL_AND_PIECEWISE  # a full graph per decode step, pieces between the attention and GDN cores else
     # 1, 4 and 8: the decode and verify steps; the rest: prefill chunks up to max_num_batched_tokens, replayed

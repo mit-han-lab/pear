@@ -8,6 +8,7 @@
 #   numactl       numactl and numastat, on a machine that lacks them: libero_run runs it
 #   station       the robot station's environment, on the machine a robot is plugged into
 #   server        the model server's environment, on the machine of its GPU
+#   claude_code   the Claude Code session service's environment, on the machine of the model server
 # An environment family's own (scripts/install/sim/<target>/install.sh):
 #   libero        the LIBERO simulator environment
 #   libero_plus   the LIBERO-plus simulator environment
@@ -23,7 +24,8 @@ set -euo pipefail
 
 INSTALL_DIR=$(cd "$(dirname "$0")/install" && pwd)
 TARGETS=(
-  verl evalscope numactl station server libero libero_plus libero_pro robodojo robolab mesa imagemagick libero_run
+  verl evalscope numactl station server claude_code libero libero_plus libero_pro robodojo robolab mesa imagemagick
+  libero_run
 )
 
 for TARGET in "${TARGETS[@]}"; do

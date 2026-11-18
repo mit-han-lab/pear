@@ -61,6 +61,10 @@ server = [
     "vllm", "torch", "flashinfer-python", "numpy", "hydra-core", "omegaconf", "uvloop", "nvidia-cuda-nvcc",
     "nvidia-cuda-crt", "nvidia-nvvm", "nvidia-cuda-cccl", "nvidia-cuda-profiler-api", "flashinfer-cubin", "ninja",
 ]
+# the Claude Code session service (pear/deploy/harness/claude_code), on the machine of the model server: the Agent SDK
+# with the Claude Code CLI its wheel carries, the service's web server and config, the parser of the model server's
+# metrics, the pictures its token counts carry, and the tests
+claude_code = ["claude-agent-sdk", "aiohttp", "hydra-core", "prometheus-client", "pillow", "pytest"]
 
 # the robot station's command, in the station's environment
 [project.scripts]

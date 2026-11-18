@@ -49,5 +49,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: ./.github/actions/training-env
-      # without the robot station's directory, whose conftest imports the station's packages: station.yml runs it
-      - run: $PEAR_PYTHON -m pytest tests --ignore=tests/deploy/station --ignore-glob='*_on_gpu.py' -m "not integration"
+      # without the robot station's directory, whose conftest imports the station's packages, and the Claude Code
+      # session service's, whose tests import the Agent SDK: station.yml and claude_code.yml run them
+      - run: >-
+          $PEAR_PYTHON -m pytest tests --ignore=tests/deploy/station --ignore=tests/deploy/harness/claude_code
+          --ignore-glob='*_on_gpu.py' -m "not integration"
