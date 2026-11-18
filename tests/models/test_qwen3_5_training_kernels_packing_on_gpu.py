@@ -5,11 +5,9 @@ import torch
 import torch.distributed as dist
 
 from verl.utils.device import get_device_capability
-from verl.utils.net_utils import get_free_port
 
 pytestmark = pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Ulysses over two GPUs")
 
-LOCALHOST = "127.0.0.1"
 SP = 2
 TEXT_HIDDEN = 512
 VOCAB = 1000
@@ -185,11 +183,11 @@ def layout_checks(rank: int, model) -> None:
         assert rel_err(split_grad, packed_grad) < GRAD_TOLERANCE
 
 
-def two_rank_checks(rank: int, port: int) -> None:
+def two_rank_checks(rank: int, rendezvous: str) -> None:
     from pear.models.qwen3_5.trainer.training_kernels import Qwen3_5TrainingKernels
 
     torch.cuda.set_device(rank)
-    dist.init_process_group("nccl", init_method=f"tcp://{LOCALHOST}:{port}", rank=rank, world_size=SP)
+    dist.init_process_group("nccl", init_method=f"file://{rendezvous}", rank=rank, world_size=SP)
     try:
         gpu_backend = Qwen3_5TrainingKernels.select_gpu_backend(get_device_capability())
         layout_checks(rank, tiny_model(gpu_backend))
@@ -197,5 +195,7 @@ def two_rank_checks(rank: int, port: int) -> None:
         dist.destroy_process_group()
 
 
-def test_the_model_s_outputs_do_not_depend_on_the_batch_s_layout():
-    torch.multiprocessing.spawn(two_rank_checks, args=(get_free_port(LOCALHOST)[0],), nprocs=SP)
+def test_the_model_s_outputs_do_not_depend_on_the_batch_s_layout(tmp_path):
+    # the ranks meet at a file of the test's own: a free port picked beforehand can be taken by another process
+    # before rank 0 binds it
+    torch.multiprocessing.spawn(two_rank_checks, args=(str(tmp_path / "rendezvous"),), nprocs=SP)

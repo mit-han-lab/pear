@@ -1,4 +1,3 @@
-import os
 from types import SimpleNamespace
 
 import pytest
@@ -10,12 +9,10 @@ from transformers.modeling_outputs import BaseModelOutput
 from pear.models.qwen3_5.trainer.forward_with_torch_backend import ForwardWithTorchBackend
 from pear.models.qwen3_5.trainer.head import Fp32Head, Fp32HeadLogProbs
 from verl.utils.fsdp_utils import MixedPrecisionPolicy, fully_shard
-from verl.utils.net_utils import get_free_port
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="the fp32 head's GEMMs need a GPU")
 
 ROWS = 2 * Fp32HeadLogProbs.CHUNK_ROWS + 37  # three chunks, the last one partial
-LOCALHOST = "127.0.0.1"
 HIDDEN, VOCAB, IDS = 64, 1000, 5
 TEMPERATURE = 0.7
 HEAD = 32  # score centering's head: the sampler's top 32 ids, the label among them
@@ -103,12 +100,11 @@ def test_the_qwen3_5_fused_forward_returns_the_labels_and_the_head_apart():
     torch.testing.assert_close(output.head_log_probs[0], expected[:, 1:])
 
 
-def two_rank_head_gradient(rank: int, port: int) -> None:
+def two_rank_head_gradient(rank: int, rendezvous: str) -> None:
     """One FSDP2 rank of an lm_head unit: the fp32 head reads the gathered bf16 weight and its gradient is reduced."""
-    os.environ.update(MASTER_ADDR=LOCALHOST, MASTER_PORT=str(port))
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)
-    dist.init_process_group("nccl", rank=rank, world_size=2, device_id=device)
+    dist.init_process_group("nccl", init_method=f"file://{rendezvous}", rank=rank, world_size=2, device_id=device)
     torch.manual_seed(0)  # the same fp32 weight on both ranks
     head = torch.nn.Linear(HIDDEN, VOCAB, bias=False, device=device)
     weight = head.weight.detach().clone()
@@ -136,5 +132,7 @@ def two_rank_head_gradient(rank: int, port: int) -> None:
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="two ranks")
-def test_the_fp32_head_of_an_fsdp_unit_reduces_its_gradient_on_two_ranks():
-    torch.multiprocessing.spawn(two_rank_head_gradient, args=(get_free_port(LOCALHOST)[0],), nprocs=2)
+def test_the_fp32_head_of_an_fsdp_unit_reduces_its_gradient_on_two_ranks(tmp_path):
+    # the ranks meet at a file of the test's own: a free port picked beforehand can be taken by another process
+    # before rank 0 binds it
+    torch.multiprocessing.spawn(two_rank_head_gradient, args=(str(tmp_path / "rendezvous"),), nprocs=2)

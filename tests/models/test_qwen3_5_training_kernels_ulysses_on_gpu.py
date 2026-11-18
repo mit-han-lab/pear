@@ -9,11 +9,9 @@ import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
 
 from verl.utils.device import get_device_capability
-from verl.utils.net_utils import get_free_port
 
 pytestmark = pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Ulysses over two GPUs")
 
-LOCALHOST = "127.0.0.1"
 SP = 2
 SMALL_HIDDEN = 512
 LENGTHS = [900, 1700, 402]  # the second sequence crosses the ranks' boundary (3002 tokens, 1501 per rank)
@@ -228,12 +226,12 @@ def attention_checks(rank: int, gpu_backend, kv_heads: int) -> None:
     assert rel_err(recomputed_grad, x64.grad) < 2 * rel_err(baseline_grad, x64.grad)
 
 
-def two_rank_checks(rank: int, port: int) -> None:
+def two_rank_checks(rank: int, rendezvous: str) -> None:
     from pear.models.qwen3_5.trainer.hopper.gpu_backend import HopperTrainingGpuBackend
     from pear.models.qwen3_5.trainer.training_kernels import Qwen3_5TrainingKernels
 
     torch.cuda.set_device(rank)
-    dist.init_process_group("nccl", init_method=f"tcp://{LOCALHOST}:{port}", rank=rank, world_size=SP)
+    dist.init_process_group("nccl", init_method=f"file://{rendezvous}", rank=rank, world_size=SP)
     gpu_backend = Qwen3_5TrainingKernels.select_gpu_backend(get_device_capability())
     gpu_backend.install()
     try:
@@ -249,5 +247,7 @@ def two_rank_checks(rank: int, port: int) -> None:
         dist.destroy_process_group()
 
 
-def test_the_mixers_under_ulysses_on_two_ranks():
-    torch.multiprocessing.spawn(two_rank_checks, args=(get_free_port(LOCALHOST)[0],), nprocs=SP)
+def test_the_mixers_under_ulysses_on_two_ranks(tmp_path):
+    # the ranks meet at a file of the test's own: a free port picked beforehand can be taken by another process
+    # before rank 0 binds it
+    torch.multiprocessing.spawn(two_rank_checks, args=(str(tmp_path / "rendezvous"),), nprocs=SP)

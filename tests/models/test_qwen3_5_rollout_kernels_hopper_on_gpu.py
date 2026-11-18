@@ -41,7 +41,6 @@ from pear.models.qwen3_5.rollout.hopper.extension import HopperExtension
 from pear.models.qwen3_5.rollout.hopper.gdn import CHUNK, FusedGDNDecode, GDNLayout, MixedStepGDNCore
 from pear.models.qwen3_5.rollout.hopper.gpu_backend import HopperRolloutGpuBackend
 from pear.models.qwen3_5.rollout.hopper.sampler import HopperSampler
-from verl.utils.net_utils import get_free_port
 
 # the GPU backend's own tests run on the GPUs that select it
 pytestmark = pytest.mark.skipif(
@@ -66,7 +65,6 @@ PARTIAL_TILE_PAGE = 784  # a page of twelve of the decode kernel's 64-token tile
 HIDDEN = 5120  # the model's hidden size
 VOCAB = 248320
 NORM_BIAS = 1.0  # Qwen3.5's RMSNorm scales by 1 + w (FlashInfer's weight_bias)
-LOCALHOST = "127.0.0.1"
 SAMPLER_ROWS = 64  # a decode step's rows
 MAX_LOGPROBS = HopperSampler.MAX_LOGPROBS  # the largest top-K the sampler's kernels keep
 DRAWS = 50  # sampler calls of the distribution check, over 256 rows each
@@ -334,12 +332,12 @@ def test_the_split_decode_attention_matches_the_reference(page):
                 assert (out[decodes:] == 7.0).all() and not state["counters"].any()
 
 
-def four_rank_checks(rank: int, port: int) -> None:
+def four_rank_checks(rank: int, rendezvous: str) -> None:
     """The decode all-reduce + residual + RMSNorm on one of four ranks, and the decoder layers' op on each path (above
     the mixed-step graphs vLLM's own one for Qwen3.5 on CUDA)."""
     torch.cuda.set_device(rank)
     with set_current_vllm_config(VllmConfig()):
-        init_distributed_environment(TP, rank, f"tcp://{LOCALHOST}:{port}", rank)
+        init_distributed_environment(TP, rank, f"file://{rendezvous}", rank)
         initialize_model_parallel(tensor_model_parallel_size=TP)
     HopperExtension.load()
     AllReduceNorm.register_op()
@@ -425,8 +423,10 @@ def four_rank_checks(rank: int, port: int) -> None:
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < TP, reason="the decode all-reduce runs over four GPUs")
-def test_the_decode_all_reduce_on_four_ranks():
-    torch.multiprocessing.spawn(four_rank_checks, args=(get_free_port(LOCALHOST)[0],), nprocs=TP)
+def test_the_decode_all_reduce_on_four_ranks(tmp_path):
+    # the ranks meet at a file of the test's own: a free port picked beforehand can be taken by another process
+    # before rank 0 binds it
+    torch.multiprocessing.spawn(four_rank_checks, args=(str(tmp_path / "rendezvous"),), nprocs=TP)
 
 
 def test_the_sampler_draws_from_the_softmax(monkeypatch):

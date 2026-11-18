@@ -1,4 +1,3 @@
-import os
 import types
 
 import numpy as np
@@ -36,7 +35,6 @@ from pear.models.qwen3_5.rollout.blackwell.gpu_backend import BlackwellRolloutGp
 from pear.models.qwen3_5.rollout.blackwell.model import AllReduceBuffers, LogitsGatherBuffers
 from pear.models.qwen3_5.rollout.blackwell.rope import Fp32Rope
 from pear.models.qwen3_5.rollout.blackwell.sampler import BlackwellSampler
-from verl.utils.net_utils import get_free_port
 
 # the GPU backend's own tests run on the GPUs that select it
 pytestmark = pytest.mark.skipif(
@@ -55,7 +53,6 @@ HIDDEN = 5120  # the model's hidden size, which the fused all-reduce is built fo
 VOCAB = 248320
 MAX_TOKENS = 8192  # the replicas' max_num_batched_tokens
 MAX_ROWS = 128  # their max_num_seqs
-LOCALHOST = "127.0.0.1"
 L2_EPS = 1e-6  # vLLM's q / k l2norm epsilon, under the square root
 CHUNK = 64  # tokens per chunk of FlashInfer's chunked Gated DeltaNet kernel
 # PEAR's error against fp64 at most this many times vLLM's own path's on the same inputs: its largest and its mean
@@ -514,12 +511,11 @@ def test_a_decode_graph_replays_the_attention_of_longer_contexts():
     torch.testing.assert_close(out.double(), want, rtol=0, atol=2e-2)
 
 
-def two_rank_checks(rank: int, port: int) -> None:
+def two_rank_checks(rank: int, rendezvous: str) -> None:
     """The fused all-reduce + fp32 residual + RMSNorm, the partial-embedding norm and the logits gather on one rank."""
-    os.environ.update(MASTER_ADDR=LOCALHOST, MASTER_PORT=str(port))
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)
-    dist.init_process_group("nccl", rank=rank, world_size=2, device_id=device)
+    dist.init_process_group("nccl", init_method=f"file://{rendezvous}", rank=rank, world_size=2, device_id=device)
     group = dist.group.WORLD
     BlackwellExtension.load()
     # held like the model holds them: the extension keeps only the buffers' addresses
@@ -569,8 +565,10 @@ def two_rank_checks(rank: int, port: int) -> None:
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="the fused all-reduce exchanges between two GPUs")
-def test_the_fused_all_reduce_and_the_logits_gather_on_two_ranks():
-    torch.multiprocessing.spawn(two_rank_checks, args=(get_free_port(LOCALHOST)[0],), nprocs=2)
+def test_the_fused_all_reduce_and_the_logits_gather_on_two_ranks(tmp_path):
+    # the ranks meet at a file of the test's own: a free port picked beforehand can be taken by another process
+    # before rank 0 binds it
+    torch.multiprocessing.spawn(two_rank_checks, args=(str(tmp_path / "rendezvous"),), nprocs=2)
 
 
 def test_the_linear_layers_gemms_match_an_fp32_product():
