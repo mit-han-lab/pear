@@ -1,3 +1,5 @@
+import inspect
+import pathlib
 import pkgutil
 import subprocess
 import sys
@@ -9,11 +11,15 @@ import numpy as np
 import pytest
 import tomllib
 import torch
+import vllm
 from vllm.config import CacheConfig, get_current_vllm_config
 from vllm.config.compilation import CompilationConfig, CUDAGraphMode
+from vllm.model_executor.layers import fused_qk_norm_rope
 from vllm.model_executor.layers.mamba.abstract import get_mamba_prefill_checkpoint_alignment
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import QwenGatedDeltaNetAttention
-from vllm.model_executor.models import ModelRegistry
+from vllm.model_executor.models import ModelRegistry, qwen3_next
+from vllm.model_executor.models.qwen2_moe import Qwen2MoeMLP
+from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 from vllm.model_executor.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from vllm.models import qwen3_5
 from vllm.platforms import current_platform
@@ -34,6 +40,7 @@ from vllm.v1.worker.gpu.sample.sampler import Sampler
 from pear.models.kernels import RolloutKernels
 from pear.models.qwen3_5.gpu_backend import VllmGpuBackend
 from pear.models.qwen3_5.rollout import model as rollout_model
+from pear.models.qwen3_5.rollout.attention import Qwen3_5RolloutAttention
 from pear.models.qwen3_5.rollout.blackwell.attention import (
     SPLIT_FACTOR,
     AttentionStep,
@@ -55,6 +62,7 @@ from pear.models.qwen3_5.rollout.hopper.model_state import HopperRolloutModelSta
 from pear.models.qwen3_5.rollout.hopper.sampler import HopperSampler
 from pear.models.qwen3_5.rollout.hopper.staging import StagedBuffer
 from pear.models.qwen3_5.rollout.hopper.step_input_arrays import StepInputArrays
+from pear.models.qwen3_5.rollout.mlp import Qwen3_5RolloutMLP
 from pear.models.qwen3_5.rollout.model import Qwen3_5RolloutDecoderLayer
 from pear.models.qwen3_5.rollout.rollout_kernels import Qwen3_5RolloutKernels
 from pear.models.qwen3_5.rollout.sampler import RolloutSampler
@@ -567,19 +575,15 @@ def test_the_backends_compute_the_gdn_core_on_vllm_s_fused_decode_path_only(
     assert layer.computes_core(torch.zeros(1, dtype=activations_dtype)) is computes
 
 
-class StandInAttention(torch.nn.Module):
-    """vLLM's full attention as its constructor leaves it for this model on a GPU: its fused q/k norm + RoPE + gate
-    kernel on."""
+def test_the_decoder_layer_builds_the_rollout_attention_and_mlp(monkeypatch):
+    # their own constructors over vLLM's, reduced to what vLLM leaves (an unfused output gate) for want of an engine;
+    # the layer's norms and M-RoPE factor are vLLM's, which need one too
+    def unfused_attention(layer, *args, **kwargs):
+        torch.nn.Module.__init__(layer)
+        layer.use_fused_output_gate = False
 
-    def __init__(self, *args, **kwargs):
-        super().__init__()
-        self.use_fused_qk_norm_rope_gate = True
-
-
-def test_the_decoder_layer_s_attention_takes_no_fused_q_k_norm_rope_kernel(monkeypatch):
-    # the attention alone: the layer's MLP, norms and M-RoPE factor are vLLM's, which need an engine
-    monkeypatch.setattr(rollout_model, "Qwen3NextAttention", StandInAttention)
-    monkeypatch.setattr(rollout_model, "Qwen3NextMLP", lambda **kwargs: torch.nn.Identity())
+    monkeypatch.setattr(Qwen3NextAttention, "__init__", unfused_attention)
+    monkeypatch.setattr(Qwen2MoeMLP, "__init__", lambda mlp, **kwargs: torch.nn.Module.__init__(mlp))
     monkeypatch.setattr(rollout_model, "Qwen3_5RMSNorm", lambda *args, **kwargs: torch.nn.Identity())
     monkeypatch.setattr(rollout_model, "mrope_positions_factor", lambda vllm_config: 1)
     text_config = types.SimpleNamespace(
@@ -594,8 +598,27 @@ def test_the_decoder_layer_s_attention_takes_no_fused_q_k_norm_rope_kernel(monke
 
     layer = Qwen3_5RolloutDecoderLayer(vllm_config, "full_attention", prefix="model.layers.3")
 
-    # q, k and the gate from the layer's own norms and rotary embedding, which a GPU backend may replace
-    assert layer.self_attn.use_fused_qk_norm_rope_gate is False
+    # q, k and the gate from the layer's own fp32 kernel, its output gated by vLLM's fused kernel, its MLP's product
+    # from FlashInfer's: each rounded to bf16 once
+    assert type(layer.self_attn) is Qwen3_5RolloutAttention and layer.self_attn.use_fused_output_gate
+    assert type(layer.mlp) is Qwen3_5RolloutMLP
+
+
+def test_vllm_calls_its_fused_q_k_norm_rope_kernel_only_where_the_rollout_attention_overrides():
+    # vLLM calls fused_qk_rmsnorm_rope_gate from one place, Qwen3NextAttention._project_qkv_gate, which the rollout
+    # attention replaces: no step of a replica, decode, mixed or prefill, reaches the kernel
+    call = f"{fused_qk_norm_rope.fused_qk_rmsnorm_rope_gate.__name__}("
+    definition = pathlib.Path(fused_qk_norm_rope.__file__).resolve()
+    callers = [
+        path.resolve()
+        for path in pathlib.Path(vllm.__file__).parent.rglob("*.py")
+        if path.resolve() != definition and call in path.read_text(errors="replace")
+    ]
+
+    assert callers == [pathlib.Path(qwen3_next.__file__).resolve()]
+    assert inspect.getsource(qwen3_next).count(call) == 1
+    assert inspect.getsource(Qwen3NextAttention._project_qkv_gate).count(call) == 1
+    assert Qwen3_5RolloutAttention._project_qkv_gate is not Qwen3NextAttention._project_qkv_gate
 
 
 def test_the_decode_attention_splits_over_more_ctas(monkeypatch):

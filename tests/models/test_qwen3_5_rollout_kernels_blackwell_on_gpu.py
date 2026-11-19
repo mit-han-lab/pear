@@ -6,14 +6,12 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from flashinfer.utils import get_device_sm_count, get_trtllm_gen_multi_ctas_kv_counter_bytes
-from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.cache import CacheConfig
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import fi_chunk_gated_delta_rule
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator, is_conv_state_dim_first
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_fn
 from vllm.model_executor.layers.mamba.ops.gather_initial_states import gather_initial_states
 from vllm.model_executor.layers.mamba.ops.scatter_states import scatter_states
-from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops import fused_post_conv_prep, fused_sigmoid_gating_delta_rule_update
 from vllm.third_party.flash_linear_attention.ops.layernorm_guard import layer_norm_fwd
@@ -33,7 +31,6 @@ from pear.models.qwen3_5.rollout.blackwell.gdn import BlackwellGDNMetadataBuilde
 from pear.models.qwen3_5.rollout.blackwell.gemm import GemmTableLinearMethod
 from pear.models.qwen3_5.rollout.blackwell.gpu_backend import BlackwellRolloutGpuBackend
 from pear.models.qwen3_5.rollout.blackwell.model import AllReduceBuffers, LogitsGatherBuffers
-from pear.models.qwen3_5.rollout.blackwell.rope import Fp32Rope
 from pear.models.qwen3_5.rollout.blackwell.sampler import BlackwellSampler
 
 # the GPU backend's own tests run on the GPUs that select it
@@ -62,14 +59,6 @@ HEAD = 256  # the attention layers' head size
 Q_HEADS, KV_HEADS = 12, 2  # their heads on one of two ranks
 KV_PAGES = 256  # pages of the attention tests' KV cache
 MAX_CONTEXT = 2352  # the longest context of the attention tests, in tokens
-ROPE = {  # the model's rope_parameters
-    "rope_type": "default",
-    "rope_theta": 1e7,
-    "partial_rotary_factor": 0.25,
-    "mrope_section": [11, 11, 10],
-    "mrope_interleaved": True,
-}
-ROPE_POSITIONS = 4096  # the test cache's positions (the model's: 262144)
 
 
 def gdn_layer(generator: torch.Generator) -> types.SimpleNamespace:
@@ -617,36 +606,3 @@ def test_the_fused_sampler_draws_the_race_with_vllms_log_probs():
         torch.testing.assert_close(logprobs.logprobs, want.logprobs, rtol=0, atol=1e-4)
         if not integers:  # tied log-probs may list their tokens in another order
             assert torch.equal(logprobs.logprob_token_ids.long(), want.logprob_token_ids)
-
-
-@pytest.fixture
-def engine_config():
-    # vLLM's custom ops (the rotary embedding) read the current engine config as they are built
-    with set_current_vllm_config(VllmConfig()):
-        yield
-
-
-@pytest.mark.usefixtures("isolated_rope_cache")
-def test_the_rotary_embedding_rotates_in_fp32(engine_config):
-    rope = get_rope(HEAD, ROPE_POSITIONS, rope_parameters=ROPE, dtype=torch.bfloat16)
-    layer = torch.nn.Module()
-    layer.rotary_emb = rope.to(DEVICE)
-    generator = torch.Generator(device=DEVICE).manual_seed(4)
-    tokens = 300
-    positions = torch.randint(0, ROPE_POSITIONS, (3, tokens), generator=generator, device=DEVICE)  # T / H / W
-    q = torch.randn(tokens, Q_HEADS * HEAD, generator=generator, device=DEVICE).bfloat16()
-    k = torch.randn(tokens, KV_HEADS * HEAD, generator=generator, device=DEVICE).bfloat16()
-    bf16_q, _ = rope.forward_native(positions, q.clone(), k.clone())
-
-    Fp32Rope.install(layer)
-
-    want_q, want_k = rope.forward_native(positions, q.float(), k.float())  # fp32 throughout
-    assert not torch.equal(bf16_q, want_q.bfloat16())
-    # vLLM's path with custom ops off: rotated in fp32, rounded once
-    got_q, got_k = rope.forward_native(positions, q.clone(), k.clone())
-    assert torch.equal(got_q, want_q.bfloat16()) and torch.equal(got_k, want_k.bfloat16())
-    # the mRoPE kernel (custom ops on): within one bf16 step
-    got_q, got_k = rope.forward_cuda(positions, q.clone(), k.clone())
-    torch.testing.assert_close(got_q, want_q.bfloat16(), rtol=2**-7, atol=0)
-    torch.testing.assert_close(got_k, want_k.bfloat16(), rtol=2**-7, atol=0)
-    assert rope.cos_sin_cache.dtype == torch.float32

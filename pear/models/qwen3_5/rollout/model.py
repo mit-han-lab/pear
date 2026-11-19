@@ -10,14 +10,13 @@ from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMetho
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import QwenGatedDeltaNetAttention
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
-from vllm.model_executor.models.qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
 from vllm.model_executor.models.qwen3_5 import (
     Qwen3_5DecoderLayer,
     Qwen3_5ForCausalLM,
     Qwen3_5ForConditionalGeneration,
     Qwen3_5Model,
 )
-from vllm.model_executor.models.qwen3_next import Qwen3NextAttention, Qwen3NextDecoderLayer, Qwen3NextModel
+from vllm.model_executor.models.qwen3_next import Qwen3NextDecoderLayer, Qwen3NextModel
 from vllm.model_executor.models.qwen3_vl import Qwen3_VisionTransformer, mrope_positions_factor
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
@@ -28,7 +27,10 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.tokenizers.registry import cached_tokenizer_from_config
 
+from pear.models.qwen3_5.rollout.attention import Qwen3_5RolloutAttention
+from pear.models.qwen3_5.rollout.mlp import Qwen3_5RolloutMLP
 from pear.models.qwen3_5.rollout.model_state import Qwen3_5RolloutModelState
+from pear.models.qwen3_5.rollout.rope import Fp32Rope
 
 
 class Qwen3_5RolloutDecoderLayer(Qwen3_5DecoderLayer):
@@ -61,7 +63,7 @@ class Qwen3_5RolloutDecoderLayer(Qwen3_5DecoderLayer):
                 reduce_results=self.reduce_results,
             )
         elif layer_type == "full_attention":
-            self.self_attn = Qwen3NextAttention(
+            self.self_attn = Qwen3_5RolloutAttention(
                 config,
                 model_config=vllm_config.model_config,
                 cache_config=vllm_config.cache_config,
@@ -70,13 +72,10 @@ class Qwen3_5RolloutDecoderLayer(Qwen3_5DecoderLayer):
                 reduce_results=self.reduce_results,
                 mrope_positions_factor=mrope_positions_factor(vllm_config),
             )
-            # q, k and the gate from the layer's norms and rotary embedding, which a GPU backend may replace (Fp32Rope),
-            # not from vLLM's fused q/k-norm + RoPE + gate kernel, which does the rotary arithmetic itself
-            self.self_attn.use_fused_qk_norm_rope_gate = False
         else:
             raise ValueError(f"Invalid layer_type {layer_type}")
 
-        self.mlp = Qwen3NextMLP(
+        self.mlp = Qwen3_5RolloutMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
@@ -98,7 +97,8 @@ class Qwen3_5RolloutDecoderLayer(Qwen3_5DecoderLayer):
     }
 )
 class Qwen3_5RolloutModel(Qwen3_5Model):
-    """vLLM's Qwen3.5 language model built from a GPU backend's decoder layer and token embedding."""
+    """vLLM's Qwen3.5 language model built from a GPU backend's decoder layer and token embedding, its rotary embedding
+    in fp32."""
 
     decoder_layer_cls: ClassVar[type[Qwen3_5RolloutDecoderLayer]] = Qwen3_5RolloutDecoderLayer
     embedding_cls: ClassVar[type[VocabParallelEmbedding]] = VocabParallelEmbedding
@@ -129,6 +129,9 @@ class Qwen3_5RolloutModel(Qwen3_5Model):
         else:
             self.norm = PPMissingLayer()
         self.aux_hidden_state_layers: tuple[int, ...] = ()
+
+        # the fp32 cos / sin cache the attention layers' q / k kernel rotates with
+        Fp32Rope.install(self)
 
 
 class Qwen3_5RolloutForCausalLM(Qwen3_5ForCausalLM):
