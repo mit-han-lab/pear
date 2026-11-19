@@ -46,7 +46,6 @@ from pear.models.qwen3_5.rollout.blackwell.gpu_backend import BlackwellRolloutGp
 from pear.models.qwen3_5.rollout.blackwell.model_state import BlackwellRolloutModelState
 from pear.models.qwen3_5.rollout.blackwell.sampler import BlackwellSampler
 from pear.models.qwen3_5.rollout.gdn import RolloutGDNMetadataBuilder
-from pear.models.qwen3_5.rollout.hopper.all_reduce import AllReduceNorm
 from pear.models.qwen3_5.rollout.hopper.attention import HEAD_DIM, QUERY_HEADS, AttentionStepBuffers
 from pear.models.qwen3_5.rollout.hopper.cudagraph import HopperCudaGraphManager, HopperMixedStepGraphs
 from pear.models.qwen3_5.rollout.hopper.gdn import HopperGDNAttention
@@ -478,30 +477,6 @@ def test_the_hopper_graphs_ask_the_attention_backends_under_the_engine_s_config(
 
     with pytest.raises(RuntimeError, match="UNIFORM_BATCH"):
         manager.make_mixed_graphs_full(groups)
-
-
-@pytest.mark.parametrize(
-    "for_capture, input_batch, is_pure_decode",
-    [
-        (True, {"max_query_len": 1}, True),  # a decode graph's capture
-        (True, {"max_query_len": 256}, False),  # a mixed graph's capture: a query as long as the graph
-        (False, {"decode_graph_eligible": True, "num_tokens": 40, "num_reqs": 40}, True),  # a decode step
-        (False, {"decode_graph_eligible": False, "num_tokens": 40, "num_reqs": 40}, False),  # with a new prompt token
-        (False, {"decode_graph_eligible": False, "num_tokens": 900, "num_reqs": 40}, False),  # a mixed step
-    ],
-)
-def test_the_hopper_all_reduce_takes_the_decode_kernels_in_a_pure_decode_step(
-    monkeypatch, for_capture, input_batch, is_pure_decode
-):
-    monkeypatch.setattr(MambaHybridModelState, "prepare_attn", lambda self, *args: {})
-    monkeypatch.setattr(AllReduceNorm, "is_pure_decode", not is_pure_decode)
-    model_state = HopperRolloutModelState.__new__(HopperRolloutModelState)
-
-    model_state.prepare_attn(
-        types.SimpleNamespace(**input_batch), CUDAGraphMode.NONE, None, None, None, None, for_capture=for_capture
-    )
-
-    assert AllReduceNorm.is_pure_decode is is_pure_decode
 
 
 def common_metadata(query_lens: list[int], seq_lens: list[int], is_prefilling: list[bool]) -> CommonAttentionMetadata:

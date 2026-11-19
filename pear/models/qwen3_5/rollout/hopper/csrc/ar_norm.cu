@@ -1,6 +1,6 @@
-// TP all-reduce + residual add + RMSNorm for decode-sized batches as FlashInfer's MNNVL pair (twoshotAllreduceKernel +
-// rmsNormLamport) computes them, with its arithmetic (flashinfer/comm/trtllm_mnnvl_allreduce.cuh, built with
-// -use_fast_math), on an MNNVL Lamport workspace of its own
+// TP all-reduce + add into the fp32 residual stream + RMSNorm: up to the workspace's rows FlashInfer's MNNVL pair
+// (twoshotAllreduceKernel + rmsNormLamport) with its arithmetic (flashinfer/comm/trtllm_mnnvl_allreduce.cuh, built with
+// -use_fast_math) on an MNNVL Lamport workspace of its own, above them the add + RMSNorm after vLLM's all-reduce
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -13,6 +13,7 @@ namespace allreduce {
 
 constexpr int WS = 4;                       // ranks
 constexpr int ELTS = 8;                     // bf16 per thread (one 16-byte packet)
+constexpr int MAX_THREADS = 1024;           // threads of a thread block at most
 constexpr uint32_t NEGZERO32 = 0x80000000u;  // Lamport sentinel word (fp32 -0)
 constexpr int SCATTER = 0, BROADCAST = 1, NUM_STAGES = 2;
 
@@ -109,7 +110,7 @@ struct Flags {
 
 struct Params {
   const __nv_bfloat16* input;  // [T, D] this rank's partial sums (overwritten by norm_out when aliased)
-  __nv_bfloat16* residual;     // [T, D] in: residual, out: input + residual
+  float* residual;             // [T, D] the fp32 residual stream, the reduced row added in place
   const __nv_bfloat16* gamma;  // [D]
   __nv_bfloat16* norm_out;     // [T, D]
   void* const* uc_ptrs;        // [WS] the ranks' workspace buffers (device array)
@@ -119,8 +120,16 @@ struct Params {
   int rank, T, D;
   float eps, weight_bias;
   int vb, nvb;                 // rmsNormLamport's block size (threads) and blocks per token
-  float* r32;                  // [T, D] or null: the residual stream kept in fp32 (decode steps)
-  int r32_init;                // this call starts the stream from the bf16 residual
+};
+
+// The add + RMSNorm of a step above the workspace's rows, after vLLM's all-reduce
+struct AddNormParams {
+  const __nv_bfloat16* reduced;  // [T, D] the all-reduced row-parallel output
+  float* residual;               // [T, D] the fp32 residual stream, the reduced row added in place
+  const __nv_bfloat16* gamma;    // [D]
+  __nv_bfloat16* norm_out;       // [T, D]
+  int D;
+  float eps, weight_bias;
 };
 
 // FlashInfer's grid (per token D/8/128 CTAs of 128 threads, resident beside the preceding GEMM under programmatic
@@ -172,10 +181,52 @@ __global__ void __launch_bounds__(128) ar_twoshot_kernel(const Params p) {
   flag.clear_dirty(p.uc_local, BROADCAST);
 }
 
+// A thread's packet of 8 fp32 residual elements
+__device__ __forceinline__ void load_residual(const float* residual, float (&r)[ELTS]) {
+  const float4* rp = reinterpret_cast<const float4*>(residual);
+  const float4 a = rp[0], b = rp[1];
+  r[0] = a.x;
+  r[1] = a.y;
+  r[2] = a.z;
+  r[3] = a.w;
+  r[4] = b.x;
+  r[5] = b.y;
+  r[6] = b.z;
+  r[7] = b.w;
+}
+
+// x = the residual packet r + the bf16 reduced packet in fp32, stored back as the stream's next residual
+__device__ __forceinline__ void add_packet(float* residual, const float (&r)[ELTS], const uint4& reduced,
+                                           float (&x)[ELTS]) {
+  const uint32_t w[4] = {reduced.x, reduced.y, reduced.z, reduced.w};
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    x[2 * i] = r[2 * i] + bf_lo(w[i]);
+    x[2 * i + 1] = r[2 * i + 1] + bf_hi(w[i]);
+  }
+  float4* rp = reinterpret_cast<float4*>(residual);
+  rp[0] = make_float4(x[0], x[1], x[2], x[3]);
+  rp[1] = make_float4(x[4], x[5], x[6], x[7]);
+}
+
+// A packet of 8 normed elements, (weight_bias + gamma) * x * rcp in bf16, rmsNormLamport's arithmetic
+__device__ __forceinline__ uint4 norm_packet(const float (&x)[ELTS], const uint4& gamma, float rcp, float weight_bias) {
+  const uint32_t gw[4] = {gamma.x, gamma.y, gamma.z, gamma.w};
+  uint32_t ow[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const float n0 = mul_ftz(mul_ftz(add_ftz(weight_bias, bf_lo(gw[i])), x[2 * i]), rcp);
+    const float n1 = mul_ftz(mul_ftz(add_ftz(weight_bias, bf_hi(gw[i])), x[2 * i + 1]), rcp);
+    const __nv_bfloat162 h = __floats2bfloat162_rn(n0, n1);
+    ow[i] = *reinterpret_cast<const uint32_t*>(&h);
+  }
+  return make_uint4(ow[0], ow[1], ow[2], ow[3]);
+}
+
 // ar_twoshot_kernel's programmatic dependent, one CTA per token, one thread per 8 elements: polls the broadcast row,
-// adds the residual (bf16, or the fp32 stream of a decode step) and normalizes; the Lamport flags then rotate (its
-// first CTA's thread 0) once ar_twoshot_kernel is done, as FlashInfer's kernels do
-__global__ void __launch_bounds__(1024) ar_rms_kernel(const Params p) {
+// adds it into the fp32 residual stream and normalizes; the Lamport flags then rotate (its first CTA's thread 0) once
+// ar_twoshot_kernel is done, as FlashInfer's kernels do
+__global__ void __launch_bounds__(MAX_THREADS) ar_rms_kernel(const Params p) {
   __shared__ float warp_sums[32];
   __shared__ float vb_sums[8];
   const int t = blockIdx.x, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
@@ -185,25 +236,13 @@ __global__ void __launch_bounds__(1024) ar_rms_kernel(const Params p) {
   const Flags flag(p.flags);
   __nv_bfloat16* bcast_r = flag.cur_buf(p.uc_local, BROADCAST);
   uint32_t* count = p.flags + 8;
-  // the residual (fp32 stream, or bf16) and gamma before the reduced row arrives
+  float* residual = p.residual + (int64_t)t * p.D + off;
+  // the residual and gamma before the reduced row arrives
   float rr[ELTS];
   uint4 gv = make_uint4(0, 0, 0, 0);
-  const bool stream32 = p.r32 != nullptr;
   if (active) {
     gv = *reinterpret_cast<const uint4*>(p.gamma + off);
-    if (stream32 && !p.r32_init) {
-      const float4* rp = reinterpret_cast<const float4*>(p.r32 + (int64_t)t * p.D + off);
-      const float4 a = rp[0], b = rp[1];
-      rr[0] = a.x; rr[1] = a.y; rr[2] = a.z; rr[3] = a.w; rr[4] = b.x; rr[5] = b.y; rr[6] = b.z; rr[7] = b.w;
-    } else {
-      const uint4 r = *reinterpret_cast<const uint4*>(p.residual + (int64_t)t * p.D + off);
-      const uint32_t w[4] = {r.x, r.y, r.z, r.w};
-#pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        rr[2 * i] = bf_lo(w[i]);
-        rr[2 * i + 1] = bf_hi(w[i]);
-      }
-    }
+    load_residual(residual, rr);
   }
   // arrive early (as rmsNormLamport): the flags rotate once every CTA has read them
   __syncthreads();
@@ -213,30 +252,7 @@ __global__ void __launch_bounds__(1024) ar_rms_kernel(const Params p) {
   if (active) {
     uint4 v = ld_volatile(bcast_r + (int64_t)t * p.D + off);
     while (is_dirty(v)) v = ld_volatile(bcast_r + (int64_t)t * p.D + off);
-    const uint32_t vw[4] = {v.x, v.y, v.z, v.w};
-    if (stream32) {  // r += reduced in fp32; the stream is the next call's residual (the bf16 tensor is not read)
-#pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        x[2 * i] = rr[2 * i] + bf_lo(vw[i]);
-        x[2 * i + 1] = rr[2 * i + 1] + bf_hi(vw[i]);
-      }
-      float4* rp = reinterpret_cast<float4*>(p.r32 + (int64_t)t * p.D + off);
-      rp[0] = make_float4(x[0], x[1], x[2], x[3]);
-      rp[1] = make_float4(x[4], x[5], x[6], x[7]);
-    } else {  // bf16: FlashInfer's PackedVec add, the residual output
-      uint4 sum;
-      __nv_bfloat162* sh = reinterpret_cast<__nv_bfloat162*>(&sum);
-#pragma unroll
-      for (int i = 0; i < 4; ++i)
-        sh[i] = __hadd2(__floats2bfloat162_rn(bf_lo(vw[i]), bf_hi(vw[i])),
-                        __floats2bfloat162_rn(rr[2 * i], rr[2 * i + 1]));
-      *reinterpret_cast<uint4*>(p.residual + (int64_t)t * p.D + off) = sum;
-#pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        x[2 * i] = __low2float(sh[i]);
-        x[2 * i + 1] = __high2float(sh[i]);
-      }
-    }
+    add_packet(residual, rr, v, x);
     // rmsNormLamport's reduction: per thread 8 squares as an FMA chain, a warp xor-tree, per virtual block (its
     // blockSize from adjustGridConfig) a second xor-tree over the warp sums, the blocks' sums in block order
 #pragma unroll
@@ -258,18 +274,8 @@ __global__ void __launch_bounds__(1024) ar_rms_kernel(const Params p) {
     for (int i = 0; i < p.nvb; ++i) full = add_ftz(full, vb_sums[i]);
   }
   const float rcp = rsqrt_approx_ftz(add_ftz(div_approx_ftz(full, (float)p.D), p.eps));
-  if (active) {
-    const uint32_t gw[4] = {gv.x, gv.y, gv.z, gv.w};
-    uint32_t ow[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      const float n0 = mul_ftz(mul_ftz(add_ftz(p.weight_bias, bf_lo(gw[i])), x[2 * i]), rcp);
-      const float n1 = mul_ftz(mul_ftz(add_ftz(p.weight_bias, bf_hi(gw[i])), x[2 * i + 1]), rcp);
-      const __nv_bfloat162 h = __floats2bfloat162_rn(n0, n1);
-      ow[i] = *reinterpret_cast<const uint32_t*>(&h);
-    }
-    *reinterpret_cast<uint4*>(p.norm_out + (int64_t)t * p.D + off) = make_uint4(ow[0], ow[1], ow[2], ow[3]);
-  }
+  if (active)
+    *reinterpret_cast<uint4*>(p.norm_out + (int64_t)t * p.D + off) = norm_packet(x, gv, rcp, p.weight_bias);
   if (t == 0 && tid == 0) {
     // a programmatic dependent orders itself after its primary only by this wait (PTX griddepcontrol): the flags rotate
     // after ar_twoshot_kernel's last clear of the previous call's buffers, which follow the flags it read
@@ -283,10 +289,39 @@ __global__ void __launch_bounds__(1024) ar_rms_kernel(const Params p) {
   }
 }
 
+// After vLLM's all-reduce of a step above the workspace's rows, one CTA per token, one thread per 8 elements (whole
+// warps): adds the reduced row into the fp32 residual stream and normalizes with rmsNormLamport's arithmetic, the warp
+// sums added in warp order; a programmatic dependent that lets its next kernel launch once its inputs are read
+__global__ void __launch_bounds__(MAX_THREADS) add_rms_kernel(const AddNormParams p) {
+  __shared__ float warp_sums[32];
+  const int t = blockIdx.x, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int off = tid * ELTS;
+  float* residual = p.residual + (int64_t)t * p.D + off;
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+  const uint4 gv = *reinterpret_cast<const uint4*>(p.gamma + off);
+  const uint4 v = *reinterpret_cast<const uint4*>(p.reduced + (int64_t)t * p.D + off);
+  float rr[ELTS];
+  load_residual(residual, rr);
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+
+  float x[ELTS];
+  float thread_sum = 0.f;
+  add_packet(residual, rr, v, x);
+#pragma unroll
+  for (int j = 0; j < ELTS; ++j) thread_sum = fma_ftz(x[j], x[j], thread_sum);
+  const float ws = warp_sum_ftz(thread_sum);
+  if (lane == 0) warp_sums[warp] = ws;
+  __syncthreads();
+
+  float full = 0.f;
+  for (int w = 0; w < (int)(blockDim.x >> 5); ++w) full = add_ftz(full, warp_sums[w]);
+  const float rcp = rsqrt_approx_ftz(add_ftz(div_approx_ftz(full, (float)p.D), p.eps));
+  *reinterpret_cast<uint4*>(p.norm_out + (int64_t)t * p.D + off) = norm_packet(x, gv, rcp, p.weight_bias);
+}
 
 // rmsNormLamport's (blockSize, clusterSize) from FlashInfer's adjustGridConfig(numTokens, dim, 8, true), SM90; a block
 // of partial warps rounds up to whole warps, the extra threads idle: the same squares summed in another order (with
-// whole warps and the bf16 residual the outputs are bitwise the pair's)
+// whole warps the arithmetic is the pair's)
 static void norm_config(int T, int D, int sms, int& vb, int& nvb) {
   const int max_cluster = 8;
   int cluster = max_cluster;
@@ -315,20 +350,22 @@ static void norm_config(int T, int D, int sms, int& vb, int& nvb) {
 
 void ar_norm(const torch::Tensor& input, torch::Tensor& residual, const torch::Tensor& gamma, torch::Tensor& norm_out,
              int64_t uc_ptrs_dev, int64_t uc_local, int64_t mc, torch::Tensor& flags, int64_t rank, double eps,
-             double weight_bias, const c10::optional<torch::Tensor>& r32, bool r32_init) {
+             double weight_bias) {
   const int T = input.size(0), D = input.size(1);
-  TORCH_CHECK(input.scalar_type() == at::kBFloat16 && residual.scalar_type() == at::kBFloat16 &&
-                  gamma.scalar_type() == at::kBFloat16 && norm_out.scalar_type() == at::kBFloat16,
+  TORCH_CHECK(input.scalar_type() == at::kBFloat16 && gamma.scalar_type() == at::kBFloat16 &&
+                  norm_out.scalar_type() == at::kBFloat16,
               "ar_norm: bf16");
+  TORCH_CHECK(residual.scalar_type() == at::kFloat && residual.sizes() == input.sizes(),
+              "ar_norm: an fp32 residual of the input's shape");
   TORCH_CHECK(input.is_contiguous() && residual.is_contiguous() && gamma.is_contiguous() && norm_out.is_contiguous(),
               "ar_norm: contiguous");
-  TORCH_CHECK(D % ELTS == 0 && D / ELTS <= 1024 && T >= 1, "ar_norm: shape");
+  TORCH_CHECK(D % ELTS == 0 && D / ELTS <= MAX_THREADS && T >= 1, "ar_norm: shape");
   TORCH_CHECK(flags.scalar_type() == at::kInt && flags.numel() >= 9, "ar_norm: flags (uint32 as int32)");
   static int sms = 0;
   if (!sms) sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
   Params p;
   p.input = reinterpret_cast<const __nv_bfloat16*>(input.data_ptr());
-  p.residual = reinterpret_cast<__nv_bfloat16*>(residual.data_ptr());
+  p.residual = residual.data_ptr<float>();
   p.gamma = reinterpret_cast<const __nv_bfloat16*>(gamma.data_ptr());
   p.norm_out = reinterpret_cast<__nv_bfloat16*>(norm_out.data_ptr());
   p.uc_ptrs = reinterpret_cast<void* const*>(uc_ptrs_dev);
@@ -341,12 +378,6 @@ void ar_norm(const torch::Tensor& input, torch::Tensor& residual, const torch::T
   p.eps = (float)eps;
   p.weight_bias = (float)weight_bias;
   norm_config(T, D, sms, p.vb, p.nvb);
-  p.r32 = nullptr;
-  p.r32_init = r32_init;
-  if (r32.has_value() && r32->defined()) {
-    TORCH_CHECK(r32->scalar_type() == at::kFloat && r32->is_contiguous() && r32->numel() >= (int64_t)T * D, "r32");
-    p.r32 = r32->data_ptr<float>();
-  }
   TORCH_CHECK(p.vb % 32 == 0 && p.vb * p.nvb >= D / ELTS && p.nvb <= 8, "ar_norm: norm config");
   cudaLaunchConfig_t c1 = {};
   c1.gridDim = dim3(T, (D / ELTS + 127) / 128);
@@ -364,12 +395,56 @@ void ar_norm(const torch::Tensor& input, torch::Tensor& residual, const torch::T
   TORCH_CHECK(cudaLaunchKernelEx(&c2, ar_rms_kernel, p) == cudaSuccess, "ar_rms launch");
 }
 
+// reduced: the all-reduced rows [T, D] in bf16; residual: the fp32 stream [T, D], residual += reduced in place;
+// norm_out = rmsnorm(residual) * (weight_bias + gamma) in bf16
+void add_rmsnorm(const torch::Tensor& reduced, torch::Tensor& residual, const torch::Tensor& gamma,
+                 torch::Tensor& norm_out, double eps, double weight_bias) {
+  const int T = reduced.size(0), D = reduced.size(1);
+  TORCH_CHECK(reduced.scalar_type() == at::kBFloat16 && gamma.scalar_type() == at::kBFloat16 &&
+                  norm_out.scalar_type() == at::kBFloat16,
+              "add_rmsnorm: bf16");
+  TORCH_CHECK(residual.scalar_type() == at::kFloat && residual.sizes() == reduced.sizes() &&
+                  norm_out.sizes() == reduced.sizes(),
+              "add_rmsnorm: an fp32 residual and a norm output of the reduced rows' shape");
+  TORCH_CHECK(
+      reduced.is_contiguous() && residual.is_contiguous() && gamma.is_contiguous() && norm_out.is_contiguous(),
+      "add_rmsnorm: contiguous");
+  // one thread per 8 elements, whole warps
+  TORCH_CHECK(D % (ELTS * 32) == 0 && D / ELTS <= MAX_THREADS, "add_rmsnorm: shape");
+  if (T == 0) return;
+
+  AddNormParams p;
+  p.reduced = reinterpret_cast<const __nv_bfloat16*>(reduced.data_ptr());
+  p.residual = residual.data_ptr<float>();
+  p.gamma = reinterpret_cast<const __nv_bfloat16*>(gamma.data_ptr());
+  p.norm_out = reinterpret_cast<__nv_bfloat16*>(norm_out.data_ptr());
+  p.D = D;
+  p.eps = (float)eps;
+  p.weight_bias = (float)weight_bias;
+
+  cudaLaunchConfig_t c = {};
+  c.gridDim = dim3(T);
+  c.blockDim = dim3(D / ELTS);
+  c.stream = at::cuda::getCurrentCUDAStream();
+  cudaLaunchAttribute a[1];
+  a[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  a[0].val.programmaticStreamSerializationAllowed = 1;
+  c.attrs = a;
+  c.numAttrs = 1;
+  TORCH_CHECK(cudaLaunchKernelEx(&c, add_rms_kernel, p) == cudaSuccess, "add_rms launch");
+}
+
 }  // namespace allreduce
 
 TORCH_LIBRARY_FRAGMENT(pear_rollout_hopper, m) {
   m.def(
       "ar_norm(Tensor input, Tensor(a!) residual, Tensor gamma, Tensor(b!) norm_out, int uc_ptrs_dev, int uc_local, "
-      "int mc, Tensor(c!) flags, int rank, float eps, float weight_bias, Tensor(d!)? r32=None, bool r32_init=False) "
-      "-> ()");
+      "int mc, Tensor(c!) flags, int rank, float eps, float weight_bias) -> ()");
+  m.def(
+      "add_rmsnorm(Tensor reduced, Tensor(a!) residual, Tensor gamma, Tensor(b!) norm_out, float eps, "
+      "float weight_bias) -> ()");
 }
-TORCH_LIBRARY_IMPL(pear_rollout_hopper, CUDA, m) { m.impl("ar_norm", &allreduce::ar_norm); }
+TORCH_LIBRARY_IMPL(pear_rollout_hopper, CUDA, m) {
+  m.impl("ar_norm", &allreduce::ar_norm);
+  m.impl("add_rmsnorm", &allreduce::add_rmsnorm);
+}
