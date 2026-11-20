@@ -1,8 +1,10 @@
+import dataclasses
+from typing import NamedTuple, Optional
+
 import numpy as np
 import torch
 import torch.nn.functional as F
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport
@@ -12,9 +14,9 @@ from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadataBuilder,
 )
 
-from pear.models.qwen3_5.rollout.gdn import RolloutGDNAttention, RolloutGDNMetadataBuilder
+from pear.models.qwen3_5.rollout.gdn import GDNProjection, RolloutGDNAttention, RolloutGDNMetadataBuilder
 from pear.models.qwen3_5.rollout.gdn_dims import GDNDims
-from pear.models.qwen3_5.rollout.hopper.staging import StagedBuffer
+from pear.models.qwen3_5.rollout.staged_buffer import StagedBuffer
 
 CHUNK = 64  # FLA's chunk size (csrc/gdn_chunk.cu BT)
 
@@ -97,6 +99,16 @@ class GDNLayout(StagedBuffer):
 
         seq_lens = m.seq_lens_cpu_upper_bound[:n].numpy()
         layout.fill(qsl, num_decodes, (seq_lens - query_lens[:n] > 0).astype(np.int32))
+
+        return layout
+
+    @classmethod
+    def of_rows(cls, vllm_config, m, rows: np.ndarray) -> "GDNLayout":
+        """The layout of a step's given prefill rows (ascending), on their tokens packed in that order."""
+        query_lens = np.diff(m.query_start_loc_cpu.numpy()[: m.num_reqs + 1].astype(np.int64))[rows]
+        layout = cls.of_engine(vllm_config, m.query_start_loc.device)
+        seq_lens = m.seq_lens_cpu_upper_bound.numpy()[rows]
+        layout.fill(np.concatenate([[0], np.cumsum(query_lens)]), 0, (seq_lens - query_lens > 0).astype(np.int32))
 
         return layout
 
@@ -323,53 +335,6 @@ class MixedStepGDNCore:
         )
 
 
-class GDNProjection:
-    """One GEMM for a Gated DeltaNet layer's in_proj_qkvz and in_proj_ba, over one weight both are views of."""
-
-    # in_proj_ba costs a launch per layer at any batch size. The views are made as the layer is built, so the loaders
-    # write into the one tensor; every consumer takes the output's row strides
-    @staticmethod
-    def merge(layer) -> None:
-        """Make the two projections' weights views of one [qkvz; ba] tensor, before the weights load."""
-        qkvz, ba = layer.in_proj_qkvz, layer.in_proj_ba
-        if (
-            getattr(qkvz, "bias", None) is not None
-            or getattr(ba, "bias", None) is not None
-            or not isinstance(qkvz.quant_method, UnquantizedLinearMethod)
-            or not isinstance(ba.quant_method, UnquantizedLinearMethod)
-            or layer.disable_tp_for_ba_proj
-            or layer.gqa_interleaved_layout
-        ):
-            return
-
-        w1, w2 = qkvz.weight, ba.weight
-        if w1.dtype != w2.dtype or w1.shape[1] != w2.shape[1] or not w1.is_contiguous() or not w2.is_contiguous():
-            return
-
-        n = w1.shape[0]
-        qkvzba = torch.empty((n + w2.shape[0], w1.shape[1]), dtype=w1.dtype, device=w1.device)
-        w1.data = qkvzba[:n]
-        w2.data = qkvzba[n:]
-        layer.register_buffer("qkvzba_weight", qkvzba, persistent=False)
-        layer.qkvz_out = n
-
-    @staticmethod
-    def eligible(layer, hidden_states) -> bool:
-        """A merged weight, and activations the layer's core computes."""
-        return getattr(layer, "qkvzba_weight", None) is not None and layer.computes_core(hidden_states)
-
-    @staticmethod
-    def check(model) -> None:
-        """Raise unless every merged layer's projections still view its merged weight (a loader replaced one)."""
-        for module in model.modules():
-            qkvzba = getattr(module, "qkvzba_weight", None)
-            if qkvzba is None:
-                continue
-            qkvz, ba = module.in_proj_qkvz.weight, module.in_proj_ba.weight
-            if qkvz.data_ptr() != qkvzba.data_ptr() or ba.data_ptr() != qkvzba[module.qkvz_out :].data_ptr():
-                raise RuntimeError(f"{module.prefix}: in_proj_qkvz / in_proj_ba no longer view the merged weight")
-
-
 class FusedGDNDecode:
     """The Gated DeltaNet core of a pure decode step as one fused kernel (csrc/gdn_decode.cu)."""
 
@@ -406,14 +371,214 @@ class FusedGDNDecode:
         )
 
 
+class ReplayRecord:
+    """The layout of a Gated DeltaNet layer's replay records: per request two copies (a verify step reads one and writes
+    the other) of its last verify block, the conv inputs from the window before it on, then its b / a rows."""
+
+    TAPS = 3  # the conv window before the block (kTaps of csrc/gdn_verify.cu)
+    COPIES = 2
+    ALIGNMENT = 256  # a copy's size is a multiple of it (bytes)
+
+    @classmethod
+    def ba_offset(cls, dims: GDNDims, max_tokens: int) -> int:
+        """The b / a rows' offset in a copy (bytes): after the window's and the block's bf16 conv inputs."""
+        return (cls.TAPS + max_tokens) * dims.C * torch.bfloat16.itemsize
+
+    @classmethod
+    def allocate(cls, num_requests: int, dims: GDNDims, max_tokens: int, device) -> torch.Tensor:
+        """Zeroed records of num_requests requests for blocks of up to max_tokens tokens."""
+        copy_bytes = cls.ba_offset(dims, max_tokens) + max_tokens * 2 * dims.HV * torch.bfloat16.itemsize
+        copy_bytes = triton.cdiv(copy_bytes, cls.ALIGNMENT) * cls.ALIGNMENT
+
+        return torch.zeros(num_requests, cls.COPIES, copy_bytes, dtype=torch.uint8, device=device)
+
+
+class ReplayStep(NamedTuple):
+    """A step's replaySSM tables: its rows and their slots in every GDN KV cache group."""
+
+    # int32 [rows, 8]: first token, verify tokens (0: not a verify row), request, tokens computed, tokens replayed, the
+    # record copy read, 2 unused
+    rows: torch.Tensor
+    slots: torch.Tensor  # int32 [groups, rows, 4]: source, destination, the block of a boundary inside it (-1: none)
+    max_tokens: int  # tokens of a verify block at most: the records' size
+    block_size: int  # the mamba block size (tokens): the prefix cache's state boundaries
+
+
+class GDNVerifyCore:
+    """A Gated DeltaNet layer's verify rows under replaySSM (csrc/gdn_verify.cu): from each request's slot, the replay
+    of its previous block's committed tokens, this block's outputs with the gated norm, the state written once."""
+
+    @staticmethod
+    def run(layer, mixed_qkvz, ba, core_attn_out, step: ReplayStep, num_rows: int) -> None:
+        """The core of the step's first num_rows rows (a row of no verify tokens is skipped) in the layer's group."""
+        dims = GDNDims.of_layer(layer)
+        torch.ops.pear_rollout_hopper.gdn_verify(
+            mixed_qkvz,
+            ba,
+            core_attn_out,
+            layer.conv1d.weight.view(dims.C, -1),
+            layer.A_log,
+            layer.dt_bias,
+            layer.norm.weight,
+            layer.kv_cache[1],
+            layer.kv_cache[0],
+            layer.replay_record,
+            step.rows,
+            step.slots,
+            layer.replay_group,
+            num_rows,
+            dims.H,
+            step.block_size,
+            step.max_tokens,
+            ReplayRecord.ba_offset(dims, step.max_tokens),
+            layer.head_k_dim**-0.5,
+            layer.norm.eps,
+            layer.norm.activation == "sigmoid",
+            layer.conv_state_dim_first,
+        )
+
+
+class ReplayState:
+    """The replaySSM bookkeeping of a speculative replica (one per process, made by its model state with the KV caches):
+    each request's replay count and record copy, the step's rows and their slots in every GDN KV cache group and the
+    layers' table of the flush after sampling."""
+
+    # a step's row and a row's slots in a group (ReplayStep; kRowInts, kSlotInts of csrc/gdn_verify.cu)
+    ROW_INTS = 8
+    SLOT_INTS = 4
+    instance: Optional["ReplayState"] = None
+
+    def __init__(self, groups: list[list], max_num_reqs: int, max_tokens: int, block_size: int, device):
+        layers = [layer for group_layers in groups for layer in group_layers]
+        self.dims = GDNDims.of_layer(layers[0])
+        self.max_tokens, self.block_size = max_tokens, block_size
+        self.scale = layers[0].head_k_dim ** -0.5
+        self.replay = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
+        self.parity = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
+        self.rows = torch.zeros(max_num_reqs, self.ROW_INTS, dtype=torch.int32, device=device)
+        self.slots = torch.full((len(groups), max_num_reqs, self.SLOT_INTS), -1, dtype=torch.int32, device=device)
+        # a mixed step's verify rows, uploaded from pinned buffers
+        self.verify_rows = StagedBuffer(max_num_reqs, device, torch.uint8)
+
+        # each layer's group, the order of the slots' groups; the flush's per-layer descriptors
+        group_ids = []
+        for group_id, group_layers in enumerate(groups):
+            for layer in group_layers:
+                layer.replay_group = group_id
+                group_ids.append(group_id)
+        self.layer_table = torch.ops.pear_rollout_hopper.gdn_layer_table(
+            [layer.kv_cache[1] for layer in layers],
+            [layer.kv_cache[0] for layer in layers],
+            [layer.replay_record for layer in layers],
+            [layer.conv1d.weight.view(self.dims.C, -1) for layer in layers],
+            [layer.A_log for layer in layers],
+            [layer.dt_bias for layer in layers],
+            [layer.norm.weight for layer in layers],
+            group_ids,
+            layers[0].conv_state_dim_first,
+        )
+
+    def preprocess(self, model_state, input_batch, num_computed_tokens: torch.Tensor, is_verify) -> None:
+        """The step's rows and slots before the forward (vLLM's align bookkeeping with them), and vLLM's pre-copy of the
+        other rows' states when there are any."""
+        ctx = model_state._mamba_ctx
+        verify_rows = None
+        if is_verify is not None:
+            num_rows = is_verify.shape[0]
+            self.verify_rows.next_stage()[:num_rows] = is_verify
+            self.verify_rows.upload(num_rows)
+            verify_rows = self.verify_rows.device_buffer[:num_rows]
+
+        torch.ops.pear_rollout_hopper.gdn_replay_meta(
+            input_batch.idx_mapping,
+            input_batch.query_start_loc,
+            num_computed_tokens,
+            verify_rows,
+            self.replay,
+            self.parity,
+            model_state._mamba_state_idx_gpu,
+            model_state._mamba_src_col_gpu,
+            model_state._mamba_src_off_gpu,
+            model_state.num_accepted_tokens_gpu,
+            ctx.aligned_index_block_table_ptrs,
+            ctx.block_table_stride_req,
+            input_batch.num_reqs,
+            input_batch.num_reqs_after_padding,
+            self.block_size,
+            self.rows,
+            self.slots,
+        )
+        if is_verify is not None:
+            ctx.run_fused_precopy(
+                input_batch.num_reqs,
+                model_state._mamba_state_idx_gpu,
+                model_state._mamba_src_col_gpu,
+                model_state._mamba_src_off_gpu,
+                input_batch.idx_mapping,
+            )
+
+    def step(self) -> ReplayStep:
+        """The tables of the step being run."""
+        return ReplayStep(self.rows, self.slots, self.max_tokens, self.block_size)
+
+    def postprocess(self, model_state, idx_mapping: torch.Tensor, num_sampled: torch.Tensor) -> None:
+        """After sampling: the boundary states the step's committed tokens reached, the requests' replay counts and
+        record copies, vLLM's accepted counts."""
+        torch.ops.pear_rollout_hopper.gdn_commit(
+            self.layer_table,
+            self.rows,
+            self.slots,
+            self.replay,
+            self.parity,
+            model_state.num_accepted_tokens_gpu,
+            idx_mapping,
+            num_sampled.to(torch.int32),
+            self.dims.H,
+            self.dims.HV,
+            self.block_size,
+            self.max_tokens,
+            ReplayRecord.ba_offset(self.dims, self.max_tokens),
+            self.scale,
+        )
+
+
+@dataclasses.dataclass
+class ReplayMetadata:
+    """The GDN metadata of a speculative replica's step: its verify rows under replaySSM (rows of ReplayState's tables
+    below num_rows; the core skips the others) and, in a mixed step, its prefill rows on MixedStepGDNCore's layout."""
+
+    num_rows: int
+    prefill: GDNAttentionMetadata | None = None
+    prefill_rows: np.ndarray | None = None  # the step's prefill rows, ascending
+    # their tokens: the step's last ones, or gathered when verify rows follow them
+    prefill_tokens: slice | torch.Tensor | None = None
+
+
 class HopperGDNAttention(RolloutGDNAttention):
     """vLLM's Qwen Gated DeltaNet layer on one projection GEMM, MixedStepGDNCore in a mixed step and the fused decode
-    kernel (registered out of tree in its place)."""
+    kernel (registered out of tree in its place); with a drafter its verify rows on GDNVerifyCore under replaySSM."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         GDNProjection.merge(self)
         self.conv_state_dim_first = is_conv_state_dim_first()  # the conv state's layout, fixed for the process
+
+        # replaySSM: each request's last verify block, for the next step to replay its committed tokens, and the
+        # layer's mamba KV cache group among ReplayState's, set with the KV caches
+        self.replay_record = None
+        if self.num_spec > 0:
+            self.replay_record = ReplayRecord.allocate(
+                self.vllm_config.scheduler_config.max_num_seqs,
+                GDNDims.of_layer(self),
+                self.num_spec + 1,
+                self.A_log.device,
+            )
+        self.replay_group = None
+
+    def get_kv_cache_spec(self, vllm_config):
+        # one state slot per request, from which a verify step replays the committed tokens of the request's last block,
+        # in place of vLLM's slot per draft token (with a drafter; without one there are none)
+        return dataclasses.replace(super().get_kv_cache_spec(vllm_config), num_speculative_blocks=0)
 
     def forward_cuda(self, hidden_states):
         if not GDNProjection.eligible(self, hidden_states):
@@ -433,6 +598,9 @@ class HopperGDNAttention(RolloutGDNAttention):
         # no metadata of the layer (a profiling run leaves the GDN groups out): vLLM's warm-up of its prefill kernels
         attn_metadata = get_forward_context().attn_metadata
         md = attn_metadata.get(self.prefix) if isinstance(attn_metadata, dict) else None
+        if isinstance(md, ReplayMetadata):
+            self.replay_core(mixed_qkvz, ba, core_attn_out, md)
+            return
         layout = getattr(md, "_pear_layout", None)
 
         if layout is not None:
@@ -454,18 +622,43 @@ class HopperGDNAttention(RolloutGDNAttention):
 
         super()._forward_core_fused_norm_packed(mixed_qkvz, ba, core_attn_out)
 
+    def replay_core(self, mixed_qkvz, ba, core_attn_out, md: ReplayMetadata) -> None:
+        """A speculative replica's step: its verify rows on GDNVerifyCore, then its prefill rows on MixedStepGDNCore."""
+        if md.num_rows > 0:
+            GDNVerifyCore.run(self, mixed_qkvz, ba, core_attn_out, ReplayState.instance.step(), md.num_rows)
+        if md.prefill is None:
+            return
+
+        tokens, prefill = md.prefill_tokens, md.prefill
+        rows_args = (prefill._pear_layout, prefill.non_spec_state_indices_tensor, prefill.has_initial_state)
+        if isinstance(tokens, slice):
+            MixedStepGDNCore.mixed_step(self, *rows_args, mixed_qkvz[tokens], ba[tokens], core_attn_out[tokens])
+            return
+        # verify rows behind prefill rows: the prefill rows' tokens gathered, their outputs scattered back
+        out = core_attn_out.new_zeros((tokens.numel(), *core_attn_out.shape[1:]))
+        MixedStepGDNCore.mixed_step(
+            self, *rows_args, mixed_qkvz.index_select(0, tokens), ba.index_select(0, tokens), out
+        )
+        core_attn_out.index_copy_(0, tokens, out)
+
 
 class HopperGDNMetadataBuilder(RolloutGDNMetadataBuilder):
     """vLLM's GDN metadata builder with a mixed step's layout for MixedStepGDNCore, which runs any mixed step of a
     graph's size in a FULL graph; the other GDN groups' metadata derives from the first group's (update_block_table)."""
-
-    _cudagraph_support = AttentionCGSupport.ALWAYS
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
 
         # this group's state slots in a mixed step, at the address its FULL mixed-step graphs read
         self.mixed_step_slots = torch.zeros(vllm_config.scheduler_config.max_num_seqs, dtype=torch.int32, device=device)
+
+    @classmethod
+    def get_cudagraph_support(cls, vllm_config, kv_cache_spec) -> AttentionCGSupport:
+        # any step on the mixed-step layout in a FULL graph; with a drafter vLLM's FULL graphs of uniform batches alone:
+        # a mixed step's ReplayMetadata gives its verify rows' count and prefill tokens on the host
+        if vllm_config.speculative_config is not None:
+            return super().get_cudagraph_support(vllm_config, kv_cache_spec)
+        return AttentionCGSupport.ALWAYS
 
     def build(
         self,
@@ -475,10 +668,12 @@ class HopperGDNMetadataBuilder(RolloutGDNMetadataBuilder):
         num_decode_draft_tokens_cpu=None,
         fast_build=False,
     ):
-        # a step with prefill rows on the mixed-step layout, whichever graph replays it; a pure decode step and a
-        # drafter's steps as vLLM builds them (vLLM's V2 runner hands every GDN build the draft-token arguments, None
-        # without a drafter)
+        # with a drafter every step's ReplayMetadata (vLLM's V2 runner hands every GDN build the draft-token arguments);
+        # without one a step with prefill rows on the mixed-step layout, whichever graph replays it, and a pure decode
+        # step as vLLM builds it
         m = common_attn_metadata
+        if self.use_spec_decode:
+            return self.replay_metadata(m, num_decode_draft_tokens_cpu)
         num_decodes = self.num_decodes(m)
         if num_decode_draft_tokens_cpu is None and num_decodes < m.num_reqs:
             layout = GDNLayout.of_step(self.vllm_config, m, num_decodes)
@@ -486,11 +681,42 @@ class HopperGDNMetadataBuilder(RolloutGDNMetadataBuilder):
 
         return super().build(common_prefix_len, m, num_accepted_tokens, num_decode_draft_tokens_cpu, fast_build)
 
+    def replay_metadata(self, m, num_decode_draft_tokens_cpu) -> ReplayMetadata:
+        """A speculative step's metadata: its verify rows (those with a draft count), its prefill rows (the others with
+        tokens) on the mixed-step layout."""
+        num_reqs = m.num_reqs
+        query_starts = m.query_start_loc_cpu.numpy()[: num_reqs + 1]
+        is_prefill = (num_decode_draft_tokens_cpu.numpy()[:num_reqs] < 0) & (np.diff(query_starts) > 0)
+        if not is_prefill.any():
+            return ReplayMetadata(num_rows=num_reqs)
+
+        rows = np.flatnonzero(is_prefill)
+        layout = GDNLayout.of_rows(self.vllm_config, m, rows)
+        prefill = self.mixed_step_metadata(m.block_table_tensor, layout.T, layout, rows)
+        first = int(rows[0])
+        if is_prefill[first:].all():
+            # the step's last rows, as vLLM's runner sorts the rows with drafts first
+            tokens = slice(int(query_starts[first]), int(query_starts[num_reqs]))
+            return ReplayMetadata(num_rows=first, prefill=prefill, prefill_rows=rows, prefill_tokens=tokens)
+
+        # vLLM's runner sorts a prompt chunk of k + 1 tokens before a decode row without drafts: the verify core takes
+        # every row, MixedStepGDNCore the prefill rows' tokens gathered
+        tokens = np.concatenate([np.arange(query_starts[row], query_starts[row + 1]) for row in rows])
+        return ReplayMetadata(
+            num_rows=num_reqs,
+            prefill=prefill,
+            prefill_rows=rows,
+            prefill_tokens=torch.from_numpy(tokens).to(m.query_start_loc.device),
+        )
+
     def build_for_cudagraph_capture(self, common_attn_metadata):
-        # a decode graph's batch (one token per request) as vLLM builds it; a mixed-step graph over the layout without
-        # tokens: a replay touches nothing until a step fills it
+        # a FULL graph's verify step reads the rows the runner's preprocess writes before each replay (a capture finds
+        # none: every step's commit ends its rows); a decode graph's batch (one token per request) as vLLM builds it; a
+        # mixed-step graph over the layout without tokens: a replay touches nothing until a step fills it
         m = common_attn_metadata
-        if self.use_spec_decode or m.max_query_len <= 1:
+        if self.use_spec_decode:
+            return ReplayMetadata(num_rows=m.num_reqs)
+        if m.max_query_len <= 1:
             return super().build_for_cudagraph_capture(m)
 
         layout = GDNLayout.of_engine(self.vllm_config, m.query_start_loc.device)
@@ -499,15 +725,33 @@ class HopperGDNMetadataBuilder(RolloutGDNMetadataBuilder):
         return self.mixed_step_metadata(m.block_table_tensor, m.num_actual_tokens, layout)
 
     def update_block_table(self, metadata, blk_table, slot_mapping):
+        if isinstance(metadata, ReplayMetadata):
+            if metadata.prefill is None:
+                return metadata
+            prefill = metadata.prefill
+            prefill = self.mixed_step_metadata(
+                blk_table, prefill.num_actual_tokens, prefill._pear_layout, metadata.prefill_rows
+            )
+            return dataclasses.replace(metadata, prefill=prefill)
         layout = getattr(metadata, "_pear_layout", None)
         if layout is None:
             return super().update_block_table(metadata, blk_table, slot_mapping)
 
         return self.mixed_step_metadata(blk_table, metadata.num_actual_tokens, layout)
 
-    def mixed_step_metadata(self, block_table, num_actual_tokens: int, layout: GDNLayout) -> GDNAttentionMetadata:
-        """vLLM's GDN metadata of a mixed step with its layout and this group's state slots."""
-        self.mixed_step_slots[: layout.N].copy_(self.state_slots(block_table, layout.N))
+    def mixed_step_metadata(
+        self, block_table, num_actual_tokens: int, layout: GDNLayout, rows: np.ndarray | None = None
+    ) -> GDNAttentionMetadata:
+        """vLLM's GDN metadata of a mixed step with its layout and this group's state slots: of the step's first
+        layout.N rows, or of the given rows (ascending)."""
+        if rows is None:
+            self.mixed_step_slots[: layout.N].copy_(self.state_slots(block_table, layout.N))
+        else:
+            slots = self.state_slots(block_table, int(rows[-1]) + 1)
+            if rows[-1] - rows[0] + 1 == len(rows):
+                self.mixed_step_slots[: layout.N].copy_(slots[int(rows[0]) :])
+            else:
+                self.mixed_step_slots[: layout.N].copy_(slots[torch.from_numpy(rows).to(slots.device)])
 
         md = GDNAttentionMetadata(
             num_prefills=layout.P,

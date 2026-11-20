@@ -10,6 +10,10 @@ verl's tests and keep its copyright line.
 This product includes software derived from LMCache (https://github.com/LMCache/LMCache),
 licensed under the Apache License, Version 2.0: the patches under 3rdparty/LMCache/patches change LMCache's code.
 
+This product includes software derived from vLLM (https://github.com/vllm-project/vllm), Copyright contributors to
+the vLLM project, licensed under the Apache License, Version 2.0: pear/rollout/top_p.py derives from vLLM's
+vllm/v1/sample/ops/topk_topp_triton.py, changed as its header states, and keeps its copyright line.
+
 This product includes the robot description of the SO-101 arm from SO-ARM100
 (https://github.com/TheRobotStudio/SO-ARM100), licensed under the Apache License, Version 2.0:
 pear/deploy/station/control/robots/so101/description/so101_new_calib.urdf, changed as the README.md beside it

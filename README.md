@@ -26,12 +26,13 @@ an open 27B reasoning model learns to use real robots entirely in simulation, wi
 
 PEAR trains with:
 
-- Fully asynchronous RL on [veRL](https://github.com/volcengine/verl)
-- GRPO, dynamic sampling, and Score Centering
+- Fully asynchronous RL on [verl](https://github.com/volcengine/verl)
+- GRPO, dynamic sampling, and score centering
 - FSDP and sequence parallelism for long-context training
 - Memory-efficient training with gradient checkpointing and activation offloading
 - Prefix caching across rounds, with [LMCache](https://github.com/LMCache/LMCache) offloading the KV cache to CPU
   memory
+- Rollouts with MTP speculative decoding
 - Optimized kernels for H100, H200 and GB300
 - Simulators on the same Ray cluster: MuJoCo on CPUs, Isaac Sim on GPUs
 
@@ -47,7 +48,9 @@ PEAR deploys with:
 
 ## News
 
-- [2026/11] 🔥 Check out our latest [DFlash2 checkpoint](https://huggingface.co/mit-han-lab/Qwen3.8-27B-PEAR-DFlash2) for Qwen3.8-27B-PEAR! With it, the NVFP4 model decodes at **921 tokens/s** on one GB300 and **262 tokens/s** on one RTX 5090!
+- [2026/11] PEAR now trains **with MTP speculative decoding by default**, which makes end-to-end training **~40% faster**.
+- [2026/11] We released a [DFlash2 checkpoint](https://huggingface.co/mit-han-lab/Qwen3.8-27B-PEAR-DFlash2) for Qwen3.8-27B-PEAR. With it, the NVFP4 model decodes at **921 tokens/s** on one GB300 and **262 tokens/s** on one RTX 5090.
+- [2026/11] The robot station can now serve the model through [Claude Code](examples/models/qwen3_8_27b_pear/deploy/README.md#serve-through-claude-code), which compacts a task's conversation whenever the context fills, supporting tasks of unlimited length!
 
 ## Getting Started
 
@@ -97,5 +100,5 @@ Then start a Ray cluster and launch your first run:
 
 ## Acknowledgment
 
-PEAR is built upon [veRL](https://github.com/volcengine/verl) and [LMCache](https://github.com/LMCache/LMCache), and
+PEAR is built upon [verl](https://github.com/volcengine/verl) and [LMCache](https://github.com/LMCache/LMCache), and
 uses [vLLM](https://github.com/vllm-project/vllm), and [Ray](https://github.com/ray-project/ray).

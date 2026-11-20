@@ -24,10 +24,12 @@ from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
 from vllm.v1.worker.utils import select_common_block_size
 
+from nonfinite_rows import NonfiniteRows
 from pear.models.qwen3_5.rollout.blackwell.attention import AttentionStep, BlackwellFlashInferImpl, KVCacheViews
 from pear.models.qwen3_5.rollout.blackwell.extension import BlackwellExtension
 from pear.models.qwen3_5.rollout.blackwell.flashinfer_launchers import FlashInferChunk
-from pear.models.qwen3_5.rollout.blackwell.gdn import BlackwellGDNMetadataBuilder, GDNCore
+from pear.models.qwen3_5.rollout.blackwell.gdn.core import GDNCore
+from pear.models.qwen3_5.rollout.blackwell.gdn.layer import BlackwellGDNMetadataBuilder
 from pear.models.qwen3_5.rollout.blackwell.gemm import GemmTableLinearMethod
 from pear.models.qwen3_5.rollout.blackwell.gpu_backend import BlackwellRolloutGpuBackend
 from pear.models.qwen3_5.rollout.blackwell.model import AllReduceBuffers, LogitsGatherBuffers
@@ -50,6 +52,11 @@ HIDDEN = 5120  # the model's hidden size, which the fused all-reduce is built fo
 VOCAB = 248320
 MAX_TOKENS = 8192  # the replicas' max_num_batched_tokens
 MAX_ROWS = 128  # their max_num_seqs
+TOO_MANY_ROWS = 65536  # one row more than a grid's y dimension takes (65535)
+SHORT_VOCAB = 128  # a vocabulary short enough for that many rows
+REFUSED_LAUNCH = "CUDA error: invalid (configuration )?argument"  # the runtime's errors for launch parameters
+NONFINITE_TEMPERATURE = 0.8  # the temperature of the sampler's rows of NaN and infinite logits
+NONFINITE_REQUESTS = ["a-finite-request", "the-request"]  # the step's requests: a finite row, then the row of a kind
 L2_EPS = 1e-6  # vLLM's q / k l2norm epsilon, under the square root
 CHUNK = 64  # tokens per chunk of FlashInfer's chunked Gated DeltaNet kernel
 # PEAR's error against fp64 at most this many times vLLM's own path's on the same inputs: its largest and its mean
@@ -88,7 +95,7 @@ def l2norm(x: torch.Tensor) -> torch.Tensor:
 
 
 def conv_window(conv_state: torch.Tensor) -> torch.Tensor:
-    """A slot's conv state as [3, C], whichever layout vLLM keeps it in."""
+    """A slot's conv state as [columns, C], whichever layout vLLM keeps it in."""
     return conv_state.transpose(-1, -2) if is_conv_state_dim_first() else conv_state
 
 
@@ -100,29 +107,35 @@ def delta_rule_step(state, q, k, v, alpha, beta):
     return torch.einsum("hvk,hk->hv", state, q), state
 
 
-def reference_core(layer, states, qkvz, ba, query_lens, slots, init):
-    """The Gated DeltaNet core in fp64, token by token: the output rows, each sequence's conv window and state."""
-    conv_state, ssm = states
+def reference_token(layer, window, state, qkvz_row, ba_row):
+    """One token of the Gated DeltaNet core in fp64: its output row, the conv window and the state after it."""
     w = layer.conv1d.weight.double()
-    decay = -layer.A_log.double().exp()
+    x = qkvz_row[:C].double()
+    acc = (window * w[:, :3].T).sum(0) + x * w[:, 3]
+    window = torch.cat([window[1:], x[None]])
+    conv = acc * torch.sigmoid(acc)
+    q = l2norm(conv[: H * K].view(H, K)).repeat_interleave(HV // H, 0) * K**-0.5
+    k = l2norm(conv[H * K : 2 * H * K].view(H, K)).repeat_interleave(HV // H, 0)
+    alpha = (-layer.A_log.double().exp() * F.softplus(ba_row[HV:].double() + layer.dt_bias.double())).exp()
+    beta = torch.sigmoid(ba_row[:HV].double())
+    o, state = delta_rule_step(state, q, k, conv[2 * H * K :].view(HV, V), alpha, beta)
+    z = qkvz_row[C:].double().view(HV, V)
+    out = o * torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + EPS) * layer.norm.weight.double() * F.silu(z)
+    return out, window, state
+
+
+def reference_core(layer, states, qkvz, ba, query_lens, slots, init):
+    """The Gated DeltaNet core in fp64, token by token: the output rows, each sequence's conv window and state (a
+    prefill or decode row's window is its conv state's first 3 columns)."""
+    conv_state, ssm = states
     qsl = np.concatenate([[0], np.cumsum(query_lens)])
     out = torch.zeros(int(qsl[-1]), HV, V, dtype=torch.float64, device=DEVICE)
     windows, finals = [], []
     for i, slot in enumerate(slots):
-        window = conv_window(conv_state[slot]).double() * init[i]
+        window = conv_window(conv_state[slot])[: CONV_WIDTH - 1].double() * init[i]
         state = ssm[slot].double() * init[i]
         for t in range(qsl[i], qsl[i + 1]):
-            x = qkvz[t, :C].double()
-            acc = (window * w[:, :3].T).sum(0) + x * w[:, 3]
-            window = torch.cat([window[1:], x[None]])
-            conv = acc * torch.sigmoid(acc)
-            q = l2norm(conv[: H * K].view(H, K)).repeat_interleave(HV // H, 0) * K**-0.5
-            k = l2norm(conv[H * K : 2 * H * K].view(H, K)).repeat_interleave(HV // H, 0)
-            alpha = (decay * F.softplus(ba[t, HV:].double() + layer.dt_bias.double())).exp()
-            beta = torch.sigmoid(ba[t, :HV].double())
-            o, state = delta_rule_step(state, q, k, conv[2 * H * K :].view(HV, V), alpha, beta)
-            z = qkvz[t, C:].double().view(HV, V)
-            out[t] = o * torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + EPS) * layer.norm.weight.double() * F.silu(z)
+            out[t], window, state = reference_token(layer, window, state, qkvz[t], ba[t])
         windows.append(window)
         finals.append(state)
     return out, windows, finals
@@ -402,13 +415,17 @@ def attention_impl() -> BlackwellFlashInferImpl:
 
 
 def attention_metadata(seq_lens, query_lens, num_decodes, tables, decode_max_seq_len) -> types.SimpleNamespace:
-    """The FlashInfer metadata attend() reads: the decode rows (one query token each), then the prefill rows."""
+    """The FlashInfer metadata attend() reads: the decode rows (one query token each, or a verify row's last token and
+    its drafts), then the prefill rows."""
     lens = torch.tensor(seq_lens, dtype=torch.int32, device=DEVICE)
     prefill_lens = query_lens[num_decodes:]
     decode = prefill = None
     if num_decodes:
         decode = types.SimpleNamespace(
-            block_tables=tables[:num_decodes], seq_lens=lens[:num_decodes], max_seq_len=decode_max_seq_len
+            block_tables=tables[:num_decodes],
+            seq_lens=lens[:num_decodes],
+            max_seq_len=decode_max_seq_len,
+            q_len_per_req=query_lens[0],
         )
     if prefill_lens:
         prefill = types.SimpleNamespace(
@@ -421,7 +438,8 @@ def attention_metadata(seq_lens, query_lens, num_decodes, tables, decode_max_seq
         )
 
     return types.SimpleNamespace(
-        num_decode_tokens=num_decodes,
+        num_decodes=num_decodes,
+        num_decode_tokens=sum(query_lens[:num_decodes]),
         num_actual_tokens=sum(query_lens),
         num_prefills=len(prefill_lens),
         kv_cache_layout=KVCacheLayout.LBHNC,
@@ -466,6 +484,32 @@ def test_the_attention_of_a_mixed_step_matches_the_reference(num_decodes):
     attention_impl().attend(query, kv_cache, md, out)
 
     torch.cuda.synchronize()
+    want = reference_attention(query, kv_cache, tables, seq_lens, query_lens)
+    torch.testing.assert_close(out.double(), want, rtol=0, atol=2e-2)
+
+
+@pytest.mark.parametrize("num_decodes", [5, AttentionStep.SORT_MIN_ROWS + 8])  # the verify rows in order, or sorted
+@pytest.mark.parametrize("num_speculative_tokens", [3, 7])
+def test_the_attention_of_verify_rows_beside_prefill_rows_matches_the_reference(num_decodes, num_speculative_tokens):
+    generator = torch.Generator(device=DEVICE).manual_seed(8)
+    rng = np.random.default_rng(8)
+    page = attention_page()
+    q_len = num_speculative_tokens + 1  # a verify row's last token and its drafts
+    kv_cache = torch.randn(KV_PAGES, KV_HEADS, page, 2 * HEAD, generator=generator, device=DEVICE).bfloat16()
+    # verify rows over a one-token context, ending at a page's end and a token past it, over other contexts; then a new
+    # turn's prompt chunks as in a mixed step
+    verify_lens = [q_len + 1, page, page + 1, *rng.integers(q_len + 1, MAX_CONTEXT, num_decodes - 3).tolist()]
+    query_lens = [q_len] * num_decodes + [100, 37, 64]
+    seq_lens = verify_lens + [100, 900 + 37, page + 64]
+    tables = torch.randint(0, KV_PAGES, (len(seq_lens), cdiv(MAX_CONTEXT, page)), generator=generator, device=DEVICE)
+    query = (torch.randn(sum(query_lens), Q_HEADS, HEAD, generator=generator, device=DEVICE) * 2).bfloat16()
+    md = attention_metadata(seq_lens, query_lens, num_decodes, tables.int(), max(verify_lens))
+    out = torch.full_like(query, 7.0)
+
+    attention_impl().attend(query, kv_cache, md, out)
+
+    torch.cuda.synchronize()
+    # each verify token attends causally within its row: the KV up to its own position
     want = reference_attention(query, kv_cache, tables, seq_lens, query_lens)
     torch.testing.assert_close(out.double(), want, rtol=0, atol=2e-2)
 
@@ -593,7 +637,7 @@ def test_the_fused_sampler_draws_the_race_with_vllms_log_probs():
         temperatures = torch.full((rows,), temperature, device=DEVICE)
 
         torch.cuda.manual_seed(rows)  # the same noise for both
-        sampled, logprobs = sampler.draw(logits.clone(), temperatures, k)
+        sampled, logprobs, nonfinite = sampler.draw(logits.clone(), temperatures, k)
         torch.cuda.manual_seed(rows)
         noise = torch.empty_like(logits).exponential_()
 
@@ -601,8 +645,59 @@ def test_the_fused_sampler_draws_the_race_with_vllms_log_probs():
         processed = logits / temperature
         want_sampled = processed.softmax(-1).div(noise).argmax(-1)
         want = compute_topk_scores(processed, k, want_sampled)
+        assert (nonfinite == 0).all()
         assert sampled.dtype == torch.int64 and torch.equal(sampled, want_sampled)
         assert torch.equal(logprobs.selected_token_ranks, want.selected_token_ranks)
         torch.testing.assert_close(logprobs.logprobs, want.logprobs, rtol=0, atol=1e-4)
         if not integers:  # tied log-probs may list their tokens in another order
             assert torch.equal(logprobs.logprob_token_ids.long(), want.logprob_token_ids)
+
+
+def test_the_fused_sampler_raises_a_refused_launch_at_the_call():
+    BlackwellExtension.load()
+    sampler = BlackwellSampler.__new__(BlackwellSampler)  # draw() reads its constants alone
+    logits = torch.zeros(TOO_MANY_ROWS, SHORT_VOCAB, device=DEVICE)
+    temperature = torch.ones(TOO_MANY_ROWS, device=DEVICE)
+
+    # the chunk kernel takes a grid row per logits row: the GPU refuses its launch, and the call raises
+    with pytest.raises(RuntimeError, match=REFUSED_LAUNCH):
+        sampler.draw(logits, temperature, 1)
+
+    # no error is left for a later launch or synchronize: the next call samples
+    sampled, _, _ = sampler.draw(logits[:MAX_ROWS], temperature[:MAX_ROWS], 1)
+    assert ((sampled >= 0) & (sampled < SHORT_VOCAB)).all()
+
+
+@pytest.mark.parametrize("kind", NonfiniteRows.KINDS)
+def test_the_fused_sampler_counts_nan_and_inf_logits_and_samples_the_other_rows_as_vllm(kind):
+    BlackwellExtension.load()
+    sampler = BlackwellSampler.__new__(BlackwellSampler)  # draw() reads its constants alone
+    generator = torch.Generator(device=DEVICE).manual_seed(6)
+    k = BlackwellSampler.MAX_LOGPROBS
+    # a finite row, then the row of the kind, last in the logits' allocation
+    logits = torch.stack([NonfiniteRows.row("finite", VOCAB, generator), NonfiniteRows.row(kind, VOCAB, generator)])
+    temperature = torch.full((len(logits),), NONFINITE_TEMPERATURE, device=DEVICE)
+
+    torch.cuda.manual_seed(7)  # the same noise for both
+    sampled, logprobs, nonfinite = sampler.draw(logits, temperature, k)
+    torch.cuda.manual_seed(7)
+    noise = torch.empty_like(logits).exponential_()
+
+    # every row's token inside the vocabulary (the next step's input), the corrupted row's logits counted
+    count = NonfiniteRows.count(kind, VOCAB)
+    assert ((sampled >= 0) & (sampled < VOCAB)).all()
+    assert nonfinite.tolist() == [0, count]
+
+    # the rows a step samples: the race over the noise as vLLM's V1 sampler ran it, vLLM's top-K and rank
+    sampled_rows = 1 if kind in NonfiniteRows.CORRUPTED_KINDS else len(logits)
+    processed = logits[:sampled_rows] / NONFINITE_TEMPERATURE
+    want_sampled = processed.softmax(-1).div(noise[:sampled_rows]).argmax(-1)
+    want = compute_topk_scores(processed, k, want_sampled)
+    assert torch.equal(sampled[:sampled_rows], want_sampled)
+    assert torch.equal(logprobs.selected_token_ranks[:sampled_rows], want.selected_token_ranks)
+    torch.testing.assert_close(logprobs.logprobs[:sampled_rows], want.logprobs, rtol=0, atol=1e-4)
+    assert torch.equal(logprobs.logprob_token_ids[:sampled_rows].long(), want.logprob_token_ids)
+
+    # the step's output raises on the corrupted row as it reaches the host, naming the step, the kernel and the row
+    want_rows = [(1, NONFINITE_REQUESTS[1], count)] if count else []
+    NonfiniteRows.assert_step_output(BlackwellSampler.KERNEL, nonfinite, NONFINITE_REQUESTS, want_rows)

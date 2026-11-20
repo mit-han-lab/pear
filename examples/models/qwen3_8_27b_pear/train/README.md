@@ -63,6 +63,8 @@ per node x `ROBODOJO_APPS_PER_GPU` Apps for `ROLLOUT_NNODES` x 2 x `SESSIONS_PER
 | `STEPS` | 1000 | The most steps a run takes. A run goes on until you stop it |
 | `BATCH`, `N` | 128, 8 | The groups per step and the rollouts per group |
 | `MAX_RESPONSE` | 160000 in stage 1, 256000 after | The response tokens of an episode |
+| `SPECULATIVE_TOKENS` | 3 | The tokens the model's MTP layer, frozen, proposes per step: speculative decoding in the vLLM replicas; 0 turns it off |
+| `DRAFT_MODEL` | `$WORK_DIR/models/Qwen3.8-27B` | The directory of the MTP layer's weights: the base model's in every stage, as a model exported from a checkpoint has none |
 
 Extra arguments are Hydra overrides.
 

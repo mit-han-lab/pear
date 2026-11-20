@@ -9,11 +9,12 @@ from vllm.v1.attention.backends.flash_attn import (
 )
 from vllm.v1.kv_cache_interface import is_quantized_kv_cache
 
-from pear.models.qwen3_5.rollout.hopper.staging import StagedBuffer
+from pear.models.qwen3_5.rollout.staged_buffer import StagedBuffer
 
 HEAD_DIM = 256  # the attention layers' head dim (csrc/split_attn.cu HD)
 QUERY_HEADS = 6  # query heads per KV head at TP4 (csrc/split_attn.cu HQ)
 MAX_SEQS = 256  # sequences a step may have (csrc/split_attn.cu MAX_SEQS)
+VERIFY_QUERY_LENS = (4, 8)  # a verify step's query tokens per request the kernel takes (csrc/split_attn.cu)
 # the largest query a step is described with to FA3 at least: its metadata at max_seqlen_q == 1 has another layout
 MIN_QUERY_LEN = 2
 
@@ -30,6 +31,9 @@ class AttentionStepBuffers(StagedBuffer):
         self.num_decode_rows, self.cu, self.sq_all, self.sk_all, self.sq, self.sk = torch.split(
             self.device_buffer, sizes
         )
+        # a pure decode step's decode rows, every row (a padding request has no context) by its row count: constants,
+        # which a FULL graph replayed without a build (vLLM's fused draft steps) reads unchanged
+        self.row_counts = torch.arange(max_seqs + 1, dtype=torch.int32, device=device)
 
     def fill(self, num_decode_rows: int, starts, total: int, qlens, klens) -> None:
         n = len(qlens)
@@ -57,6 +61,11 @@ class HopperFlashAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
         super().__init__(*args, **kwargs)
         self.step_buffers = None  # the attention arguments' device buffers, made at the first step that takes them
 
+        # a speculative engine's verify step: every request's last token and its drafts, if the kernel takes as many
+        speculative_config = self.vllm_config.speculative_config
+        query_len = None if speculative_config is None else 1 + speculative_config.num_speculative_tokens
+        self.verify_query_len = query_len if query_len in VERIFY_QUERY_LENS else None
+
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
         m = common_attn_metadata
 
@@ -80,8 +89,11 @@ class HopperFlashAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
         if md.mm_prefix_query_range_tensor is not None:
             return super().build(common_prefix_len, m, fast_build=fast_build)
 
-        # a pure decode step (vLLM captures the mixed-step graphs at max_query_len = their token count)
-        md._pear_attention_step = self.attention_step(m, md, is_pure_decode=m.max_query_len == 1)
+        # a pure decode step (vLLM captures the mixed-step graphs at max_query_len = their token count), or a verify
+        # step's (those graphs are captured without a drafter only)
+        md._pear_attention_step = self.attention_step(
+            m, md, is_pure_decode=m.max_query_len == 1 or self.is_verify_step(m)
+        )
 
         return md
 
@@ -100,22 +112,35 @@ class HopperFlashAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
             and m.mm_req_doc_ranges is None
             and self.rswa_window is None
             and self.aot_sliding_window in (None, (-1, -1))
+            # with a drafter the host's KV lengths are upper bounds (the last step's drafts may be rejected): FA3's
+            # part, which attends over them, stays vLLM's; the kernel takes the steps of decode or verify rows alone,
+            # reading the lengths on the GPU
+            and (self.vllm_config.speculative_config is None or m.max_query_len == 1 or self.is_verify_step(m))
         )
 
+    def is_verify_step(self, m) -> bool:
+        """A verify step the kernel takes: every request's query is its last token and its drafts."""
+        query_len = self.verify_query_len
+        return query_len is not None and m.max_query_len == query_len and m.num_actual_tokens == m.num_reqs * query_len
+
     def attention_step(self, m, md, is_pure_decode: bool) -> tuple:
-        """The step's attention arguments: its decode rows (the leading one-token queries) and FA3's part on
-        whole-batch metadata."""
+        """The step's attention arguments: its decode rows (the leading one-token queries, or a verify step's rows of
+        its query length) and FA3's part on whole-batch metadata."""
         n = m.num_reqs
+        buffers = self.step_buffers
+        if buffers is None:
+            max_seqs = min(self.vllm_config.scheduler_config.max_num_seqs, MAX_SEQS)
+            buffers = self.step_buffers = AttentionStepBuffers(max_seqs, self.device)
+
+        # a verify step's rows on the kernel alone: no FA3 part
+        if is_pure_decode and m.max_query_len > 1:
+            return buffers.row_counts[n : n + 1], None, None, None, n, True, m.max_query_len
+
         qsl = m.query_start_loc_cpu[: n + 1].numpy().astype(np.int64)
         qlens = np.diff(qsl)
         klens = m.seq_lens_cpu_upper_bound[:n].numpy().astype(np.int64)  # exact without a drafter
         prefill_rows = np.flatnonzero(qlens != 1)
         num_decode_rows = int(prefill_rows[0]) if len(prefill_rows) else n
-
-        buffers = self.step_buffers
-        if buffers is None:
-            max_seqs = min(self.vllm_config.scheduler_config.max_num_seqs, MAX_SEQS)
-            buffers = self.step_buffers = AttentionStepBuffers(max_seqs, self.device)
         buffers.fill(num_decode_rows, qsl[:-1], int(qsl[-1]), qlens, klens)
         cu = buffers.cu[: n + 1]
 
@@ -148,8 +173,9 @@ class HopperFlashAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
             0,
         )
         md.scheduler_metadata = self._store_scheduler_metadata(scheduler_metadata)
+        decode_rows = buffers.row_counts[n : n + 1] if is_pure_decode else buffers.num_decode_rows
 
-        return buffers.num_decode_rows, cu, buffers.sq[:n], buffers.sk[:n], n, is_pure_decode
+        return decode_rows, cu, buffers.sq[:n], buffers.sk[:n], n, is_pure_decode, 1
 
 
 class HopperFlashAttentionImpl(FlashAttentionImpl):
@@ -161,7 +187,7 @@ class HopperFlashAttentionImpl(FlashAttentionImpl):
     MIXED_CTAS = 48  # the decode kernel's CTAs beside FlashAttention-3 in a mixed step (FA3 keeps the other SMs)
     DECODE_CTAS = 132  # the decode kernel's CTAs in a pure decode step, where it runs alone (H100's SMs)
     MAX_CTAS = 160  # the kernel's partial slots (csrc/split_attn.cu MAX_CTAS_ALLOWED)
-    device_states: dict = {}  # device -> the kernel's partials, counters and the mixed steps' side stream
+    device_states: dict = {}  # device -> the kernel's partials and the mixed steps' side stream
 
     def forward(
         self, layer, query, key, value, kv_cache, attn_metadata, output, output_scale=None, output_block_scale=None
@@ -200,8 +226,8 @@ class HopperFlashAttentionImpl(FlashAttentionImpl):
         )
 
     def attend(self, query, kv_cache, md, output, step) -> None:
-        """The decode kernel alone in a pure decode step; in a mixed one beside FA3 over the prefill rows."""
-        num_decode_rows, cu, sq, sk, n, is_pure_decode = step
+        """The decode kernel alone in a pure decode or verify step; in a mixed one beside FA3 over the prefill rows."""
+        num_decode_rows, cu, sq, sk, n, is_pure_decode, query_len = step
         num_tokens = md.num_actual_tokens
         kv = kv_cache.transpose(1, 2)  # [blocks, page, kv heads, K | V]
         q = query[:num_tokens].view(num_tokens, QUERY_HEADS, HEAD_DIM)
@@ -218,10 +244,11 @@ class HopperFlashAttentionImpl(FlashAttentionImpl):
                 out,
                 state["part_o"],
                 state["part_ml"],
-                state["counters"],
                 self.scale,
                 self.DECODE_CTAS,
                 n,
+                query_len,
+                True,
             )
             return
 
@@ -244,10 +271,11 @@ class HopperFlashAttentionImpl(FlashAttentionImpl):
                 out,
                 state["part_o"],
                 state["part_ml"],
-                state["counters"],
                 self.scale,
                 self.MIXED_CTAS,
                 n,
+                1,
+                False,
             )
 
         torch.ops._vllm_fa3_C.fwd(
@@ -295,12 +323,10 @@ class HopperFlashAttentionImpl(FlashAttentionImpl):
     @classmethod
     def device_state(cls, device) -> dict:
         if device not in cls.device_states:
+            rows = QUERY_HEADS * max(VERIFY_QUERY_LENS)  # a partial's query rows at most
             cls.device_states[device] = {
-                "part_o": torch.empty(
-                    (cls.MAX_CTAS + MAX_SEQS) * QUERY_HEADS * HEAD_DIM, dtype=torch.float32, device=device
-                ),
-                "part_ml": torch.empty((cls.MAX_CTAS + MAX_SEQS) * QUERY_HEADS * 2, dtype=torch.float32, device=device),
-                "counters": torch.zeros(MAX_SEQS, dtype=torch.int32, device=device),
+                "part_o": torch.empty((cls.MAX_CTAS + MAX_SEQS) * rows * HEAD_DIM, dtype=torch.float32, device=device),
+                "part_ml": torch.empty((cls.MAX_CTAS + MAX_SEQS) * rows * 2, dtype=torch.float32, device=device),
                 "stream": torch.cuda.Stream(device=device),
             }
 

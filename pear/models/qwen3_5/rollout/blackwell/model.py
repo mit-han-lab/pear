@@ -1,6 +1,7 @@
 import torch
 import torch.distributed._symmetric_memory as symm_mem
 from vllm.distributed import get_pp_group, get_tp_group
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
@@ -9,15 +10,20 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.triton_utils import tl, triton
 
-from pear.models.qwen3_5.rollout.blackwell.gemm import GemmTableLinearMethod
+from pear.models.qwen3_5.rollout.attention import Qwen3_5RolloutAttention
+from pear.models.qwen3_5.rollout.blackwell.attention import VerifyAttention
+from pear.models.qwen3_5.rollout.blackwell.gemm import GemmTableLinearMethod, PartialSumsLinearMethod, StreamGemm
 from pear.models.qwen3_5.rollout.blackwell.model_state import BlackwellRolloutModelState
-from pear.models.qwen3_5.rollout.blackwell.triton_launcher import TritonLauncher
+from pear.models.qwen3_5.rollout.blackwell.vision import BlackwellVisionTransformer
+from pear.models.qwen3_5.rollout.gdn import GDNProjection
+from pear.models.qwen3_5.rollout.mlp import Qwen3_5RolloutMLP
 from pear.models.qwen3_5.rollout.model import (
     Qwen3_5RolloutDecoderLayer,
     Qwen3_5RolloutForCausalLM,
     Qwen3_5RolloutForConditionalGeneration,
     Qwen3_5RolloutModel,
 )
+from pear.models.qwen3_5.rollout.triton_launcher import TritonLauncher
 
 TP_SIZE = 2  # the fused all-reduce and the logits gather exchange with one peer
 
@@ -66,7 +72,8 @@ class AllReduceBuffers:
 
 
 class LogitsGatherBuffers:
-    """This rank's gathered-logits buffer and its flags in symmetric memory (the peer writes both), the local epochs."""
+    """This rank's gathered-logits buffer and its flags in symmetric memory (the peer writes both), the local epochs; the
+    stream GEMM's lm_head shares them."""
 
     instance: "LogitsGatherBuffers | None" = None
 
@@ -76,9 +83,10 @@ class LogitsGatherBuffers:
         ctas = torch.cuda.get_device_properties(device).multi_processor_count  # one co-resident CTA per SM
 
         self.buffer = symm_mem.empty(max_rows, vocab_size, dtype=torch.float32, device=device)
-        self.flags = symm_mem.empty(ctas, dtype=torch.int32, device=device)
+        # the gather kernel's per-CTA flags and epochs, then the stream GEMM head's launch counts (the peer's, its own)
+        self.flags = symm_mem.empty(ctas + 1, dtype=torch.int32, device=device)
         self.flags.zero_()
-        self.epochs = torch.zeros(ctas, dtype=torch.int32, device=device)
+        self.epochs = torch.zeros(ctas + 1, dtype=torch.int32, device=device)
 
         self.handles = (
             symm_mem.rendezvous(self.buffer, group.group_name),
@@ -93,6 +101,13 @@ class LogitsGatherBuffers:
             self.epochs,
             ctas,
         )
+        torch.ops.pear_rollout_blackwell.sg_logits_setup(
+            self.buffer,
+            buffer_handle.buffer_ptrs[1 - buffer_handle.rank],
+            self.epochs[ctas:],
+            self.flags[ctas:],
+            flag_handle.buffer_ptrs[1 - flag_handle.rank] + ctas * self.flags.element_size(),
+        )
 
         torch.cuda.synchronize(device)
         torch.distributed.barrier(group)
@@ -104,13 +119,51 @@ class LogitsGatherBuffers:
             cls.instance = cls(group, max_rows, vocab_size, device)
 
 
+class BlackwellQwen3_5MLP(Qwen3_5RolloutMLP):
+    """The rollout's dense MLP whose gate_up projection and SiLU-and-mul are one stream GEMM at decode sizes."""
+
+    def forward(self, x):
+        # the stream GEMM's epilogue takes silu(gate) * up from its fp32 sums and rounds it once; larger steps take the
+        # rollout MLP's
+        weight = self.gate_up_proj.weight
+        if not StreamGemm.takes(x, weight, StreamGemm.SWIGLU_MAX_ROWS):
+            return super().forward(x)
+
+        out, _ = self.down_proj(torch.ops.pear_rollout_blackwell.sg_swiglu(x, weight))
+
+        return out
+
+
+class BlackwellQwen3_5Attention(Qwen3_5RolloutAttention):
+    """The rollout's gated full attention whose output gate x * sigmoid(gate) is one kernel in fp32 rounded to bf16 once
+    (csrc/output_gate.cu), a programmatic dependent that lets o_proj's GEMM stream its weights while it runs."""
+
+    def forward(self, positions, hidden_states):
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v, gate = self._project_qkv_gate(qkv, positions)
+        attn_output = torch.ops.pear_rollout_blackwell.output_gate(self.attn(q, k, v), gate)
+        output, _ = self.o_proj(attn_output)
+
+        return output
+
+
 class BlackwellQwen3_5DecoderLayer(Qwen3_5RolloutDecoderLayer):
     """A dense decoder layer on the fp32 residual stream, whose row-parallel outputs the next fused norm reduces."""
 
     # every decoder layer's two norms become one op each (csrc/ar_norm.cu): the all-reduce of the row-parallel
-    # projection's bf16 partial sums over the two ranks (one-shot NVLink push), the add into the fp32 residual and the
+    # projection's partial sums over the two ranks (one-shot NVLink push), the add into the fp32 residual and the
     # (1 + w) RMSNorm whose bf16 output feeds the next GEMMs; the row-parallel layers stop reducing their outputs
     reduce_results = False
+    mlp_cls = BlackwellQwen3_5MLP
+    attention_cls = BlackwellQwen3_5Attention
+
+    def __init__(self, vllm_config, layer_type: str, prefix: str = "") -> None:
+        super().__init__(vllm_config, layer_type, prefix)
+        # the row-parallel projections leave their split-K sums to the next fused norm at decode sizes
+        mixer = self.linear_attn.out_proj if layer_type == "linear_attention" else self.self_attn.o_proj
+        for layer in (mixer, self.mlp.down_proj):
+            if type(layer.quant_method) is UnquantizedLinearMethod:
+                layer.quant_method = PartialSumsLinearMethod()
 
     def forward(self, hidden_states, residual, positions=None, **kwargs):
         # the first layer sums the ranks' partial embeddings into the residual
@@ -140,13 +193,15 @@ class BlackwellQwen3_5DecoderLayer(Qwen3_5RolloutDecoderLayer):
         return self.mlp(normed_states), residual
 
 
-class UnreducedVocabParallelEmbedding(VocabParallelEmbedding):
-    """The vocab-parallel lookup without its all-reduce: the first decoder layer's norm sums the ranks' partial rows."""
+class PartialRowsVocabParallelEmbedding(VocabParallelEmbedding):
+    """vLLM's vocab-parallel embedding with a lookup of this rank's partial rows, which the first decoder layer's norm
+    sums; its forward stays vLLM's reduced lookup, the one a drafter sharing the module calls."""
 
     EMBED_COLUMNS = 1024  # hidden columns per program of the shard lookup
     shard_embed = TritonLauncher(_shard_embed_kernel)
 
-    def forward(self, input_):
+    def partial_rows(self, input_):
+        """The lookup without its all-reduce: the rows of this rank's vocabulary shard, zeros for the other tokens."""
         shard_indices = self.shard_indices
         weight = self.weight
         if (
@@ -194,7 +249,7 @@ class BlackwellQwen3_5Model(Qwen3_5RolloutModel):
     output in fp32."""
 
     decoder_layer_cls = BlackwellQwen3_5DecoderLayer
-    embedding_cls = UnreducedVocabParallelEmbedding
+    embedding_cls = PartialRowsVocabParallelEmbedding
 
     def __init__(self, *, vllm_config, prefix=""):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
@@ -203,12 +258,22 @@ class BlackwellQwen3_5Model(Qwen3_5RolloutModel):
         assert get_pp_group().world_size == 1 and not self.aux_hidden_state_layers and group.world_size == TP_SIZE
 
         device = torch.device("cuda", torch.cuda.current_device())
+        # a step's logits rows: a verify step's request has its last token's and its drafts'
         LogitsGatherBuffers.create(
-            group.device_group, vllm_config.scheduler_config.max_num_seqs, self.config.vocab_size, device
+            group.device_group,
+            vllm_config.scheduler_config.max_num_seqs * vllm_config.uniform_decode_query_len,
+            self.config.vocab_size,
+            device,
         )
         AllReduceBuffers.create(
             group.device_group, vllm_config.scheduler_config.max_num_batched_tokens, self.config.hidden_size, device
         )
+        VerifyAttention.create(device)
+
+    def embed_input_ids(self, input_ids):
+        # this rank's partial rows: the first decoder layer's norm sums them (vLLM's MTP drafter shares embed_tokens and
+        # calls its reduced forward)
+        return self.embed_tokens.partial_rows(input_ids)
 
     def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None):
         hidden_states = inputs_embeds if inputs_embeds is not None else self.embed_input_ids(input_ids)
@@ -232,7 +297,8 @@ class HighLowLogitsProcessor(LogitsProcessor):
         if not self.eligible(lm_head, hidden_states, embedding_bias):
             return super()._apply_head(lm_head, hidden_states, embedding_bias)
 
-        high_low_logits, n = self.high_low_head(lm_head, hidden_states)
+        high_low, n = self.high_low_rows(hidden_states)
+        high_low_logits = self.high_low_head(lm_head, high_low)
 
         return (high_low_logits[:n] + high_low_logits[n:]).reshape(*hidden_states.shape[:-1], -1)
 
@@ -250,10 +316,12 @@ class HighLowLogitsProcessor(LogitsProcessor):
         ):
             return super()._get_logits(hidden_states, lm_head, embedding_bias, skip_gather)
 
-        high_low_logits, n = self.high_low_head(lm_head, hidden_states)
+        high_low, n = self.high_low_rows(hidden_states)
+        if StreamGemm.takes_logits(high_low, lm_head.weight):
+            return StreamGemm.logits(high_low, lm_head.weight, gather.rank)
 
         # high + low and the vocabulary gather in one NVLink kernel: [n, vocab], valid until the next step's logits
-        return torch.ops.pear_rollout_blackwell.lg_gather(high_low_logits, n, gather.rank)
+        return torch.ops.pear_rollout_blackwell.lg_gather(self.high_low_head(lm_head, high_low), n, gather.rank)
 
     @staticmethod
     def eligible(lm_head, hidden_states, embedding_bias) -> bool:
@@ -266,17 +334,16 @@ class HighLowLogitsProcessor(LogitsProcessor):
         )
 
     @staticmethod
-    def high_low_head(lm_head, hidden_states) -> tuple[torch.Tensor, int]:
-        """The head's fp32 product of [high rows; low rows] and the row count."""
-        # one GEMM of twice the rows: decode-sized GEMMs are bound by the weight read
-        flat_states = hidden_states.reshape(-1, hidden_states.shape[-1])
-        high_part = flat_states.to(torch.bfloat16)
-        low_part = (flat_states - high_part.float()).to(torch.bfloat16)
+    def high_low_rows(hidden_states) -> tuple[torch.Tensor, int]:
+        """The fp32 hidden states as the head's [high rows; low rows] in bf16, and their row count."""
+        flat_states = hidden_states.reshape(-1, hidden_states.shape[-1]).contiguous()
 
-        return (
-            torch.mm(torch.cat([high_part, low_part]), lm_head.weight.t(), out_dtype=torch.float32),
-            flat_states.shape[0],
-        )
+        return torch.ops.pear_rollout_blackwell.hl_split(flat_states), flat_states.shape[0]
+
+    @staticmethod
+    def high_low_head(lm_head, high_low) -> torch.Tensor:
+        """The head's fp32 product of [high rows; low rows]: one GEMM of twice the rows, bound by the weight read."""
+        return torch.mm(high_low, lm_head.weight.t(), out_dtype=torch.float32)
 
 
 class BlackwellQwen3_5ForCausalLM(Qwen3_5RolloutForCausalLM):
@@ -290,8 +357,13 @@ class BlackwellQwen3_5ForConditionalGeneration(Qwen3_5RolloutForConditionalGener
     """The Qwen3.5 vision-language model of a datacenter Blackwell replica, its linear layers on the GEMM table."""
 
     causal_lm_cls = BlackwellQwen3_5ForCausalLM
+    vision_cls = BlackwellVisionTransformer
     linear_method_cls = GemmTableLinearMethod
     model_state_cls = BlackwellRolloutModelState
+
+    def process_weights_after_loading(self) -> None:
+        # after every load: the GDN layers' projections still views of their merged weights
+        GDNProjection.check(self)
 
     def embed_input_ids(self, input_ids, multimodal_embeddings=None, *, is_multimodal=None):
         # the image rows: rank 0 contributes them, the other rank zeros (its text rows are its partial lookup)

@@ -1,124 +1,22 @@
 // vLLM's sampling of random rows with processed log-probs (temperature only): x = logits / t, the sampled token
 // argmax_j x_j - log q_j (the exponential race on torch's noise q), lp = log_softmax(x), the top-K lp sorted
-// descending with their ids, and the sampled token's rank #{j : lp_j >= lp_sampled}.
+// descending with their ids, and the sampled token's rank #{j : lp_j >= lp_sampled}; each row's count of NaN and +inf
+// x, corrupted logits the rollout raises on.
 #include <cuda_runtime.h>
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
-#include <cfloat>
-#include <climits>
+#include "sampler_common.cuh"
 
 namespace {
 
-constexpr int kTopK = 32;      // candidates per chunk: >= the requested log-probs
 constexpr int k1Threads = 256;
 constexpr int k1Vec = 8;       // float4 per thread: chunks up to 8192 floats
 
-__device__ __forceinline__ uint32_t fkey(float f) {
-  const uint32_t u = __float_as_uint(f);
-  return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
-}
-
-// (value, index) order: larger value first, then smaller index
-__device__ __forceinline__ bool better(float v, int i, float w, int j) { return v > w || (v == w && i < j); }
-
-template <int NT>
-__device__ __forceinline__ float block_max(float v, float* red) {
-#pragma unroll
-  for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
-  const int w = threadIdx.x / 32, l = threadIdx.x % 32;
-  __syncthreads();
-  if (l == 0) red[w] = v;
-  __syncthreads();
-  v = l < NT / 32 ? red[l] : -INFINITY;
-#pragma unroll
-  for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
-  return v;
-}
-
-template <int NT>
-__device__ __forceinline__ float block_sum(float v, float* red) {
-#pragma unroll
-  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-  const int w = threadIdx.x / 32, l = threadIdx.x % 32;
-  __syncthreads();
-  if (l == 0) red[w] = v;
-  __syncthreads();
-  v = l < NT / 32 ? red[l] : 0.f;
-#pragma unroll
-  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-  return v;
-}
-
-template <int NT>
-__device__ __forceinline__ void block_best(float& v, int& i, float* redv, int* redi) {
-#pragma unroll
-  for (int o = 16; o > 0; o >>= 1) {
-    const float w = __shfl_xor_sync(0xffffffffu, v, o);
-    const int j = __shfl_xor_sync(0xffffffffu, i, o);
-    if (better(w, j, v, i)) v = w, i = j;
-  }
-  const int wp = threadIdx.x / 32, l = threadIdx.x % 32;
-  __syncthreads();
-  if (l == 0) redv[wp] = v, redi[wp] = i;
-  __syncthreads();
-  v = l < NT / 32 ? redv[l] : -INFINITY;
-  i = l < NT / 32 ? redi[l] : INT_MAX;
-#pragma unroll
-  for (int o = 16; o > 0; o >>= 1) {
-    const float w = __shfl_xor_sync(0xffffffffu, v, o);
-    const int j = __shfl_xor_sync(0xffffffffu, i, o);
-    if (better(w, j, v, i)) v = w, i = j;
-  }
-}
-
-// x / t, exact (IEEE division even under --use_fast_math); t == 1 skips it
-__device__ __forceinline__ float scaled(float x, float t) { return t == 1.f ? x : __fdiv_rn(x, t); }
-
-constexpr int kCap = 512;  // candidates a chunk sorts for its exact top-kTopK (more: the radix-select path)
-
-// warp-wide bitonic sort (descending) of n2 (power of two, <= 2 * kCap) smem pairs; __syncwarp between stages
-__device__ __forceinline__ void warp_sort_desc(float* sv, int* si, int n2) {
-  const int l = threadIdx.x & 31;
-  for (int size = 2; size <= n2; size <<= 1) {
-    for (int stride = size >> 1; stride > 0; stride >>= 1) {
-      for (int k = l; k < n2 / 2; k += 32) {
-        const int lo = 2 * k - (k & (stride - 1));
-        const int hi = lo + stride;
-        const bool desc = (lo & size) == 0;
-        const bool swap = desc ? better(sv[hi], si[hi], sv[lo], si[lo]) : better(sv[lo], si[lo], sv[hi], si[hi]);
-        if (swap) {
-          const float tv = sv[lo]; sv[lo] = sv[hi]; sv[hi] = tv;
-          const int ti = si[lo]; si[lo] = si[hi]; si[hi] = ti;
-        }
-      }
-      __syncwarp();
-    }
-  }
-}
-
-// one value per lane, sorted descending across the warp (shuffle bitonic)
-__device__ __forceinline__ float warp_sort_lanes_desc(float v) {
-  const int l = threadIdx.x & 31;
-#pragma unroll
-  for (int size = 2; size <= 32; size <<= 1) {
-#pragma unroll
-    for (int stride = size >> 1; stride > 0; stride >>= 1) {
-      const float w = __shfl_xor_sync(0xffffffffu, v, stride);
-      const bool lower = (l & stride) == 0;      // this lane holds the pair's first position
-      const bool desc = (l & size) == 0;         // the block sorts descending
-      // descending block: the first position keeps the larger value
-      const bool keep_max = lower == desc;
-      v = keep_max ? fmaxf(v, w) : fminf(v, w);
-    }
-  }
-  return v;
-}
-
-// a row chunk per CTA, one streaming pass: the chunk's max / exp-sum (online) and best race score, then its top-kTopK
-// from the candidates >= theta (the kTopK-th largest of the threads' maxima), sorted; a radix select when ties leave
-// more than kCap candidates
+// a row chunk per CTA, one streaming pass: the chunk's max / exp-sum (online; NaN with a NaN or +inf x) and best race
+// score, then its top-kTopK from the candidates >= theta (the kTopK-th largest of the threads' maxima), sorted; a
+// radix select when ties leave more than kCap candidates
 __global__ void __launch_bounds__(k1Threads) k1_chunks(
     const float* __restrict__ logits, const float* __restrict__ q, const float* __restrict__ temp, int V, int chunk,
     float* __restrict__ part_max, float* __restrict__ part_sum, float* __restrict__ part_best,
@@ -141,9 +39,10 @@ __global__ void __launch_bounds__(k1Threads) k1_chunks(
   __shared__ int si[kCap];
   const int l = threadIdx.x & 31, w = threadIdx.x >> 5;
 
-  // pass 1: online max / exp-sum, the race's best score, this thread's max
+  // pass 1: online max / exp-sum, the race's best score from this thread's first token (no index left unset), this
+  // thread's max; a NaN x leaves the exp-sum NaN (a new max keeps it), a +inf x the max +inf and the chunk's sum NaN
   float m = -INFINITY, s = 0.f, best = -INFINITY;
-  int best_i = INT_MAX;
+  int best_i = threadIdx.x * 4 < n ? start + threadIdx.x * 4 : INT_MAX;
   for (int b = threadIdx.x * 4; b < n; b += k1Threads * 4) {
     float xv[4], qv[4];
     if (b + 3 < n) {
@@ -163,7 +62,7 @@ __global__ void __launch_bounds__(k1Threads) k1_chunks(
       if (b + e >= n) continue;
       const float xs = scaled(xv[e], t);
       if (xs > m) {
-        s = (m == -INFINITY ? 0.f : s * expf(m - xs)) + 1.f;
+        s = s * expf(m - xs) + 1.f;  // 0 * exp(-inf) + 1 at the first max
         m = xs;
       } else if (xs != -INFINITY) {
         s += expf(xs - m);
@@ -174,7 +73,7 @@ __global__ void __launch_bounds__(k1Threads) k1_chunks(
   }
   const float tmax = m;
   const float M = block_max<k1Threads>(m, red);
-  s = m == -INFINITY ? 0.f : s * expf(m - M);
+  s *= m == -INFINITY ? 0.f : expf(m - M);  // (NaN kept: 0 * NaN)
   s = block_sum<k1Threads>(s, red);
   block_best<k1Threads>(best, best_i, red, redi);
   const int p = r * S + c;
@@ -315,24 +214,30 @@ __global__ void __launch_bounds__(k1Threads) k1_chunks(
 }
 
 // one warp per row: the row's max / sum and sampled token from the chunks' partials, the top-K by merging the chunks'
-// sorted candidate lists (lane = chunk), and the sampled token's rank when the top kTopK decide it (else k3 counts)
+// sorted candidate lists (lane = chunk), the sampled token's rank when the top kTopK decide it (else k3 counts), and
+// the row's count of NaN and +inf x, read again when its sum is NaN (with them only)
 __global__ void __launch_bounds__(32) k2_rows(
     const float* __restrict__ logits, const float* __restrict__ temp, int V, int S, int K,
     const float* __restrict__ part_max, const float* __restrict__ part_sum, const float* __restrict__ part_best,
     const int* __restrict__ part_best_idx, const float* __restrict__ cand_val, const int* __restrict__ cand_idx,
-    int* __restrict__ sampled32, int* __restrict__ out_ids,
-    float* __restrict__ out_lp, float* __restrict__ row_stats, int64_t* __restrict__ ranks) {
+    int* __restrict__ sampled32, int* __restrict__ out_ids, float* __restrict__ out_lp, float* __restrict__ row_stats,
+    int64_t* __restrict__ ranks, int* __restrict__ nonfinite) {
   const int r = blockIdx.x, l = threadIdx.x;
   const bool has = l < S;
-  const float pm = has ? part_max[r * S + l] : -INFINITY;
+  // the lane's chunk partials, every load at once and used by every lane (none sunk into a branch): a lane past the
+  // row's chunks takes its last one, which leaves the max and the race as they are and weighs 0 in the sum
+  const int partial_index = r * S + min(l, S - 1);
+  const float pm = part_max[partial_index], chunk_sum = part_sum[partial_index];
+  float best = part_best[partial_index];
+  int bi = part_best_idx[partial_index];
+  const float lane_weight = has ? 1.f : 0.f;
   float m = pm;
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
-  float s = has && pm != -INFINITY ? part_sum[r * S + l] * expf(pm - m) : 0.f;
+  // (NaN kept: 0 * NaN; the product rounded before the sum, never fused into it)
+  float s = __fmul_rn(chunk_sum * lane_weight, pm == -INFINITY ? 0.f : expf(pm - m));
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
-  float best = has ? part_best[r * S + l] : -INFINITY;
-  int bi = has ? part_best_idx[r * S + l] : INT_MAX;
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) {
     const float w = __shfl_xor_sync(0xffffffffu, best, o);
@@ -391,6 +296,20 @@ __global__ void __launch_bounds__(32) k2_rows(
     row_stats[4 * r + 3] = decided ? 1.f : 0.f;
     ranks[r] = decided ? above : 0;
   }
+  // the row's NaN and +inf x, read again when its sum is NaN (the same on every lane), after the outputs
+  int nonfinite_count = 0;
+  if (isnan(s)) {
+    const float4* row = reinterpret_cast<const float4*>(logits + (int64_t)r * V);
+#pragma unroll 1
+    for (int i = l; i < V / 4; i += 32) {
+      const float4 v = row[i];
+      nonfinite_count += !(scaled(v.x, t) < INFINITY) + !(scaled(v.y, t) < INFINITY) + !(scaled(v.z, t) < INFINITY) +
+                         !(scaled(v.w, t) < INFINITY);
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) nonfinite_count += __shfl_xor_sync(0xffffffffu, nonfinite_count, o);
+  }
+  if (l == 0) nonfinite[r] = nonfinite_count;
 }
 
 // a row chunk per CTA: the sampled token's rank, counted on the log-probs, for the rows k2 left undecided
@@ -427,7 +346,8 @@ __global__ void __launch_bounds__(k1Threads) k3_rank(const float* __restrict__ l
 }
 
 // logits [R, V] fp32 contiguous, q [R, V] fp32 (exponential noise), temperature [>= R] fp32; K <= kTopK log-probs.
-// Returns (sampled int32 [R], ids int32 [R, K+1], logprobs fp32 [R, K+1], ranks int64 [R]).
+// Returns (sampled int32 [R], ids int32 [R, K+1], logprobs fp32 [R, K+1], ranks int64 [R], NaN and +inf counts int32
+// [R]).
 std::vector<torch::Tensor> fused_sample(torch::Tensor logits, torch::Tensor q, torch::Tensor temperature, int64_t K,
                                         int64_t chunks) {
   TORCH_CHECK(logits.dim() == 2 && logits.is_contiguous() && logits.scalar_type() == torch::kFloat32);
@@ -453,21 +373,24 @@ std::vector<torch::Tensor> fused_sample(torch::Tensor logits, torch::Tensor q, t
   auto lp = torch::empty({R, K + 1}, f32);
   auto stats = torch::empty({R, 4}, f32);
   auto ranks = torch::empty({R}, i64);
-  if (R == 0) return {sampled32, ids, lp, ranks};
+  auto nonfinite = torch::empty({R}, i32);
+  if (R == 0) return {sampled32, ids, lp, ranks, nonfinite};
   auto stream = at::cuda::getCurrentCUDAStream();
   float* pm = part.data_ptr<float>();
+  int* best_idx = reinterpret_cast<int*>(pm + 3 * R * S);
   k1_chunks<<<dim3(S, R), k1Threads, 0, stream>>>(
       logits.data_ptr<float>(), q.data_ptr<float>(), temperature.data_ptr<float>(), V, chunk, pm, pm + R * S,
-      pm + 2 * R * S, reinterpret_cast<int*>(pm + 3 * R * S), cand_val.data_ptr<float>(), cand_idx.data_ptr<int>());
+      pm + 2 * R * S, best_idx, cand_val.data_ptr<float>(), cand_idx.data_ptr<int>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
   k2_rows<<<R, 32, 0, stream>>>(
       logits.data_ptr<float>(), temperature.data_ptr<float>(), V, S, (int)K, pm, pm + R * S, pm + 2 * R * S,
-      reinterpret_cast<int*>(pm + 3 * R * S), cand_val.data_ptr<float>(), cand_idx.data_ptr<int>(),
-      sampled32.data_ptr<int>(), ids.data_ptr<int>(), lp.data_ptr<float>(),
-      stats.data_ptr<float>(), ranks.data_ptr<int64_t>());
+      best_idx, cand_val.data_ptr<float>(), cand_idx.data_ptr<int>(), sampled32.data_ptr<int>(), ids.data_ptr<int>(),
+      lp.data_ptr<float>(), stats.data_ptr<float>(), ranks.data_ptr<int64_t>(), nonfinite.data_ptr<int>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
   k3_rank<<<dim3(S, R), k1Threads, 0, stream>>>(logits.data_ptr<float>(), temperature.data_ptr<float>(), V, chunk,
                                                  stats.data_ptr<float>(), ranks.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return {sampled32, ids, lp, ranks};
+  return {sampled32, ids, lp, ranks, nonfinite};
 }
 
 }  // namespace

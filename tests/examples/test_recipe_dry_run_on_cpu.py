@@ -17,8 +17,9 @@ from verl.utils.dataset.rl_dataset import get_dataset_class
 from verl.workers.rollout.vllm_rollout.utils import build_cli_args_from_config
 
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="the recipes call GNU readlink")
-# every recipe that launches on a Ray cluster, on each GPU
+# every recipe that launches on a Ray cluster, on each GPU, and the trainings among them
 LAUNCHES = [(recipe, gpu) for recipe in RecipeDryRun.recipes(REPO) for gpu in RecipeDryRun.GPUS]
+TRAINING_RECIPES = [recipe for recipe in RecipeDryRun.recipes(REPO) if Path(recipe).parent.name == "train"]
 ENTRY_MODULES = ("pear.trainer.main", "pear.eval.embodied")  # PEAR's entry points, each with a Hydra main
 CLASS_PATH = re.compile(r"(pear|verl)(\.\w+)+")  # a module or a class of PEAR's or verl's, by its dotted path
 RUNTIME_ENV_KEY = "ray_kwargs.ray_init.runtime_env.env_vars"  # what a launch gives its Ray workers
@@ -224,6 +225,21 @@ def test_the_workers_get_the_apps_of_a_server_only_when_the_recipe_was_given_the
     assert [config["apps_per_gpu"] for config in plain.tool_configs() if "apps_per_gpu" in config] == [own_number]
     assert given.value(RUNTIME_ENV_KEY)[variable] == "20"
     assert [config["apps_per_gpu"] for config in given.tool_configs() if "apps_per_gpu" in config] == ["20"]
+
+
+@pytest.mark.parametrize("recipe", TRAINING_RECIPES, ids=lambda recipe: Path(recipe).stem)
+def test_a_training_s_replicas_draft_with_the_drafter_the_recipe_was_given(tmp_path, recipe):
+    variables = {"SPECULATIVE_TOKENS": "3", "DRAFT_MODEL": "/draft"}
+
+    launch = RecipeDryRun(REPO, tmp_path).run(recipe, RecipeDryRun.GPUS[0], variables)
+
+    # the rollout's MTP keys (a frozen drafter: the actor keeps no MTP layer) and the engine's speculative_config, of
+    # which verl builds vLLM's
+    composed = ComposedConfig(launch.composed_config)
+    mtp = composed.value("actor_rollout_ref.rollout.mtp")
+    assert mtp["enable_rollout"] and not mtp["enable"]
+    assert (mtp["method"], mtp["num_speculative_tokens"]) == ("pear_mtp", 3)
+    assert composed.value("actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config") == {"model": "/draft"}
 
 
 def test_two_dumps_of_a_recipe_are_the_same_files(tmp_path):

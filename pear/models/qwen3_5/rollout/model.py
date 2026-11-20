@@ -39,6 +39,9 @@ class Qwen3_5RolloutDecoderLayer(Qwen3_5DecoderLayer):
     TEXT_MODEL_TYPE = "qwen3_5_text"  # the dense model's text config, the one the layer is built for
     # whether the row-parallel projections all-reduce their outputs (otherwise the GPU backend's next norm does)
     reduce_results: ClassVar[bool] = True
+    mlp_cls: ClassVar[type[Qwen3_5RolloutMLP]] = Qwen3_5RolloutMLP  # the GPU backend's dense MLP
+    # the GPU backend's gated full attention
+    attention_cls: ClassVar[type[Qwen3_5RolloutAttention]] = Qwen3_5RolloutAttention
 
     def __init__(self, vllm_config: VllmConfig, layer_type: str, prefix: str = "") -> None:
         # vLLM's Qwen3_5DecoderLayer.__init__ for the dense model: no MoE, no layer scale
@@ -63,7 +66,7 @@ class Qwen3_5RolloutDecoderLayer(Qwen3_5DecoderLayer):
                 reduce_results=self.reduce_results,
             )
         elif layer_type == "full_attention":
-            self.self_attn = Qwen3_5RolloutAttention(
+            self.self_attn = self.attention_cls(
                 config,
                 model_config=vllm_config.model_config,
                 cache_config=vllm_config.cache_config,
@@ -75,7 +78,7 @@ class Qwen3_5RolloutDecoderLayer(Qwen3_5DecoderLayer):
         else:
             raise ValueError(f"Invalid layer_type {layer_type}")
 
-        self.mlp = Qwen3_5RolloutMLP(
+        self.mlp = self.mlp_cls(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
@@ -174,6 +177,7 @@ class Qwen3_5RolloutForConditionalGeneration(Qwen3_5ForConditionalGeneration):
 
     VISION_NORM_EPS = 1e-6  # the vision tower's norm epsilon when the config names none (vLLM's default)
     causal_lm_cls: ClassVar[type[Qwen3_5RolloutForCausalLM]] = Qwen3_5RolloutForCausalLM
+    vision_cls: ClassVar[type[Qwen3_VisionTransformer]] = Qwen3_VisionTransformer  # the GPU backend's vision tower
     linear_method_cls: ClassVar[type[UnquantizedLinearMethod]] = UnquantizedLinearMethod
     model_state_cls: ClassVar[type[Qwen3_5RolloutModelState]]  # the GPU backend's model state
 
@@ -197,7 +201,7 @@ class Qwen3_5RolloutForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         self.multiscale_dim = self.visual_dim * self.deepstack_num_level
 
         with self._mark_tower_model(vllm_config, {"image", "video"}):
-            self.visual = Qwen3_VisionTransformer(
+            self.visual = self.vision_cls(
                 config.vision_config,
                 norm_eps=getattr(config, "rms_norm_eps", self.VISION_NORM_EPS),
                 quant_config=vllm_config.quant_config,

@@ -147,8 +147,9 @@ class Replica:
     def server(cls, stand_in: StandIn, enable: bool = True, enable_sleep_mode: bool = False) -> PearVLLMServer:
         server = object.__new__(PearVLLMServer)
         lmcache_config = {"enable": enable, "log_dir": str(stand_in.log_dir), "l1_size_gb": 1}
+        # no drafter: the rollout config's mtp is null without one
         server.config = SimpleNamespace(
-            custom={"lmcache": lmcache_config}, enable_sleep_mode=enable_sleep_mode, fp32_modules=[]
+            custom={"lmcache": lmcache_config}, enable_sleep_mode=enable_sleep_mode, fp32_modules=[], mtp=None
         )
         server.replica_rank, server.node_rank = cls.RANK, 0
 

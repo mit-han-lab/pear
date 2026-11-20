@@ -388,11 +388,11 @@ void ar_norm(const torch::Tensor& input, torch::Tensor& residual, const torch::T
   a1[0].val.programmaticStreamSerializationAllowed = 1;
   c1.attrs = a1;
   c1.numAttrs = 1;
-  TORCH_CHECK(cudaLaunchKernelEx(&c1, ar_twoshot_kernel, p) == cudaSuccess, "ar_twoshot launch");
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&c1, ar_twoshot_kernel, p));
   cudaLaunchConfig_t c2 = c1;
   c2.gridDim = dim3(T);
   c2.blockDim = dim3(p.vb * p.nvb);
-  TORCH_CHECK(cudaLaunchKernelEx(&c2, ar_rms_kernel, p) == cudaSuccess, "ar_rms launch");
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&c2, ar_rms_kernel, p));
 }
 
 // reduced: the all-reduced rows [T, D] in bf16; residual: the fp32 stream [T, D], residual += reduced in place;
@@ -431,7 +431,7 @@ void add_rmsnorm(const torch::Tensor& reduced, torch::Tensor& residual, const to
   a[0].val.programmaticStreamSerializationAllowed = 1;
   c.attrs = a;
   c.numAttrs = 1;
-  TORCH_CHECK(cudaLaunchKernelEx(&c, add_rms_kernel, p) == cudaSuccess, "add_rms launch");
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&c, add_rms_kernel, p));
 }
 
 }  // namespace allreduce

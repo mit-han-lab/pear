@@ -17,6 +17,11 @@ class Qwen3_5RolloutKernels(RolloutKernels):
         "pear.models.qwen3_5.rollout.blackwell.gpu_backend.BlackwellRolloutGpuBackend",
         "pear.models.qwen3_5.rollout.hopper.gpu_backend.HopperRolloutGpuBackend",
     )
+    # the family's speculative method (rollout.mtp.method): vLLM's MTP drafting on the target's M-RoPE positions, its
+    # config by class path like the GPU backends
+    SPECULATIVE_METHOD = "pear_mtp"
+    SPECULATOR_CONFIG = "pear.models.qwen3_5.rollout.speculator_config.Qwen3_5MTPSpeculatorConfig"
+    DRAFT_ARCHITECTURE = "Qwen3_5MTP"  # the MTP drafter's HF architecture, which a GPU backend may serve
 
     @classmethod
     def configure_server(cls, compilation_config: dict, max_num_seqs: int, max_num_batched_tokens: int) -> None:
@@ -25,13 +30,20 @@ class Qwen3_5RolloutKernels(RolloutKernels):
 
     @classmethod
     def register(cls) -> None:
-        """PEAR's vLLM general plugin (pyproject.toml): register the GPU backend's model in a process of an engine the
-        server switched the kernels on for."""
+        """PEAR's vLLM general plugin (pyproject.toml): register the GPU backend's model, its MTP drafter if it has one,
+        and the family's speculative method in a process of an engine the server switched the kernels on for."""
         # vLLM loads general plugins first in each process; a worker resolves its model class and keeps it for the
         # process (init_worker's multimodal receiver cache) before it builds the worker, whose extension installs the
         # GPU backend: a registration there comes too late
         if cls.is_enabled():
-            ModelRegistry.register_model(VllmGpuBackend.ARCHITECTURE, cls.select_gpu_backend().model_cls)
+            gpu_backend = cls.select_gpu_backend()
+            ModelRegistry.register_model(VllmGpuBackend.ARCHITECTURE, gpu_backend.model_cls)
+            if gpu_backend.draft_model_cls is not None:
+                ModelRegistry.register_model(cls.DRAFT_ARCHITECTURE, gpu_backend.draft_model_cls)
+            # vLLM 0.34's registry of speculative methods, which the model server's older vLLM lacks
+            from vllm.v1.worker.gpu.spec_decode.speculator_config import register_speculative_method
+
+            register_speculative_method(cls.SPECULATIVE_METHOD, cls.SPECULATOR_CONFIG)
 
     @classmethod
     def install_worker(cls, vllm_config) -> None:

@@ -1,0 +1,123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [vllm] fix: MTP weight sync finds the drafter under
+ ModelRunner V2
+
+vLLM's V2 model runner holds the draft model as model_runner.speculator.model where V1 held it as
+model_runner.drafter.model (vllm/v1/worker/gpu/model_runner.py:309 and spec_decode/speculator.py:294 in 0.34), and
+vLLM 0.34 has no V1 runner left (aac1b2a4, vllm-project/vllm#63373). _get_drafter_model read drafter alone, so
+under V2 it returned None and the MTP drafter silently left the weight sync: every step that iterates the models
+(_iter_all_models, _iter_all_models_with_config: parameters, buffers, post-load processing) skipped it, and its own
+layers kept the weights the engine started with. It now returns the model of either owner.
+
+load_quanted_weights(is_drafter=True) looks the draft model up the same way: once the drafter is found, the FP8 path
+calls it for the drafter, and its lookup of drafter alone would fail its assertion. This is upstream's cc1773b
+(#8681) with its test, plus a test of load_quanted_weights.
+---
+ .../test_vllm_weight_update_utils_on_cpu.py   | 26 ++++++++++++++++---
+ verl/utils/vllm/vllm_quant_utils.py           | 11 +++++---
+ verl/workers/rollout/vllm_rollout/utils.py    | 12 ++++++---
+ 3 files changed, 40 insertions(+), 9 deletions(-)
+
+diff --git a/tests/workers/rollout/test_vllm_weight_update_utils_on_cpu.py b/tests/workers/rollout/test_vllm_weight_update_utils_on_cpu.py
+index 6ffa01a07e2bc35eb325a77566dca6bef493c581..3134998ea7ab30297dae329482f61ac311c9f62b 100644
+--- a/tests/workers/rollout/test_vllm_weight_update_utils_on_cpu.py
++++ b/tests/workers/rollout/test_vllm_weight_update_utils_on_cpu.py
+@@ -17,6 +17,7 @@ import sys
+ import types
+ from pathlib import Path
+ 
++import pytest
+ import torch
+ 
+ _REPO_ROOT = Path(__file__).resolve().parents[3]
+@@ -253,8 +254,9 @@ def test_vllm_update_weights_loads_params_and_buffers():
+     )
+ 
+ 
+-def test_vllm_update_weights_syncs_buffers_to_mtp_drafter():
+-    """When an MTP drafter is synced, its registered buffers must be updated too."""
++@pytest.mark.parametrize("owner_attr", ["drafter", "speculator"])
++def test_vllm_update_weights_syncs_buffers_to_mtp_drafter(owner_attr):
++    """MTP buffers must stay in sync with either the V1 or V2 draft-model owner."""
+     main_model = _ToyModel()
+     drafter_model = _ToyModel()
+     main_model.load_weights = lambda weights: None
+@@ -270,7 +272,7 @@ def test_vllm_update_weights_syncs_buffers_to_mtp_drafter():
+ 
+     worker = object.__new__(vLLMColocateWorkerExtension)
+     worker.model_runner = _FakeModelRunner(main_model, speculative_config=_SpecConfig())
+-    worker.model_runner.drafter = _Drafter(drafter_model)
++    setattr(worker.model_runner, owner_attr, _Drafter(drafter_model))
+ 
+     weights = [
+         ("model.layers.0.linear.weight", torch.ones(4, 4, dtype=torch.float32)),
+@@ -282,3 +284,21 @@ def test_vllm_update_weights_syncs_buffers_to_mtp_drafter():
+     expected = torch.tensor([5, 6, 7, 8], dtype=torch.float32)
+     torch.testing.assert_close(main_model.model.layers[0].e_score_correction_bias, expected)
+     torch.testing.assert_close(drafter_model.model.layers[0].e_score_correction_bias, expected)
++
++
++@pytest.mark.parametrize("owner_attr", ["drafter", "speculator"])
++def test_load_quanted_weights_loads_the_draft_model_of_either_owner(monkeypatch, owner_attr):
++    """The FP8 drafter load reaches the V1 drafter's or the V2 speculator's model; the target has no loader here."""
++    vllm_quant_utils = pytest.importorskip("verl.utils.vllm.vllm_quant_utils")
++    monkeypatch.setattr(vllm_quant_utils, "quant_weights", lambda weights, model, quant_config, dtype: weights)
++    drafter_model = _ToyModel()
++    drafter_model.load_weights = lambda weights: {name for name, _ in weights}
++    model_runner = _FakeModelRunner(_ToyModel())
++    model_runner.vllm_config.quant_config = None
++    model_runner.vllm_config.model_config = types.SimpleNamespace(dtype=torch.bfloat16)
++    setattr(model_runner, owner_attr, types.SimpleNamespace(model=drafter_model))
++    weights = [("model.layers.0.linear.weight", torch.ones(4, 4, dtype=torch.float32))]
++
++    loaded = vllm_quant_utils.load_quanted_weights(weights, model_runner, is_drafter=True)
++
++    assert loaded == {"model.layers.0.linear.weight"}
+diff --git a/verl/utils/vllm/vllm_quant_utils.py b/verl/utils/vllm/vllm_quant_utils.py
+index 702dccfea89637eb09d2b8fdeb0abd62440209e7..c515ab88a5d001dbe27d19e0ec919fe39f20cd76 100644
+--- a/verl/utils/vllm/vllm_quant_utils.py
++++ b/verl/utils/vllm/vllm_quant_utils.py
+@@ -438,10 +438,15 @@ def process_quanted_weights_after_loading(model, reload_state):
+ 
+ def load_quanted_weights(weights, model_runner, is_drafter=False):
+     if is_drafter:
+-        drafter = getattr(model_runner, "drafter", None)
+-        model = drafter.model if drafter is not None and hasattr(drafter, "model") else None
++        model = None
++        for attr in ("drafter", "speculator"):
++            owner = getattr(model_runner, attr, None)
++            model = getattr(owner, "model", None)
++            if model is not None:
++                break
+         assert model is not None, (
+-            "load_quanted_weights(is_drafter=True) requires model_runner.drafter.model "
++            "load_quanted_weights(is_drafter=True) requires model_runner.drafter.model or "
++            "model_runner.speculator.model "
+             "to be present and non-None for FP8 weight loading."
+         )
+     else:
+diff --git a/verl/workers/rollout/vllm_rollout/utils.py b/verl/workers/rollout/vllm_rollout/utils.py
+index 22a4b274cd33a24325805e3faa02c6f0baa4407e..2287ec63c3d2ad57bc65d65e6aeeaf4ef83500df 100644
+--- a/verl/workers/rollout/vllm_rollout/utils.py
++++ b/verl/workers/rollout/vllm_rollout/utils.py
+@@ -210,9 +210,15 @@ class vLLMColocateWorkerExtension:
+         return instance
+ 
+     def _get_drafter_model(self):
+-        """Return the drafter's model object, or None if unavailable."""
+-        drafter = getattr(self.model_runner, "drafter", None)
+-        return drafter.model if drafter is not None and hasattr(drafter, "model") else None
++        """Return the V1 drafter or V2 speculator model, if available."""
++        # V2 renamed the draft-model owner to speculator. Resolve both so MTP
++        # weight loading, buffer updates, and post-processing include its model.
++        for attr in ("drafter", "speculator"):
++            owner = getattr(self.model_runner, attr, None)
++            model = getattr(owner, "model", None)
++            if model is not None:
++                return model
++        return None
+ 
+     def _get_draft_model_config(self):
+         """Return the draft model config from speculative_config, or None."""

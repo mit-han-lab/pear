@@ -84,7 +84,7 @@ class LMCacheSidecar:
             "--http-port",
             str(self.http_port),
             # no --chunk-size: LMCache's default is the least chunk, which its vLLM connector raises to a multiple of
-            # the engine's KV cache block (all its groups' blocks) when the replica registers
+            # the engine's KV cache block (all its groups' blocks) when the replica registers, whatever a drafter adds
             "--separate-object-groups",
             "--l1-size-gb",
             str(self.l1_size_gb),

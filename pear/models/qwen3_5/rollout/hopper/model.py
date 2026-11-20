@@ -1,5 +1,5 @@
+from pear.models.qwen3_5.rollout.gdn import GDNProjection
 from pear.models.qwen3_5.rollout.hopper.all_reduce import AllReduceNorm
-from pear.models.qwen3_5.rollout.hopper.gdn import GDNProjection
 from pear.models.qwen3_5.rollout.hopper.model_state import HopperRolloutModelState
 from pear.models.qwen3_5.rollout.model import (
     Qwen3_5RolloutDecoderLayer,

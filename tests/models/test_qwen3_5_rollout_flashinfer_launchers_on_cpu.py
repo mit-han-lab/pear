@@ -162,10 +162,11 @@ def test_the_attention_gives_the_trtllm_launchers_none_only_where_they_may(monke
     lens = torch.tensor([20, 7, 3], dtype=torch.int32)
     tables = torch.arange(6, dtype=torch.int32).view(3, 2)
     md = types.SimpleNamespace(
+        num_decodes=2,
         num_decode_tokens=2,
         num_actual_tokens=5,
         num_prefills=1,
-        decode=types.SimpleNamespace(block_tables=tables[:2], seq_lens=lens[:2], max_seq_len=20),
+        decode=types.SimpleNamespace(block_tables=tables[:2], seq_lens=lens[:2], max_seq_len=20, q_len_per_req=1),
         prefill=types.SimpleNamespace(
             block_tables=tables[2:],
             seq_lens=lens[2:],

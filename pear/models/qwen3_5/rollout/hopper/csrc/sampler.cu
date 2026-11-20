@@ -1,6 +1,7 @@
 // Fused random sampling without top-k / top-p (vLLM's TopKTopPSampler native path) with processed log-probs: per row
 // of fp32 logits x at temperature t, y = x / t: logprobs = log_softmax(y), sampled ~ softmax(y), the top-K log-probs
-// with their ids, the sampled token's log-prob and its rank (the tokens whose log-prob is >= its own)
+// with their ids, the sampled token's log-prob and its rank (the tokens whose log-prob is >= its own), and the row's
+// count of NaN and +inf y, corrupted logits the rollout raises on
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <torch/all.h>
@@ -98,6 +99,7 @@ struct Params {
   int32_t* out_ids;  // [B][k + 1]: sampled, then the top k
   float* out_lp;     // [B][k + 1]
   int64_t* ranks;    // [B]
+  int32_t* nonfinite;  // [B]
   int k;             // returned top count (<= K)
 };
 
@@ -106,8 +108,9 @@ __device__ __forceinline__ float temp_of(const Params& p, int b) { return p.temp
 // y = x / t exactly as vLLM's in-place division (skipped for t == 1, where it is the identity)
 __device__ __forceinline__ float scaled(float x, float t, bool scale) { return scale ? x / t : x; }
 
-// grid chunks x rows: per chunk the max m and the sum s of exp(y - m), and a top-K list (a sorted 32-entry list per
-// warp, fed by single insertions of the values above the CTA's running threshold; the lists merged)
+// grid chunks x rows: per chunk the max m and the sum s of exp(y - m) (NaN with a NaN or +inf y), and a top-K list (a
+// sorted 32-entry list per warp, fed by single insertions of the values above the CTA's running threshold; the lists
+// merged)
 __global__ void __launch_bounds__(NT1) pass1(const Params p) {
   const int c = blockIdx.x, b = blockIdx.y;
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -179,6 +182,9 @@ __global__ void __launch_bounds__(NT1) pass1(const Params p) {
     }
   }
 
+  // a thread with a NaN or +inf y: its s NaN or its m +inf (the chunk's s left NaN below)
+  const bool is_nonfinite = isnan(s) || m == INFINITY;
+
   __shared__ float sm_m[NW1], sm_s[NW1];
   __shared__ float sm_lv[NW1][32];
   __shared__ int sm_li[NW1][32];
@@ -195,7 +201,7 @@ __global__ void __launch_bounds__(NT1) pass1(const Params p) {
   }
   sm_lv[warp][lane] = lv;
   sm_li[warp][lane] = li;
-  __syncthreads();
+  const bool has_nonfinite = __syncthreads_or(is_nonfinite);
   if (warp == 0) {
     float M = -FLT_MAX, S = 0.f;
     for (int w = 0; w < NW1; ++w) {
@@ -209,7 +215,7 @@ __global__ void __launch_bounds__(NT1) pass1(const Params p) {
     ChunkRec* rec = p.recs + (int64_t)b * p.chunks + c;
     if (lane == 0) {
       rec->m = M;
-      rec->s = S;
+      rec->s = has_nonfinite ? NAN : S;  // (pass2 counts the row's NaN and +inf y when its sum is NaN)
     }
     rec->topv[lane] = v;
     rec->topi[lane] = i;
@@ -217,7 +223,8 @@ __global__ void __launch_bounds__(NT1) pass1(const Params p) {
 }
 
 // one warp per row: log Z, the top-K, and the first level of the draw, exact inverse-CDF sampling from one uniform per
-// row (Philox, counter = (offset, row)): the chunk that holds it by the chunks' masses, and the mass left inside it
+// row (Philox, counter = (offset, row)): the chunk that holds it by the chunks' masses, and the mass left inside it;
+// the row's count of NaN and +inf y, read again when its sum is NaN (with them only)
 __global__ void __launch_bounds__(32) pass2(const Params p) {
   const int b = blockIdx.x, lane = threadIdx.x;
   const ChunkRec* recs = p.recs + (int64_t)b * p.chunks;
@@ -255,6 +262,16 @@ __global__ void __launch_bounds__(32) pass2(const Params p) {
     rr.m = recs[chosen].m;
     rr.r = (float)((target - cum) / exp((double)recs[chosen].m - M));
   }
+  // the row's NaN and +inf y, read again when its sum is NaN (the same on every lane), after the outputs
+  int nonfinite_count = 0;
+  if (isnan(S)) {
+    const float* row = p.logits + (int64_t)b * p.stride;
+    const float t = temp_of(p, b);
+    for (int j = lane; j < p.V; j += 32) nonfinite_count += !(scaled(row[j], t, t != 1.f) < INFINITY);
+#pragma unroll
+    for (int o = 16; o; o >>= 1) nonfinite_count += __shfl_xor_sync(0xffffffffu, nonfinite_count, o);
+  }
+  if (lane == 0) p.nonfinite[b] = nonfinite_count;
 }
 
 // one CTA per row: the token of the chosen chunk where the running mass passes r, by a scan of that chunk only; its
@@ -349,7 +366,7 @@ __global__ void __launch_bounds__(NT1) pass4(const Params p) {
 
 void fused_sample(const torch::Tensor& logits, const torch::Tensor& temperature, int64_t seed, int64_t offset,
                   int64_t k, torch::Tensor& workspace, torch::Tensor& sampled, torch::Tensor& out_ids,
-                  torch::Tensor& out_lp, torch::Tensor& ranks) {
+                  torch::Tensor& out_lp, torch::Tensor& ranks, torch::Tensor& nonfinite) {
   TORCH_CHECK(logits.scalar_type() == at::kFloat && logits.dim() == 2 && logits.stride(1) == 1, "logits");
   TORCH_CHECK(logits.stride(0) % 4 == 0 && reinterpret_cast<uintptr_t>(logits.data_ptr()) % 16 == 0, "align");
   TORCH_CHECK(k >= 1 && k <= K, "k");
@@ -370,7 +387,8 @@ void fused_sample(const torch::Tensor& logits, const torch::Tensor& temperature,
   TORCH_CHECK(workspace.numel() * workspace.element_size() >= need, "workspace");
   TORCH_CHECK(sampled.scalar_type() == at::kLong && ranks.scalar_type() == at::kLong &&
                   out_ids.scalar_type() == at::kInt && out_lp.scalar_type() == at::kFloat && out_ids.is_contiguous() &&
-                  out_lp.is_contiguous() && out_ids.size(1) == k + 1 && out_lp.size(1) == k + 1,
+                  out_lp.is_contiguous() && out_ids.size(1) == k + 1 && out_lp.size(1) == k + 1 &&
+                  nonfinite.scalar_type() == at::kInt && nonfinite.numel() >= B,
               "outputs");
   p.V = V;
   p.B = B;
@@ -385,12 +403,16 @@ void fused_sample(const torch::Tensor& logits, const torch::Tensor& temperature,
   p.out_ids = out_ids.data_ptr<int32_t>();
   p.out_lp = out_lp.data_ptr<float>();
   p.ranks = ranks.data_ptr<int64_t>();
+  p.nonfinite = nonfinite.data_ptr<int32_t>();
   p.k = k;
   if (B == 0) return;
   auto stream = at::cuda::getCurrentCUDAStream();
   pass1<<<dim3(chunks, B), NT1, 0, stream>>>(p);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
   pass2<<<B, 32, 0, stream>>>(p);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
   pass3<<<B, NT3, 0, stream>>>(p);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
   pass4<<<dim3(chunks, B), NT1, 0, stream>>>(p);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -400,6 +422,6 @@ void fused_sample(const torch::Tensor& logits, const torch::Tensor& temperature,
 TORCH_LIBRARY_FRAGMENT(pear_rollout_hopper, m) {
   m.def(
       "fused_sample(Tensor logits, Tensor temperature, int seed, int offset, int k, Tensor(a!) workspace, "
-      "Tensor(b!) sampled, Tensor(c!) out_ids, Tensor(d!) out_lp, Tensor(e!) ranks) -> ()");
+      "Tensor(b!) sampled, Tensor(c!) out_ids, Tensor(d!) out_lp, Tensor(e!) ranks, Tensor(f!) nonfinite) -> ()");
 }
 TORCH_LIBRARY_IMPL(pear_rollout_hopper, CUDA, m) { m.impl("fused_sample", &sampler::fused_sample); }
