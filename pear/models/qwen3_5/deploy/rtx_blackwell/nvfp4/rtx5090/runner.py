@@ -15,9 +15,9 @@ from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 
-from pear.models.qwen3_5.deploy.rtx_blackwell.nvfp4.draft import INT32_BYTES, DraftLaunch
-from pear.models.qwen3_5.deploy.rtx_blackwell.nvfp4.schedule import NT, SS_HOST
-from pear.models.qwen3_5.deploy.rtx_blackwell.nvfp4.step import DecodeStep, ModelView
+from pear.models.qwen3_5.deploy.rtx_blackwell.nvfp4.rtx5090.draft import INT32_BYTES, DraftLaunch
+from pear.models.qwen3_5.deploy.rtx_blackwell.nvfp4.rtx5090.schedule import NT, SS_HOST
+from pear.models.qwen3_5.deploy.rtx_blackwell.nvfp4.rtx5090.step import DecodeStep, ModelView
 from pear.utils.logging_utils import get_logger
 
 if TYPE_CHECKING:  # annotations only

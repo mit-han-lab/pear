@@ -2,7 +2,7 @@
 // path: the sampled token, then the k largest logits by (logit desc, index asc) as torch.topk breaks ties; logprob =
 // x - max - log(sum exp(x - max)) in fp32; the sampled token's rank, the count of logits >= its own.
 #pragma once
-#include "common.cuh"
+// (after the GPU's csrc/common.cuh, which every includer includes first)
 
 namespace mk {
 
