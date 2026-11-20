@@ -29,7 +29,7 @@ bash scripts/install.sh libero_run
 
 1. The base model, from the Hugging Face Hub
 2. The LIBERO simulator environment
-3. The training and rollout environment: PyTorch, vLLM, the patched veRL and PEAR
+3. The training and rollout environment: PyTorch, vLLM, the patched verl and PEAR
 4. A check on the GPU: the environment's tests, then one action in a simulator
 
 A successful install ends with the simulator's reply:

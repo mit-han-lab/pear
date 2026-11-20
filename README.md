@@ -26,7 +26,7 @@ an open 27B reasoning model learns to use real robots entirely in simulation, wi
 
 PEAR trains with:
 
-- Fully asynchronous RL on [veRL](https://github.com/volcengine/verl)
+- Fully asynchronous RL on [verl](https://github.com/volcengine/verl)
 - GRPO, dynamic sampling, and Score Centering
 - FSDP and sequence parallelism for long-context training
 - Memory-efficient training with gradient checkpointing and activation offloading
@@ -97,5 +97,5 @@ Then start a Ray cluster and launch your first run:
 
 ## Acknowledgment
 
-PEAR is built upon [veRL](https://github.com/volcengine/verl) and [LMCache](https://github.com/LMCache/LMCache), and
+PEAR is built upon [verl](https://github.com/volcengine/verl) and [LMCache](https://github.com/LMCache/LMCache), and
 uses [vLLM](https://github.com/vllm-project/vllm), and [Ray](https://github.com/ray-project/ray).
