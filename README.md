@@ -45,6 +45,10 @@ PEAR deploys with:
 - A [model server](examples/models/qwen3_8_27b_pear/deploy/README.md): vLLM server on one RTX 5090 or GB300, with decode megakernels
 - A [robot station](examples/models/qwen3_8_27b_pear/deploy/README.md#drive-a-robot): the agent loop that drives a YAM or an SO-101 robot
 
+## News
+
+- [2026/11] 🔥 Check out our latest [DFlash2 checkpoint](https://huggingface.co/mit-han-lab/Qwen3.8-27B-PEAR-DFlash2) for Qwen3.8-27B-PEAR! With it, the NVFP4 model decodes at **921 tokens/s** on one GB300 and **262 tokens/s** on one RTX 5090!
+
 ## Getting Started
 
 Install PEAR and everything a LIBERO run needs, on a GPU node:
