@@ -8,16 +8,15 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     get_masked_input_and_mask,
 )
-from vllm.model_executor.models.qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
-from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 from vllm.triton_utils import tl, triton
 
+from pear.models.qwen3_5.rollout.attention import Qwen3_5RolloutAttention
 from pear.models.qwen3_5.rollout.blackwell.attention import VerifyAttention
 from pear.models.qwen3_5.rollout.blackwell.gemm import GemmTableLinearMethod, PartialSumsLinearMethod, StreamGemm
 from pear.models.qwen3_5.rollout.blackwell.model_state import BlackwellRolloutModelState
-from pear.models.qwen3_5.rollout.blackwell.rope import Fp32Rope
 from pear.models.qwen3_5.rollout.blackwell.vision import BlackwellVisionTransformer
 from pear.models.qwen3_5.rollout.gdn import GDNProjection
+from pear.models.qwen3_5.rollout.mlp import Qwen3_5RolloutMLP
 from pear.models.qwen3_5.rollout.model import (
     Qwen3_5RolloutDecoderLayer,
     Qwen3_5RolloutForCausalLM,
@@ -120,29 +119,24 @@ class LogitsGatherBuffers:
             cls.instance = cls(group, max_rows, vocab_size, device)
 
 
-class BlackwellQwen3_5MLP(Qwen3NextMLP):
-    """vLLM's dense SwiGLU MLP whose gate_up projection and SiLU-and-mul are one stream GEMM at decode sizes."""
+class BlackwellQwen3_5MLP(Qwen3_5RolloutMLP):
+    """The rollout's dense MLP whose gate_up projection and SiLU-and-mul are one stream GEMM at decode sizes."""
 
     def forward(self, x):
+        # the stream GEMM's epilogue takes silu(gate) * up from its fp32 sums and rounds it once; larger steps take the
+        # rollout MLP's
         weight = self.gate_up_proj.weight
-        if StreamGemm.takes(x, weight, StreamGemm.SWIGLU_MAX_ROWS):
-            out = torch.ops.pear_rollout_blackwell.sg_swiglu(x, weight)
-        else:
-            gate_up, _ = self.gate_up_proj(x)
-            out = self.act_fn(gate_up)
-        out, _ = self.down_proj(out)
+        if not StreamGemm.takes(x, weight, StreamGemm.SWIGLU_MAX_ROWS):
+            return super().forward(x)
+
+        out, _ = self.down_proj(torch.ops.pear_rollout_blackwell.sg_swiglu(x, weight))
 
         return out
 
 
-class BlackwellQwen3_5Attention(Qwen3NextAttention):
-    """vLLM's gated full attention whose output gate x * sigmoid(gate) is one kernel with torch's roundings
+class BlackwellQwen3_5Attention(Qwen3_5RolloutAttention):
+    """The rollout's gated full attention whose output gate x * sigmoid(gate) is one kernel in fp32 rounded to bf16 once
     (csrc/output_gate.cu), a programmatic dependent that lets o_proj's GEMM stream its weights while it runs."""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # Qwen3.5's output gate, unfused in vLLM's generic layer
-        assert self.attn_output_gate and not self.use_fused_output_gate
 
     def forward(self, positions, hidden_states):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -251,8 +245,8 @@ class PartialRowsVocabParallelEmbedding(VocabParallelEmbedding):
 
 
 class BlackwellQwen3_5Model(Qwen3_5RolloutModel):
-    """The Qwen3.5 language model on an fp32 residual stream with fused all-reduces and RMSNorms, its rotary embedding
-    and its final norm's output in fp32."""
+    """The Qwen3.5 language model on an fp32 residual stream with fused all-reduces and RMSNorms, its final norm's
+    output in fp32."""
 
     decoder_layer_cls = BlackwellQwen3_5DecoderLayer
     embedding_cls = PartialRowsVocabParallelEmbedding
@@ -275,8 +269,6 @@ class BlackwellQwen3_5Model(Qwen3_5RolloutModel):
             group.device_group, vllm_config.scheduler_config.max_num_batched_tokens, self.config.hidden_size, device
         )
         VerifyAttention.create(device)
-
-        Fp32Rope.install(self)
 
     def embed_input_ids(self, input_ids):
         # this rank's partial rows: the first decoder layer's norm sums them (vLLM's MTP drafter shares embed_tokens and

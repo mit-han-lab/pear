@@ -10,34 +10,33 @@ from pear.models.qwen3_5.rollout.model import (
 
 
 class HopperQwen3_5DecoderLayer(Qwen3_5RolloutDecoderLayer):
-    """A dense decoder layer whose row-parallel outputs the next norm all-reduces (AllReduceNorm)."""
+    """A dense decoder layer on the fp32 residual stream, whose row-parallel outputs the next norm all-reduces
+    (AllReduceNorm)."""
 
     reduce_results = False
 
     def forward(self, hidden_states, residual, positions=None, **kwargs):
-        # the first layer's input is the whole embedding, normed alone; its post-attention norm starts a uniform decode
-        # step's fp32 residual stream from it
-        starts_stream = residual is None
-        if starts_stream:
-            residual = hidden_states
+        # the first layer's input is the whole embedding, normed alone; it starts the fp32 residual stream (its bf16
+        # values exactly)
+        if residual is None:
+            residual = hidden_states.float()
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = AllReduceNorm.apply(hidden_states, residual, self.input_layernorm, False)
+            hidden_states, residual = AllReduceNorm.apply(hidden_states, residual, self.input_layernorm)
 
         if self.layer_type == "linear_attention":
             hidden_states = self.linear_attn(hidden_states=hidden_states)
         else:
             hidden_states = self.self_attn(hidden_states=hidden_states, positions=positions)
 
-        hidden_states, residual = AllReduceNorm.apply(
-            hidden_states, residual, self.post_attention_layernorm, starts_stream
-        )
+        hidden_states, residual = AllReduceNorm.apply(hidden_states, residual, self.post_attention_layernorm)
 
         return self.mlp(hidden_states), residual
 
 
 class HopperQwen3_5Model(Qwen3_5RolloutModel):
-    """The Qwen3.5 language model whose norms all-reduce the row-parallel outputs before them, the final one too."""
+    """The Qwen3.5 language model on an fp32 residual stream, whose norms all-reduce the row-parallel outputs before
+    them, the final one too."""
 
     decoder_layer_cls = HopperQwen3_5DecoderLayer
 
@@ -48,7 +47,7 @@ class HopperQwen3_5Model(Qwen3_5RolloutModel):
         for layer in self.layers[self.start_layer : self.end_layer]:
             hidden_states, residual = layer(positions=positions, hidden_states=hidden_states, residual=residual)
 
-        hidden_states, _ = AllReduceNorm.apply(hidden_states, residual, self.norm, False)
+        hidden_states, _ = AllReduceNorm.apply(hidden_states, residual, self.norm)
 
         return hidden_states
 
@@ -60,17 +59,12 @@ class HopperQwen3_5ForCausalLM(Qwen3_5RolloutForCausalLM):
 
 
 class HopperQwen3_5ForConditionalGeneration(Qwen3_5RolloutForConditionalGeneration):
-    """The Qwen3.5 vision-language model of a Hopper replica, its pure decode steps on the decode kernels."""
+    """The Qwen3.5 vision-language model of a Hopper replica, on an fp32 residual stream with fused all-reduces."""
 
     causal_lm_cls = HopperQwen3_5ForCausalLM
     model_state_cls = HopperRolloutModelState
 
     def process_weights_after_loading(self) -> None:
-        # every rank after every load (collectives): the merged GDN projections and the all-reduces' workspaces, for
-        # the widest uniform decode step (every request with its drafts)
+        # every rank after every load (collectives): the merged GDN projections and the all-reduces' workspaces
         GDNProjection.check(self)
-        vllm_config = self.language_model.vllm_config
-        AllReduceNorm.create_workspace(
-            self.config.get_text_config().hidden_size,
-            vllm_config.scheduler_config.max_num_seqs * vllm_config.uniform_decode_query_len,
-        )
+        AllReduceNorm.create_workspace(self)

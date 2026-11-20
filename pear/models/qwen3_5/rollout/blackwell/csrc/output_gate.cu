@@ -1,6 +1,6 @@
-// The output gate of a gated full-attention layer, out = x * sigmoid(gate) in bf16 with torch's roundings (the sigmoid
-// rounded to bf16, then the product), as a programmatic dependent that lets the next kernel launch at once: o_proj's
-// GEMM streams its weights while this kernel waits for the attention and gates its output.
+// The output gate of a gated full-attention layer, out = x * sigmoid(gate) in fp32 rounded to bf16 once (torch's fp32
+// sigmoid and product), as a programmatic dependent that lets the next kernel launch at once: o_proj's GEMM streams its
+// weights while this kernel waits for the attention and gates its output.
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <torch/all.h>
@@ -21,15 +21,15 @@ struct alignas(16) Bf16x8 {
   __nv_bfloat16 v[kVec];
 };
 
-// torch's bf16 sigmoid, 1 / (1 + exp(-g)) in fp32 with IEEE addition and division (no flush to zero), rounded to bf16
-__device__ __forceinline__ float sigmoid_bf16(float g) {
+// torch's fp32 sigmoid, 1 / (1 + exp(-g)) with IEEE addition and division (no flush to zero)
+__device__ __forceinline__ float sigmoid_f32(float g) {
   float d, s;
   asm("add.rn.f32 %0, %1, %2;" : "=f"(d) : "f"(1.f), "f"(__nv_expf(-g)));
   asm("div.rn.f32 %0, %1, %2;" : "=f"(s) : "f"(1.f), "f"(d));
-  return __bfloat162float(__float2bfloat16_rn(s));
+  return s;
 }
 
-// torch's bf16 product: in fp32 (no flush to zero), rounded to bf16
+// torch's fp32 product (no flush to zero), rounded to bf16
 __device__ __forceinline__ __nv_bfloat16 mul_bf16(float a, float b) {
   float p;
   asm("mul.rn.f32 %0, %1, %2;" : "=f"(p) : "f"(a), "f"(b));
@@ -51,12 +51,13 @@ __global__ void __launch_bounds__(kThreads) output_gate_kernel(const Bf16x8* __r
     Bf16x8 o;
 #pragma unroll
     for (int e = 0; e < kVec; e++)
-      o.v[e] = mul_bf16(__bfloat162float(xv.v[e]), sigmoid_bf16(__bfloat162float(gv.v[e])));
+      o.v[e] = mul_bf16(__bfloat162float(xv.v[e]), sigmoid_f32(__bfloat162float(gv.v[e])));
     out[i] = o;
   }
 }
 
-// x [T, D] contiguous bf16, gate [T, D] bf16 with unit column stride: x * sigmoid(gate) as torch computes it
+// x [T, D] contiguous bf16, gate [T, D] bf16 with unit column stride: x * sigmoid(gate) as torch computes it in fp32,
+// rounded to bf16 once
 torch::Tensor output_gate(torch::Tensor x, torch::Tensor gate) {
   TORCH_CHECK(x.dim() == 2 && gate.dim() == 2 && x.sizes() == gate.sizes(), "output_gate: x and gate [T, D]");
   TORCH_CHECK(x.scalar_type() == torch::kBFloat16 && gate.scalar_type() == torch::kBFloat16, "output_gate: bf16");

@@ -27,20 +27,40 @@ def extension():
     BlackwellExtension.load()
 
 
-@pytest.mark.parametrize("T, D, gate_scale", SHAPES)
-def test_the_output_gate_is_torch_s_bitwise(T, D, gate_scale):
+def gated_rows(T: int, D: int, gate_scale: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """An attention output [T, D] and its gate, a strided view of wider rows (the kernel reads rows of any stride)."""
     generator = torch.Generator(device=DEVICE).manual_seed(SEED)
     x = (torch.randn(T, D, generator=generator, device=DEVICE) * 2).bfloat16()
-    # the gate as the attention layer hands it over, a strided view of the projection's output
     gate = (torch.randn(T, 2 * D, generator=generator, device=DEVICE) * gate_scale).bfloat16()[:, D:]
+
+    return x, gate
+
+
+def rounded_once(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    """x * sigmoid(gate) as torch computes it in fp32, rounded to bf16 once."""
+    return (x.float() * torch.sigmoid(gate.float())).bfloat16()
+
+
+@pytest.mark.parametrize("T, D, gate_scale", SHAPES)
+def test_the_output_gate_is_torch_s_fp32_gate_rounded_once(T, D, gate_scale):
+    x, gate = gated_rows(T, D, gate_scale)
 
     out = torch.ops.pear_rollout_blackwell.output_gate(x, gate)
 
-    assert torch.equal(out.view(torch.int16), (x * torch.sigmoid(gate)).view(torch.int16))
+    assert torch.equal(out.view(torch.int16), rounded_once(x, gate).view(torch.int16))
+
+
+def test_torch_s_bf16_gate_rounds_twice():
+    # the control: torch's bf16 chain rounds sigmoid(gate) to bf16 before the product, which the kernel does not
+    x, gate = gated_rows(*SHAPES[0])
+
+    out = torch.ops.pear_rollout_blackwell.output_gate(x, gate)
+
+    assert not torch.equal(out, x * torch.sigmoid(gate))
 
 
 @pytest.mark.parametrize("x_value", INPUTS)
-def test_every_finite_bf16_gate_is_torch_s_bitwise(x_value):
+def test_every_finite_bf16_gate_is_torch_s_fp32_gate_rounded_once(x_value):
     gate = torch.arange(BF16_PATTERNS, dtype=torch.int32, device=DEVICE).to(torch.int16).view(torch.bfloat16)
     gate = gate[torch.isfinite(gate.float())]
     gate = gate[: gate.numel() // VECTOR * VECTOR].view(1, -1).contiguous()
@@ -48,4 +68,4 @@ def test_every_finite_bf16_gate_is_torch_s_bitwise(x_value):
 
     out = torch.ops.pear_rollout_blackwell.output_gate(x, gate)
 
-    assert torch.equal(out.view(torch.int16), (x * torch.sigmoid(gate)).view(torch.int16))
+    assert torch.equal(out.view(torch.int16), rounded_once(x, gate).view(torch.int16))

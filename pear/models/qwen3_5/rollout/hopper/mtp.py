@@ -7,10 +7,10 @@ from vllm.distributed import get_tp_group
 from vllm.model_executor.layers.linear import LinearBase, ReplicatedLinear, UnquantizedLinearMethod
 from vllm.model_executor.models.interfaces import _require_is_multimodal
 from vllm.model_executor.models.utils import _merge_multimodal_embeddings
-from vllm.models.qwen3_5 import Qwen3_5MTP
 from vllm.triton_utils import tl, triton
 
 from pear.models.qwen3_5.rollout.hopper.all_reduce import AllReduceNorm
+from pear.models.qwen3_5.rollout.mtp import Qwen3_5RolloutMTP
 
 
 @triton.jit(do_not_specialize=["start", "end", "hidden_stride"])
@@ -151,8 +151,8 @@ class DraftFcLinear(ReplicatedLinear):
         param.data.copy_(torch.cat([embedding_block, hidden_columns], dim=1))
 
 
-class HopperQwen3_5MTP(Qwen3_5MTP):
-    """vLLM's Qwen3.5 MTP drafter on the Hopper replica's fused kernels: its fc row-parallel on each rank's partial
+class HopperQwen3_5MTP(Qwen3_5RolloutMTP):
+    """The rollout's MTP drafter on the Hopper replica's fused kernels: its fc row-parallel on each rank's partial
     embedding rows (DraftFcLinear, no embedding all-reduce and no gather), its three norms fused with the all-reduces
     (AllReduceNorm), and its greedy token two kernels after the lm_head's cuBLASLt GEMM (csrc/draft_gemm.cpp), the
     ranks' best exchanged over NVLink (DraftArgmaxBuffers)."""
@@ -208,17 +208,16 @@ class HopperQwen3_5MTP(Qwen3_5MTP):
         self, input_ids, positions, hidden_states, intermediate_tensors=None, inputs_embeds=None, spec_step_idx=0
     ):
         # inputs_embeds, when given, are this rank's partial rows (embed_input_ids). Every norm takes the preceding
-        # row-parallel output's all-reduce; the first starts the residual from the fc's sum
+        # row-parallel output's all-reduce; the first starts the fp32 residual stream from the fc's sum
         mtp = self.model
         layer = mtp.layers[spec_step_idx % mtp.num_mtp_layers]
-        AllReduceNorm.begin_step(True)
 
         x = mtp.fc(self.fc_input(input_ids, inputs_embeds, hidden_states))
-        x, residual = AllReduceNorm.apply(x, torch.zeros_like(x), layer.input_layernorm, True)
+        x, residual = AllReduceNorm.apply(x, torch.zeros_like(x, dtype=torch.float32), layer.input_layernorm)
         x = layer.self_attn(positions=positions, hidden_states=x)
-        x, residual = AllReduceNorm.apply(x, residual, layer.post_attention_layernorm, False)
+        x, residual = AllReduceNorm.apply(x, residual, layer.post_attention_layernorm)
         x = layer.mlp(x)
-        x, _ = AllReduceNorm.apply(x, residual, mtp.norm, False)
+        x, _ = AllReduceNorm.apply(x, residual, mtp.norm)
 
         return x
 

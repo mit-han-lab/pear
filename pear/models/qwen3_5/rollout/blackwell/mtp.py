@@ -1,15 +1,14 @@
 import torch
 import torch.distributed._symmetric_memory as symm_mem
 from vllm.distributed import get_tp_group
-from vllm.kernels.triton.fused_sigmoid_gate_mul import fused_sigmoid_gate_mul
 from vllm.model_executor.layers.linear import LinearBase, ReplicatedLinear, UnquantizedLinearMethod
 from vllm.model_executor.models.interfaces import _require_is_multimodal
 from vllm.model_executor.models.utils import _merge_multimodal_embeddings
-from vllm.models.qwen3_5 import Qwen3_5MTP
 from vllm.triton_utils import tl, triton
 
 from pear.models.qwen3_5.rollout.blackwell.gemm import DraftGemmTableLinearMethod, DraftPartialsLinearMethod, StreamGemm
 from pear.models.qwen3_5.rollout.blackwell.model import TP_SIZE, BlackwellQwen3_5ForConditionalGeneration
+from pear.models.qwen3_5.rollout.mtp import Qwen3_5RolloutMTP
 from pear.models.qwen3_5.rollout.triton_launcher import TritonLauncher
 
 
@@ -123,11 +122,12 @@ class DraftFcLinear(ReplicatedLinear):
         param.data.copy_(torch.cat([embedding_block, hidden_columns], dim=1))
 
 
-class BlackwellQwen3_5MTP(Qwen3_5MTP):
-    """vLLM's Qwen3.5 MTP drafter on the drafter's GEMM table and the target's fused kernels: its fc row-parallel on
+class BlackwellQwen3_5MTP(Qwen3_5RolloutMTP):
+    """The rollout's MTP drafter on the drafter's GEMM table and the target's fused kernels: its fc row-parallel on
     each rank's partial embedding rows (DraftFcLinear), its norms fused with the all-reduces on an fp32 residual
-    (csrc/ar_norm.cu), the MLP's SwiGLU and the row-parallel projections' split-K sums on the stream GEMM, and its
-    greedy token one kernel after the lm_head's GEMM, the ranks' best swapped over NVLink (csrc/draft_argmax.cu)."""
+    (csrc/ar_norm.cu), its output gate (csrc/output_gate.cu), the MLP's SwiGLU and the row-parallel projections'
+    split-K sums on the stream GEMM, and its greedy token one kernel after the lm_head's GEMM, the ranks' best swapped
+    over NVLink (csrc/draft_argmax.cu)."""
 
     FC_INPUT_WARPS = 8  # warps per row of the fc-input kernel
     SWIGLU_MAX_ROWS = 128  # rows up to which the MLP's SwiGLU stream GEMM beats the GEMM table and the activation
@@ -212,12 +212,7 @@ class BlackwellQwen3_5MTP(Qwen3_5MTP):
         attention_layer = layer.self_attn
         qkv, _ = attention_layer.qkv_proj(normed)
         q, k, v, gate = attention_layer._project_qkv_gate(qkv, positions)
-        attention = attention_layer.attn(q, k, v)
-        if gate is not None:
-            if attention_layer.use_fused_output_gate:
-                attention = fused_sigmoid_gate_mul(attention, gate)
-            else:
-                attention = attention * torch.sigmoid(gate)
+        attention = torch.ops.pear_rollout_blackwell.output_gate(attention_layer.attn(q, k, v), gate)
         if sample_rows is not None:
             attention, residual = attention[sample_rows], residual[sample_rows]
         attention, _ = attention_layer.o_proj(attention)
@@ -231,11 +226,9 @@ class BlackwellQwen3_5MTP(Qwen3_5MTP):
 
         mlp = layer.mlp
         if StreamGemm.takes(normed, mlp.gate_up_proj.weight, self.SWIGLU_MAX_ROWS):
-            activation = torch.ops.pear_rollout_blackwell.sg_swiglu(normed, mlp.gate_up_proj.weight)
+            down, _ = mlp.down_proj(torch.ops.pear_rollout_blackwell.sg_swiglu(normed, mlp.gate_up_proj.weight))
         else:
-            gate_up, _ = mlp.gate_up_proj(normed)
-            activation = mlp.act_fn(gate_up)
-        down, _ = mlp.down_proj(activation)
+            down = mlp(normed)
         hidden_states, _ = ar_add_rmsnorm(down, residual, mtp.norm.weight, mtp.norm.variance_epsilon, False)
 
         return hidden_states

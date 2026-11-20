@@ -1,4 +1,5 @@
 import inspect
+import pathlib
 import pkgutil
 import subprocess
 import sys
@@ -10,12 +11,16 @@ import numpy as np
 import pytest
 import tomllib
 import torch
+import vllm
 from vllm.config import CacheConfig, get_current_vllm_config
 from vllm.config.compilation import CompilationConfig, CUDAGraphMode
+from vllm.model_executor.layers import fused_qk_norm_rope
 from vllm.model_executor.layers.mamba.abstract import get_mamba_prefill_checkpoint_alignment
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import QwenGatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
-from vllm.model_executor.models import ModelRegistry
+from vllm.model_executor.models import ModelRegistry, qwen3_next
+from vllm.model_executor.models.qwen2_moe import Qwen2MoeMLP
+from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 from vllm.model_executor.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from vllm.models import qwen3_5
 from vllm.platforms import current_platform
@@ -45,6 +50,7 @@ from host_staged_buffer import HostStagedBuffer
 from pear.models.kernels import RolloutKernels
 from pear.models.qwen3_5.gpu_backend import VllmGpuBackend
 from pear.models.qwen3_5.rollout import model as rollout_model
+from pear.models.qwen3_5.rollout.attention import Qwen3_5RolloutAttention
 from pear.models.qwen3_5.rollout.blackwell import attention as blackwell_attention
 from pear.models.qwen3_5.rollout.blackwell.attention import (
     SPLIT_FACTOR,
@@ -57,11 +63,11 @@ from pear.models.qwen3_5.rollout.blackwell.cudagraph import BlackwellMixedStepGr
 from pear.models.qwen3_5.rollout.blackwell.gdn.core import GDNCore
 from pear.models.qwen3_5.rollout.blackwell.gdn.layer import BlackwellGDNAttention
 from pear.models.qwen3_5.rollout.blackwell.gpu_backend import BlackwellRolloutGpuBackend
+from pear.models.qwen3_5.rollout.blackwell.model import BlackwellQwen3_5DecoderLayer
 from pear.models.qwen3_5.rollout.blackwell.model_state import BlackwellRolloutModelState
 from pear.models.qwen3_5.rollout.blackwell.mtp import BlackwellQwen3_5MTP
 from pear.models.qwen3_5.rollout.blackwell.sampler import BlackwellRejectionSampler, BlackwellSampler
 from pear.models.qwen3_5.rollout.gdn import RolloutGDNMetadataBuilder
-from pear.models.qwen3_5.rollout.hopper.all_reduce import AllReduceNorm
 from pear.models.qwen3_5.rollout.hopper.attention import (
     HEAD_DIM,
     QUERY_HEADS,
@@ -71,15 +77,18 @@ from pear.models.qwen3_5.rollout.hopper.attention import (
 from pear.models.qwen3_5.rollout.hopper.cudagraph import HopperCudaGraphManager, HopperMixedStepGraphs
 from pear.models.qwen3_5.rollout.hopper.gdn import HopperGDNAttention, HopperGDNMetadataBuilder
 from pear.models.qwen3_5.rollout.hopper.gpu_backend import HopperRolloutGpuBackend
-from pear.models.qwen3_5.rollout.hopper.model import HopperQwen3_5ForConditionalGeneration
+from pear.models.qwen3_5.rollout.hopper.model import HopperQwen3_5DecoderLayer, HopperQwen3_5ForConditionalGeneration
 from pear.models.qwen3_5.rollout.hopper.model_state import HopperRolloutModelState
 from pear.models.qwen3_5.rollout.hopper.mtp import HopperQwen3_5MTP
 from pear.models.qwen3_5.rollout.hopper.sampler import HopperRejectionSampler, HopperSampler
 from pear.models.qwen3_5.rollout.hopper.step_input_arrays import StepInputArrays
+from pear.models.qwen3_5.rollout.mlp import Qwen3_5RolloutMLP
 from pear.models.qwen3_5.rollout.model import Qwen3_5RolloutDecoderLayer
 from pear.models.qwen3_5.rollout.model_state import Qwen3_5RolloutModelState
+from pear.models.qwen3_5.rollout.mtp import Qwen3_5RolloutMTP
 from pear.models.qwen3_5.rollout.nonfinite_logits import NonfiniteCheckedOutput, NonfiniteLogits
 from pear.models.qwen3_5.rollout.rollout_kernels import Qwen3_5RolloutKernels
+from pear.models.qwen3_5.rollout.rope import Fp32Rope
 from pear.models.qwen3_5.rollout.sampler import RolloutSampler
 from pear.models.qwen3_5.rollout.speculator_config import Qwen3_5MTPSpeculatorConfig
 from pear.rollout.config import PearRolloutConfig
@@ -694,35 +703,6 @@ def test_with_a_drafter_the_hopper_gdn_graphs_take_uniform_batches_alone(specula
     assert HopperGDNMetadataBuilder.get_cudagraph_support(vllm_config, None) == cg_support
 
 
-@pytest.mark.parametrize(
-    "for_capture, input_batch, is_uniform_decode",
-    [
-        (True, {"max_query_len": 1}, True),  # a decode graph's capture
-        (True, {"max_query_len": 1 + NUM_SPECULATIVE_TOKENS}, True),  # a verify graph's capture
-        (True, {"max_query_len": 256}, False),  # a mixed graph's capture: a query as long as the graph
-        (False, {"decode_graph_eligible": True, "num_tokens": 40, "num_reqs": 40}, True),  # a decode step
-        (False, {"decode_graph_eligible": True, "num_tokens": 160, "num_reqs": 40}, True),  # a verify step
-        (False, {"decode_graph_eligible": False, "num_tokens": 40, "num_reqs": 40}, False),  # with a new prompt token
-        (False, {"decode_graph_eligible": True, "num_tokens": 90, "num_reqs": 40}, False),  # rows of other lengths
-        (False, {"decode_graph_eligible": False, "num_tokens": 900, "num_reqs": 40}, False),  # a mixed step
-    ],
-)
-def test_the_hopper_all_reduce_takes_the_decode_kernels_in_a_uniform_decode_step(
-    monkeypatch, for_capture, input_batch, is_uniform_decode
-):
-    monkeypatch.setattr(MambaHybridModelState, "prepare_attn", lambda self, *args: {})
-    monkeypatch.setattr(AllReduceNorm, "is_uniform_decode", not is_uniform_decode)
-    model_state = HopperRolloutModelState.__new__(HopperRolloutModelState)
-    # a replica of three drafts: a uniform decode step gives every request one token, or one and its drafts
-    model_state.vllm_config = types.SimpleNamespace(uniform_decode_query_len=1 + NUM_SPECULATIVE_TOKENS)
-
-    model_state.prepare_attn(
-        types.SimpleNamespace(**input_batch), CUDAGraphMode.NONE, None, None, None, None, for_capture=for_capture
-    )
-
-    assert AllReduceNorm.is_uniform_decode is is_uniform_decode
-
-
 def common_metadata(query_lens: list[int], seq_lens: list[int], is_prefilling: list[bool]) -> CommonAttentionMetadata:
     """A step's common attention metadata on the host, as vLLM's V2 runner gives it to a GDN group's builder."""
     qsl = torch.tensor([0, *np.cumsum(query_lens)], dtype=torch.int32)
@@ -811,19 +791,15 @@ def test_the_backends_compute_the_gdn_core_on_vllm_s_fused_decode_path_only(
     assert layer.computes_core(torch.zeros(1, dtype=activations_dtype)) is computes
 
 
-class StandInAttention(torch.nn.Module):
-    """vLLM's full attention as its constructor leaves it for this model on a GPU: its fused q/k norm + RoPE + gate
-    kernel on."""
+def test_the_decoder_layer_builds_the_rollout_attention_and_mlp(monkeypatch):
+    # their own constructors over vLLM's, reduced to what vLLM leaves (an unfused output gate) for want of an engine;
+    # the layer's norms and M-RoPE factor are vLLM's, which need one too
+    def unfused_attention(layer, *args, **kwargs):
+        torch.nn.Module.__init__(layer)
+        layer.use_fused_output_gate = False
 
-    def __init__(self, *args, **kwargs):
-        super().__init__()
-        self.use_fused_qk_norm_rope_gate = True
-
-
-def test_the_decoder_layer_s_attention_takes_no_fused_q_k_norm_rope_kernel(monkeypatch):
-    # the attention alone: the layer's MLP, norms and M-RoPE factor are vLLM's, which need an engine
-    monkeypatch.setattr(Qwen3_5RolloutDecoderLayer, "attention_cls", StandInAttention)
-    monkeypatch.setattr(Qwen3_5RolloutDecoderLayer, "mlp_cls", staticmethod(lambda **kwargs: torch.nn.Identity()))
+    monkeypatch.setattr(Qwen3NextAttention, "__init__", unfused_attention)
+    monkeypatch.setattr(Qwen2MoeMLP, "__init__", lambda mlp, **kwargs: torch.nn.Module.__init__(mlp))
     monkeypatch.setattr(rollout_model, "Qwen3_5RMSNorm", lambda *args, **kwargs: torch.nn.Identity())
     monkeypatch.setattr(rollout_model, "mrope_positions_factor", lambda vllm_config: 1)
     text_config = types.SimpleNamespace(
@@ -838,8 +814,63 @@ def test_the_decoder_layer_s_attention_takes_no_fused_q_k_norm_rope_kernel(monke
 
     layer = Qwen3_5RolloutDecoderLayer(vllm_config, "full_attention", prefix="model.layers.3")
 
-    # q, k and the gate from the layer's own norms and rotary embedding, which a GPU backend may replace
-    assert layer.self_attn.use_fused_qk_norm_rope_gate is False
+    # q, k and the gate from the layer's own fp32 kernel, its output gated by vLLM's fused kernel, its MLP's product
+    # from FlashInfer's: each rounded to bf16 once
+    assert type(layer.self_attn) is Qwen3_5RolloutAttention and layer.self_attn.use_fused_output_gate
+    assert type(layer.mlp) is Qwen3_5RolloutMLP
+
+
+def test_vllm_calls_its_fused_q_k_norm_rope_kernel_only_where_the_rollout_attention_overrides():
+    # vLLM calls fused_qk_rmsnorm_rope_gate from one place, Qwen3NextAttention._project_qkv_gate, which the rollout
+    # attention replaces: no step of a replica, decode, mixed or prefill, reaches the kernel
+    call = f"{fused_qk_norm_rope.fused_qk_rmsnorm_rope_gate.__name__}("
+    definition = pathlib.Path(fused_qk_norm_rope.__file__).resolve()
+    callers = [
+        path.resolve()
+        for path in pathlib.Path(vllm.__file__).parent.rglob("*.py")
+        if path.resolve() != definition and call in path.read_text(errors="replace")
+    ]
+
+    assert callers == [pathlib.Path(qwen3_next.__file__).resolve()]
+    assert inspect.getsource(qwen3_next).count(call) == 1
+    assert inspect.getsource(Qwen3NextAttention._project_qkv_gate).count(call) == 1
+    assert Qwen3_5RolloutAttention._project_qkv_gate is not Qwen3NextAttention._project_qkv_gate
+
+
+def test_the_gpu_backends_compute_as_the_rollout_model_and_drafter():
+    # each backend's decoder layer builds the rollout's attention and MLP or classes of its own over them, and drafts
+    # with a drafter over the rollout's, so that every chain of theirs is rounded to bf16 once
+    for layer_cls in (BlackwellQwen3_5DecoderLayer, HopperQwen3_5DecoderLayer):
+        assert issubclass(layer_cls.attention_cls, Qwen3_5RolloutAttention)
+        assert issubclass(layer_cls.mlp_cls, Qwen3_5RolloutMLP)
+    for gpu_backend in (BlackwellRolloutGpuBackend, HopperRolloutGpuBackend):
+        assert issubclass(gpu_backend.draft_model_cls, Qwen3_5RolloutMTP)
+
+
+def test_the_drafter_s_layers_are_the_rollout_attention_and_mlp_on_an_fp32_rotary_embedding(monkeypatch):
+    # vLLM's drafter reduced to one MTP layer of vLLM's attention and MLP for want of an engine, the attention's output
+    # gate unfused as vLLM's generic attention leaves it
+    def vllm_drafter(drafter, *, vllm_config, prefix=""):
+        torch.nn.Module.__init__(drafter)
+        layer = torch.nn.Module()
+        layer.self_attn = Qwen3NextAttention.__new__(Qwen3NextAttention)
+        layer.mlp = Qwen2MoeMLP.__new__(Qwen2MoeMLP)
+        for module in (layer.self_attn, layer.mlp):
+            torch.nn.Module.__init__(module)
+        layer.self_attn.use_fused_output_gate = False
+        drafter.model = torch.nn.Module()
+        drafter.model.layers = torch.nn.ModuleList([layer])
+
+    installed = []
+    monkeypatch.setattr(qwen3_5.Qwen3_5MTP, "__init__", vllm_drafter)
+    monkeypatch.setattr(Fp32Rope, "install", staticmethod(installed.append))
+
+    drafter = Qwen3_5RolloutMTP(vllm_config=None)
+
+    (layer,) = drafter.model.layers
+    assert type(layer.self_attn) is Qwen3_5RolloutAttention and layer.self_attn.use_fused_output_gate
+    assert type(layer.mlp) is Qwen3_5RolloutMLP
+    assert installed == [drafter]
 
 
 def test_the_decode_attention_splits_over_more_ctas(monkeypatch):

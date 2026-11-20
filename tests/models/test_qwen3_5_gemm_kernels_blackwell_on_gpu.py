@@ -5,6 +5,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from flashinfer.activation import silu_and_mul
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import CommonAttentionMetadata
@@ -15,7 +16,7 @@ from pear.models.qwen3_5.rollout.blackwell.gdn.core import GDNCore
 from pear.models.qwen3_5.rollout.blackwell.gdn.layer import BlackwellGDNMetadataBuilder
 from pear.models.qwen3_5.rollout.blackwell.gemm import GemmTableLinearMethod, PartialSumsLinearMethod, StreamGemm
 from pear.models.qwen3_5.rollout.blackwell.gpu_backend import BlackwellRolloutGpuBackend
-from pear.models.qwen3_5.rollout.blackwell.model import AllReduceBuffers, LogitsGatherBuffers
+from pear.models.qwen3_5.rollout.blackwell.model import AllReduceBuffers, BlackwellQwen3_5MLP, LogitsGatherBuffers
 
 # the GPU backend's own tests run on the GPUs that select it
 pytestmark = pytest.mark.skipif(
@@ -25,6 +26,7 @@ pytestmark = pytest.mark.skipif(
 
 DEVICE = "cuda"
 HIDDEN = 5120  # the model's hidden size, which the fused all-reduce is built for
+INTERMEDIATE = 8704  # the MLP's intermediate channels on one of two ranks
 MAX_TOKENS = 8192  # the replicas' max_num_batched_tokens
 MAX_ROWS = 128  # their max_num_seqs
 EPS = 1e-6  # the norms' epsilon
@@ -106,6 +108,39 @@ def test_the_row_parallel_layers_hand_their_next_norm_partial_sums_at_decode_siz
             torch.testing.assert_close(out.sum(0), want, rtol=1e-4, atol=1e-4)
         else:
             assert torch.equal(out, torch.ops.pear_rollout_blackwell.lt_mm(x, layer.weight))
+
+
+class StandInProjection(torch.nn.Module):
+    """A linear layer as vLLM's return their output: (x @ w^T in bf16, no bias)."""
+
+    def __init__(self, weight: torch.Tensor):
+        super().__init__()
+        self.weight = weight
+
+    def forward(self, x):
+        return x @ self.weight.t(), None
+
+
+@pytest.mark.parametrize("M", [1, StreamGemm.SWIGLU_MAX_ROWS, StreamGemm.SWIGLU_MAX_ROWS + 1])
+def test_the_mlp_takes_the_stream_gemm_s_swiglu_up_to_its_rows_and_the_rollout_mlp_s_above(M):
+    BlackwellExtension.load()
+    generator = torch.Generator(DEVICE).manual_seed(M)
+    x = torch.randn(M, HIDDEN, generator=generator, device=DEVICE).bfloat16()
+    weight = (torch.randn(2 * INTERMEDIATE, HIDDEN, generator=generator, device=DEVICE) * WEIGHT_SCALE).bfloat16()
+    # the projections stand in: gate_up a bf16 GEMM of the weight, down hands its input back
+    mlp = BlackwellQwen3_5MLP.__new__(BlackwellQwen3_5MLP)
+    torch.nn.Module.__init__(mlp)
+    mlp.gate_up_proj = StandInProjection(weight)
+    mlp.down_proj = lambda activation: (activation, None)
+
+    got = mlp(x)
+
+    # each path rounds silu(gate) * up to bf16 once: the stream GEMM's epilogue from its fp32 sums, FlashInfer's
+    # kernel from the projection's bf16 output (vLLM's own rounds silu(gate) first)
+    if M <= StreamGemm.SWIGLU_MAX_ROWS:
+        assert torch.equal(got, torch.ops.pear_rollout_blackwell.sg_swiglu(x, weight))
+    else:
+        assert torch.equal(got, silu_and_mul(x @ weight.t()))
 
 
 def test_the_head_s_high_and_low_rows_are_the_torch_split():

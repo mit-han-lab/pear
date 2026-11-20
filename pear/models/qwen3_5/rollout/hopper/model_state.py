@@ -1,8 +1,6 @@
 import numpy as np
 from vllm.v1.core.sched.output import NewRequestData
-from vllm.v1.worker.gpu.input_batch import InputBatch
 
-from pear.models.qwen3_5.rollout.hopper.all_reduce import AllReduceNorm
 from pear.models.qwen3_5.rollout.hopper.gdn import ReplayState
 from pear.models.qwen3_5.rollout.hopper.sampler import HopperRejectionSampler, HopperSampler
 from pear.models.qwen3_5.rollout.hopper.step_input_arrays import StepInputArrays
@@ -10,10 +8,9 @@ from pear.models.qwen3_5.rollout.model_state import Qwen3_5RolloutModelState
 
 
 class HopperRolloutModelState(Qwen3_5RolloutModelState):
-    """The model state of a Hopper replica: vLLM's hybrid model state with the fused samplers, which tells the decoder
-    layers' all-reduces whether a forward is a uniform decode step, and a new turn's M-RoPE positions from its first
-    uncomputed token on; with a drafter, the Gated DeltaNet layers' replaySSM bookkeeping (ReplayState) in place of
-    vLLM's per-draft-token state copies."""
+    """The model state of a Hopper replica: vLLM's hybrid model state with the fused samplers and a new turn's M-RoPE
+    positions from its first uncomputed token on; with a drafter, the Gated DeltaNet layers' replaySSM bookkeeping
+    (ReplayState) in place of vLLM's per-draft-token state copies."""
 
     sampler_cls = HopperSampler
     rejection_sampler_cls = HopperRejectionSampler
@@ -83,39 +80,3 @@ class HopperRolloutModelState(Qwen3_5RolloutModelState):
         is_verify = ~is_prefilling & (num_tokens > 0) & (num_tokens <= 1 + self.vllm_config.num_speculative_tokens)
 
         return None if is_verify.all() else is_verify
-
-    def prepare_attn(
-        self,
-        input_batch: InputBatch,
-        cudagraph_mode,
-        block_tables,
-        slot_mappings,
-        attn_groups,
-        kv_cache_config,
-        for_capture=False,
-        ubatch_idx=0,
-        model_specific_attn_metadata=None,
-    ):
-        # vLLM's V2 runner sets up every forward here, the captures' too. A uniform decode step gives every request one
-        # token, or one and its drafts. A FULL graph's capture promises its queries' length (the decode query length in a
-        # decode graph, its token count in a mixed one); a forward without a graph computes its own batch
-        query_lens = (1, self.vllm_config.uniform_decode_query_len)
-        if for_capture:
-            is_uniform_decode = input_batch.max_query_len in query_lens
-        else:
-            is_uniform_decode = input_batch.decode_graph_eligible and any(
-                input_batch.num_tokens == input_batch.num_reqs * query_len for query_len in query_lens
-            )
-        AllReduceNorm.begin_step(is_uniform_decode)
-
-        return super().prepare_attn(
-            input_batch,
-            cudagraph_mode,
-            block_tables,
-            slot_mappings,
-            attn_groups,
-            kv_cache_config,
-            for_capture,
-            ubatch_idx,
-            model_specific_attn_metadata,
-        )

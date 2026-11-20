@@ -6,8 +6,9 @@ import torch
 class Fp32Rope:
     """The Qwen3.5 language model's rotary embedding with an fp32 cos/sin cache and fp32 arithmetic."""
 
-    # vLLM builds the cache in the model's dtype (bf16 cos / sin) and rotates q / k in bf16; here they are rotated in
-    # fp32 and rounded to bf16 once, by vLLM's own paths (the native one's fp32 mode, the mRoPE kernel's cache dtype)
+    # vLLM builds the cache in the model's dtype (bf16 cos / sin) and rotates q / k in bf16; here the attention's q / k
+    # kernel rotates on the fp32 cache, and vLLM's own paths keep it and rotate in fp32 too (the native one's fp32 mode,
+    # the mRoPE kernel's cache dtype)
     @classmethod
     def install(cls, model: torch.nn.Module) -> None:
         """Recompute the model's rotary caches in fp32 and rotate with them in fp32."""

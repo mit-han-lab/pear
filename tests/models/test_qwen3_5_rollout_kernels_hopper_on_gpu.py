@@ -12,7 +12,6 @@ from vllm.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
-from vllm.model_executor.layers.fused_allreduce_gemma_rms_norm import fused_allreduce_gemma_rms_norm
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
 from vllm.models.qwen3_5.nvidia.model import Qwen3_5RMSNorm as VllmQwen3_5RMSNorm
 from vllm.platforms import current_platform
@@ -44,6 +43,7 @@ from pear.models.qwen3_5.rollout.hopper.cudagraph import HopperMixedStepGraphs
 from pear.models.qwen3_5.rollout.hopper.extension import HopperExtension
 from pear.models.qwen3_5.rollout.hopper.gdn import CHUNK, FusedGDNDecode, GDNLayout, MixedStepGDNCore
 from pear.models.qwen3_5.rollout.hopper.gpu_backend import HopperRolloutGpuBackend
+from pear.models.qwen3_5.rollout.hopper.model import HopperQwen3_5DecoderLayer
 from pear.models.qwen3_5.rollout.hopper.sampler import HopperSampler
 
 # the GPU backend's own tests run on the GPUs that select it
@@ -82,6 +82,11 @@ UNWRITTEN = -1  # an id and a rank no pass of the sampler writes
 REFUSED_LAUNCH = "CUDA error: invalid (configuration )?argument"  # the runtime's errors for launch parameters
 NONFINITE_TEMPERATURE = 0.8  # the temperature of the sampler's rows of NaN and infinite logits
 NONFINITE_REQUESTS = ["a-finite-request", "the-request"]  # the step's requests: a finite row, then the row of a kind
+BF16_ROUNDING = 2**-8  # a bf16 rounding's relative error, with margin (half an ulp is 2^-9)
+FP32_ROUNDING = 2**-20  # the relative error of a few fp32 roundings of a sum, against its terms' magnitudes
+NORM_ATOL = 1e-5  # the normed rows' absolute tolerance beside BF16_ROUNDING, for rows near zero
+STREAM_LAYERS = 3  # decoder layers of the residual stream check
+PARTIAL_SCALES = (0.25, 0.5, -0.125, 0.375)  # the stub sublayers' row-parallel partials: the normed rows times these
 
 
 def gdn_layer(generator: torch.Generator) -> types.SimpleNamespace:
@@ -459,9 +464,55 @@ def test_a_pure_decode_step_s_padding_rows_take_no_work():
     assert (out[real_rows:] == 7.0).all()
 
 
+class ScaledPartial:
+    """A stub sublayer that records its normed input rows and returns its rank's row-parallel partial of them: the rows
+    times the rank's scale."""
+
+    def __init__(self, rank: int) -> None:
+        self.rank = rank
+        self.inputs = []
+
+    def __call__(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        self.inputs.append(hidden_states)
+
+        return (hidden_states.float() * PARTIAL_SCALES[self.rank]).bfloat16()
+
+    @staticmethod
+    def partials(hidden_states: torch.Tensor) -> list[torch.Tensor]:
+        """Every rank's partial of the normed rows, in fp64."""
+        return [(hidden_states.float() * scale).bfloat16().double() for scale in PARTIAL_SCALES]
+
+
+class StreamBound:
+    """The error bound of an fp32 residual stream against fp64: each added sum of partials rounded to bf16 once, the
+    fp32 additions, against the terms' magnitudes."""
+
+    def __init__(self, start: torch.Tensor) -> None:
+        self.reduced = torch.zeros_like(start, dtype=torch.float64)
+        self.magnitude = start.double().abs()
+
+    def add(self, partials: list[torch.Tensor]) -> None:
+        """One all-reduce's partials (fp64), added into the stream."""
+        self.reduced += sum(partials).abs()
+        self.magnitude += sum(p.abs() for p in partials)
+
+    def holds(self, stream: torch.Tensor, reference: torch.Tensor) -> bool:
+        """Whether the stream is within the bound of the fp64 reference everywhere."""
+        bound = BF16_ROUNDING * self.reduced + FP32_ROUNDING * self.magnitude
+
+        return bool(((stream.double() - reference).abs() <= bound).all())
+
+
+def rms_reference(residual: torch.Tensor, gamma: torch.Tensor) -> torch.Tensor:
+    """The RMSNorm of the residual rows with Qwen3.5's 1 + w scale, in fp64."""
+    rows = residual.double()
+
+    return rows * torch.rsqrt(rows.pow(2).mean(-1, keepdim=True) + EPS) * (gamma.double() + NORM_BIAS)
+
+
 def four_rank_checks(rank: int, rendezvous: str) -> None:
-    """The decode all-reduce + residual + RMSNorm on one of four ranks, and the decoder layers' op on each path (above
-    the mixed-step graphs vLLM's own one for Qwen3.5 on CUDA)."""
+    """The fused all-reduce + add into the fp32 residual stream + RMSNorm on one of four ranks against fp64: the pair
+    of kernels, the op on each path, and the decoder layers' residual stream from the embedding to the final norm."""
     torch.cuda.set_device(rank)
     with set_current_vllm_config(VllmConfig()):
         init_distributed_environment(TP, rank, f"file://{rendezvous}", rank)
@@ -470,7 +521,9 @@ def four_rank_checks(rank: int, rendezvous: str) -> None:
     AllReduceNorm.register_op()
     ops = torch.ops.pear_rollout_hopper
     generator = torch.Generator(device=DEVICE).manual_seed(6)  # the same draws on every rank
-    AllReduceNorm.create_workspace(HIDDEN, UNIFORM_DECODE_ROWS)
+    text_config = types.SimpleNamespace(hidden_size=HIDDEN)
+    model = types.SimpleNamespace(config=types.SimpleNamespace(get_text_config=lambda: text_config))
+    AllReduceNorm.create_workspace(model)
     workspace = AllReduceNorm.workspace
     buffers = (
         int(workspace.uc_ptrs_dev),
@@ -480,80 +533,99 @@ def four_rank_checks(rank: int, rendezvous: str) -> None:
         int(workspace.rank),
     )
     gamma = (0.1 * torch.randn(HIDDEN, generator=generator, device=DEVICE)).bfloat16()
-    scale = gamma.double() + NORM_BIAS
 
-    # the bf16 residual: the reduced rows (fp32 sums over the ranks in rank order, rounded) added in bf16; up to a
-    # verify step's rows
-    for T in (1, 7, 64, 128, VERIFY_ROWS, UNIFORM_DECODE_ROWS):
-        residual = (3 * torch.randn(T, HIDDEN, generator=generator, device=DEVICE)).bfloat16()
+    # the pair up to the largest mixed-step graph: the reduced rows (fp32 sums over the ranks in rank order, rounded to
+    # bf16) added into the fp32 residual; a verify step's and the widest uniform decode step's rows among them
+    for T in (1, 7, 64, 128, VERIFY_ROWS, UNIFORM_DECODE_ROWS, HopperMixedStepGraphs.MAX_TOKENS):
+        residual = 3 * torch.randn(T, HIDDEN, generator=generator, device=DEVICE)
         partials = [torch.randn(T, HIDDEN, generator=generator, device=DEVICE).bfloat16() for _ in range(TP)]
-        want = (residual.float() + sum(p.float() for p in partials).bfloat16().float()).bfloat16()
-        norm_out = torch.empty_like(residual)
+        want = residual + sum(p.float() for p in partials).bfloat16().float()
+        bound = StreamBound(residual)
+        bound.add([p.double() for p in partials])
+        reference = residual.double() + sum(p.double() for p in partials)
+        norm_out = torch.empty_like(partials[rank])
+
         ops.ar_norm(partials[rank].clone(), residual, gamma, norm_out, *buffers, EPS, NORM_BIAS)
+
         torch.cuda.synchronize()
-        assert torch.equal(residual, want)
-        rms = want.double() * torch.rsqrt(want.double().pow(2).mean(-1, keepdim=True) + EPS) * scale
-        torch.testing.assert_close(norm_out.double(), rms, rtol=1e-2, atol=1e-2)
+        assert torch.equal(residual, want) and bound.holds(residual, reference)
+        torch.testing.assert_close(norm_out.double(), rms_reference(want, gamma), rtol=BF16_ROUNDING, atol=NORM_ATOL)
 
-    # a uniform decode step's fp32 stream: the first layer starts it from the bf16 residual, which stays as it was
-    for T in (7, 64, VERIFY_ROWS):
-        residual = (3 * torch.randn(T, HIDDEN, generator=generator, device=DEVICE)).bfloat16()
-        before = residual.clone()
-        stream = residual.float()
-        norm_out = torch.empty_like(residual)
-        for layer in range(3):
-            partials = [torch.randn(T, HIDDEN, generator=generator, device=DEVICE).bfloat16() for _ in range(TP)]
-            stream = stream + sum(p.float() for p in partials).bfloat16().float()
-            ops.ar_norm(
-                partials[rank].clone(), residual, gamma, norm_out, *buffers, EPS, NORM_BIAS, AllReduceNorm.stream32,
-                layer == 0,
-            )  # fmt: skip
-            torch.cuda.synchronize()
-            assert torch.equal(AllReduceNorm.stream32[:T], stream) and torch.equal(residual, before)
-            rms = stream.double() * torch.rsqrt(stream.double().pow(2).mean(-1, keepdim=True) + EPS) * scale
-            torch.testing.assert_close(norm_out.double(), rms, rtol=1e-2, atol=1e-2)
-
-    # the decoder layers' op: a uniform decode step (a pure decode or a verify step) on the decode kernels (its fp32
-    # stream), a mixed step up to the largest mixed-step graph on FlashInfer's fused kernel, above it vLLM's all-reduce
-    # and FlashInfer's norm (bf16 residuals)
+    # the decoder layers' op: up to the largest mixed-step graph the pair (a verify step's rows among them), above it
+    # vLLM's all-reduce (not in rank order) and the add + RMSNorm kernel; one bf16 rounding of the reduced rows either way
     norm = types.SimpleNamespace(weight=gamma, variance_epsilon=EPS)
-    for is_uniform_decode, T in ((True, 64), (True, VERIFY_ROWS), (False, 64), (False, ABOVE_GRAPH_ROWS)):
-        residual = (3 * torch.randn(T, HIDDEN, generator=generator, device=DEVICE)).bfloat16()
+    for T in (64, VERIFY_ROWS, HopperMixedStepGraphs.MAX_TOKENS, ABOVE_GRAPH_ROWS):
+        residual = 3 * torch.randn(T, HIDDEN, generator=generator, device=DEVICE)
         partials = [torch.randn(T, HIDDEN, generator=generator, device=DEVICE).bfloat16() for _ in range(TP)]
-        reduced = sum(p.float() for p in partials)
-        AllReduceNorm.begin_step(is_uniform_decode)
+        bound = StreamBound(residual)
+        bound.add([p.double() for p in partials])
+        reference = residual.double() + sum(p.double() for p in partials)
 
-        x, new_residual = AllReduceNorm.apply(partials[rank].clone(), residual.clone(), norm, True)
+        x, new_residual = AllReduceNorm.apply(partials[rank].clone(), residual, norm)
 
         torch.cuda.synchronize()
-        want = AllReduceNorm.stream32[:T].double() if is_uniform_decode else new_residual.double()
-        torch.testing.assert_close(want, residual.double() + reduced.double(), rtol=1e-2, atol=5e-2)
-        rms = want * torch.rsqrt(want.pow(2).mean(-1, keepdim=True) + EPS) * scale
-        torch.testing.assert_close(x.double(), rms, rtol=1e-2, atol=1e-2)
+        assert new_residual.dtype == torch.float32 and bound.holds(new_residual, reference)
+        torch.testing.assert_close(x.double(), rms_reference(new_residual, gamma), rtol=BF16_ROUNDING, atol=NORM_ATOL)
 
-    # above the mixed-step graphs the op is vLLM's eager path for Qwen3.5 on CUDA bit for bit: its all-reduce, then the
-    # CUDA model's norm (FlashInfer's fused add + Gemma RMSNorm), not the unfused native norm
+    # the decoder layers keep the residual stream in fp32 from the embedding to the final norm, on either path: every
+    # sublayer's reduced partials added once rounded, the stream itself never
     vllm_norm = VllmQwen3_5RMSNorm(HIDDEN, EPS).to(device=DEVICE, dtype=torch.bfloat16)
     vllm_norm.weight.data.copy_(gamma)
-    residual = (3 * torch.randn(ABOVE_GRAPH_ROWS, HIDDEN, generator=generator, device=DEVICE)).bfloat16()
-    partials = [torch.randn(ABOVE_GRAPH_ROWS, HIDDEN, generator=generator, device=DEVICE).bfloat16() for _ in range(TP)]
-    AllReduceNorm.begin_step(False)
+    for T in (64, ABOVE_GRAPH_ROWS):
+        sublayer = ScaledPartial(rank)
+        layer = types.SimpleNamespace(
+            layer_type="linear_attention",
+            input_layernorm=vllm_norm,
+            post_attention_layernorm=vllm_norm,
+            linear_attn=sublayer,
+            mlp=sublayer,
+        )
+        embedding = (3 * torch.randn(T, HIDDEN, generator=generator, device=DEVICE)).bfloat16()
+        hidden_states, residual = embedding, None
 
-    x, new_residual = AllReduceNorm.apply(partials[rank].clone(), residual.clone(), norm, False)
-    want_x, want_residual = fused_allreduce_gemma_rms_norm(partials[rank].clone(), residual.clone(), vllm_norm)
+        for _ in range(STREAM_LAYERS):
+            hidden_states, residual = HopperQwen3_5DecoderLayer.forward(layer, hidden_states, residual)
+            assert residual.dtype == torch.float32
+        x, residual = AllReduceNorm.apply(hidden_states, residual, vllm_norm)
 
-    torch.cuda.synchronize()
-    assert torch.equal(x, want_x) and torch.equal(new_residual, want_residual)
+        torch.cuda.synchronize()
+        bound = StreamBound(embedding)
+        reference = embedding.double()
+        for rows in sublayer.inputs:
+            partials = ScaledPartial.partials(rows)
+            bound.add(partials)
+            reference = reference + sum(partials)
+        assert len(sublayer.inputs) == 2 * STREAM_LAYERS and bound.holds(residual, reference)
+        assert not torch.equal(residual, residual.bfloat16().float())  # the stream holds more than bf16's bits
+        torch.testing.assert_close(x.double(), rms_reference(residual, gamma), rtol=BF16_ROUNDING, atol=NORM_ATOL)
 
     destroy_model_parallel()
     destroy_distributed_environment()
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < TP, reason="the decode all-reduce runs over four GPUs")
-def test_the_decode_all_reduce_on_four_ranks(tmp_path):
+@pytest.mark.skipif(torch.cuda.device_count() < TP, reason="the fused all-reduce runs over four GPUs")
+def test_the_fused_all_reduces_on_four_ranks(tmp_path):
     # the ranks meet at a file of the test's own: a free port picked beforehand can be taken by another process
     # before rank 0 binds it
     torch.multiprocessing.spawn(four_rank_checks, args=(str(tmp_path / "rendezvous"),), nprocs=TP)
+
+
+def test_the_add_rmsnorm_against_fp64():
+    HopperExtension.load()
+    generator = torch.Generator(device=DEVICE).manual_seed(7)
+    gamma = (0.1 * torch.randn(HIDDEN, generator=generator, device=DEVICE)).bfloat16()
+
+    for T in (1, ABOVE_GRAPH_ROWS):
+        reduced = torch.randn(T, HIDDEN, generator=generator, device=DEVICE).bfloat16()
+        residual = 3 * torch.randn(T, HIDDEN, generator=generator, device=DEVICE)
+        want = residual + reduced.float()
+        norm_out = torch.empty_like(reduced)
+
+        torch.ops.pear_rollout_hopper.add_rmsnorm(reduced, residual, gamma, norm_out, EPS, NORM_BIAS)
+
+        torch.cuda.synchronize()
+        assert torch.equal(residual, want)
+        torch.testing.assert_close(norm_out.double(), rms_reference(want, gamma), rtol=BF16_ROUNDING, atol=NORM_ATOL)
 
 
 def test_the_sampler_draws_from_the_softmax(monkeypatch):
