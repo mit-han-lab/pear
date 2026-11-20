@@ -27,11 +27,12 @@ an open 27B reasoning model learns to use real robots entirely in simulation, wi
 PEAR trains with:
 
 - Fully asynchronous RL on [verl](https://github.com/volcengine/verl)
-- GRPO, dynamic sampling, and Score Centering
+- GRPO, dynamic sampling, and score centering
 - FSDP and sequence parallelism for long-context training
 - Memory-efficient training with gradient checkpointing and activation offloading
 - Prefix caching across rounds, with [LMCache](https://github.com/LMCache/LMCache) offloading the KV cache to CPU
   memory
+- Rollouts with MTP speculative decoding
 - Optimized kernels for H100, H200 and GB300
 - Simulators on the same Ray cluster: MuJoCo on CPUs, Isaac Sim on GPUs
 
