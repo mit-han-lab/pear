@@ -10,8 +10,9 @@ class EndReason(str, Enum):
     """How an episode ends, each by the text its EPISODE_END record names it with."""
 
     ENV = "env"  # the environment finished it
+    FINISH = "finish"  # the model declared the task complete
     PARSE = "parse"  # an answer without a usable action
-    BUDGET = "budget"  # its response tokens ran out
+    BUDGET = "budget"  # its response tokens or native steps ran out
 
 
 @dataclass(eq=False)  # each episode is a run of its own: two are never the same by their contents
@@ -52,5 +53,7 @@ class Episode:
 
     @staticmethod
     def is_success(result: dict[str, Any]) -> bool:
-        """Returns whether ``result`` ends its episode with the task done: its action earned a reward."""
+        """Returns whether the result ends the episode with the task complete."""
+        if "task_success" in result:
+            return bool(result["done"]) and result["task_success"]
         return bool(result["done"]) and sum(float(reward) for reward in result["rewards"]) > 0.0

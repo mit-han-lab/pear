@@ -94,6 +94,14 @@ ROLLOUT_NNODES=32 MODEL=<model dir> EVAL_STEP=<step> RUN=$WORK_DIR/runs/eval bas
 
 The records and the summary land in `$RUN/val_dumps/eval_<step>.jsonl` and `$RUN/val_dumps/eval_<step>_summary.json`.
 
+## Model-controlled completion in LIBERO
+
+Set `policy_finish: true` in the LIBERO entry of the recipe's tool config
+(`actor_rollout_ref.rollout.multi_turn.tool_config_path`). The model can submit its usual action or a fenced JSON block
+containing `{"finish": true}`. Reaching the goal still returns an observation while there is budget for another turn. When the model emits `finish`, LIBERO checks the
+current state and the rollout receives 1 for success or 0 for failure. A rollout that exhausts the native step or token
+budget without finishing receives 0. The episode records `finish` and `budget` as distinct end reasons.
+
 ## Next Steps
 
 - [Robot-Use RL with Qwen3.8-27B](../../examples/models/qwen3_8_27b_pear/train/README.md): stages 2 and 3

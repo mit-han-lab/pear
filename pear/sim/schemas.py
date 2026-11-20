@@ -14,7 +14,11 @@ class ServerContext:
     log: Callable[[str], None]  # appends a message to the server's log
 
 
-class EnvResult(TypedDict):
+class _TerminalResult(TypedDict, total=False):
+    task_success: bool  # explicit verdict for a terminal result in policy finish mode
+
+
+class EnvResult(_TerminalResult):
     """What one call of an env returns: the protocol's keys, in this order, before the keys of the family's own."""
 
     images: list[Any] | None  # the cameras' frames in CAMERAS order; None once the episode ended

@@ -13,6 +13,11 @@ class JsonBlockProtocol:
     JSON_BLOCK_PATTERN = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL)  # a fenced json block and its object
 
     @staticmethod
+    def is_finish(action: Any) -> bool:
+        """Whether the output is the explicit finish action."""
+        return isinstance(action, dict) and action.keys() == {"finish"} and action["finish"] is True
+
+    @staticmethod
     def system_prompt(template: str, environment: str, instruction: str) -> str:
         """Returns ``template`` with the family's facts as its ENVIRONMENT section (no section without facts) and the
         episode's task."""

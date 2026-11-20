@@ -15,6 +15,7 @@ ENV_ARGS = {"suite": "libero_goal", "task_id": 3, "trial_id": 0}
 ZERO = {"arm": {"x": 0.0, "y": 0.0, "z": 0.0, "roll": 0.0, "pitch": 0.0, "yaw": 0.0}, "gripper": {"width": 0.0}}
 # json blocks that are no action of LIBERO's schema, each with the tool's reason
 INVALID_ACTIONS = [
+    ({"finish": True}, "the json block must map exactly the parts arm, gripper to their quantities"),
     ([ZERO], "the json block must map exactly the parts arm, gripper to their quantities"),
     ({"arm": ZERO["arm"]}, "the json block must map exactly the parts arm, gripper to their quantities"),
     ({**ZERO, "gripper": {}}, "'gripper' must give exactly its quantities width"),

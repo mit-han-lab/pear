@@ -30,6 +30,7 @@ class BaseEnv(ABC):
     CAMERAS: tuple[str, ...]  # the frames' names, in the order of a result's images
     ENVIRONMENT_PROMPT: str  # the facts the protocol leaves out, in the family's words; empty: no ENVIRONMENT section
     LOG_KEYS: tuple[str, ...] = ()  # the keys of its results the call log records besides the protocol's
+    POLICY_FINISH_ENVIRONMENT_PROMPT: str | None = None
 
     @classmethod
     def server_n(cls, config: dict[str, Any], cluster_resources: dict[str, float]) -> int:
