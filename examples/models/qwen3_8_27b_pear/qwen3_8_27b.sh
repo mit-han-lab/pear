@@ -84,7 +84,7 @@ esac
 # drafter, whose config and weights are DRAFT_MODEL's: the base model's unless the recipe set it, as a model exported
 # from a checkpoint has no MTP layer.
 SPECULATIVE_ARGS=()
-if (( ${SPECULATIVE_TOKENS:-0} > 0 )); then
+if ((${SPECULATIVE_TOKENS:-0} > 0)); then
   DRAFT_MODEL=${DRAFT_MODEL:-$WORK_DIR/models/Qwen3.8-27B}
   SPECULATIVE_ARGS=(
     actor_rollout_ref.model.mtp.enable_rollout=true
