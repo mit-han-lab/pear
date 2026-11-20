@@ -76,7 +76,7 @@ class PearAgentLoop(ToolAgentLoop):
         # the episode's record for the val dumps and the evaluation's records, as a dict (verl ships extra_fields as
         # JSON); written only now: verl takes an empty extra_fields as the mark of the first generation
         output.extra_fields["episode"] = self.episode.record()
-        if self.tool.policy_finish:
+        if getattr(self.tool, "policy_finish", False):
             output.extra_fields["episode"]["end_reason"] = self.end_reason.value
 
         # uid is the prompt's id, shared by the n trajectories of a group; global_steps is the training step (both from
@@ -169,7 +169,7 @@ class PearAgentLoop(ToolAgentLoop):
 
         if self.episode.done:
             self.end_reason = EndReason.ENV
-            if self.tool.policy_finish:
+            if getattr(self.tool, "policy_finish", False):
                 if result["outcome"] == "finish":
                     self.end_reason = EndReason.FINISH
                 elif result["outcome"] == "budget":

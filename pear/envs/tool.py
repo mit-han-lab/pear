@@ -31,7 +31,7 @@ class EnvironmentTool(BaseTool):
     REMINDER = "The current camera frames follow. End your response with one json block containing the next action."
     FINISH_INSTRUCTION = (
         'End your response with one fenced json block containing the next action or {"finish": true} '
-        'if you have completed the task.'
+        "if you have completed the task."
     )
 
     def __init__(self, config: dict, tool_schema: OpenAIFunctionToolSchema | None = None) -> None:
@@ -127,7 +127,9 @@ class EnvironmentTool(BaseTool):
         if result["images"] is None:
             return None
 
-        reminder = f"The current camera frames follow. {self.FINISH_INSTRUCTION}" if self.policy_finish else self.REMINDER
+        reminder = (
+            f"The current camera frames follow. {self.FINISH_INSTRUCTION}" if self.policy_finish else self.REMINDER
+        )
         text = JsonBlockProtocol.turn_text(result["state"], reminder)
         blocks: list[dict[str, Any]] = [{"type": "text", "text": text}]
 
