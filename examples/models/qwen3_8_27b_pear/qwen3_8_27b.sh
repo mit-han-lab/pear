@@ -4,7 +4,7 @@
 # and its actor's on the GPU (MODEL_ROLLOUT_ARGS, MODEL_TRAINING_ARGS), a plain vLLM server's (MODEL_SERVER_ARGS), the
 # modules verl imports for it (MODEL_MODULES), the sizes its own arithmetic needs (GPUS_PER_NODE, TP and
 # SESSIONS_PER_REPLICA; a TP or SESSIONS_PER_REPLICA the recipe set wins) and model_image_tokens. Its replicas decode
-# speculatively when the recipe sets SPECULATIVE_TOKENS.
+# speculatively when the recipe's SPECULATIVE_TOKENS is above 0.
 
 # the base model on the Hugging Face Hub and its revision, which scripts/download_model.sh downloads
 MODEL_REPO=Qwen/Qwen3.8-27B
@@ -84,7 +84,7 @@ esac
 # drafter, whose config and weights are DRAFT_MODEL's: the base model's unless the recipe set it, as a model exported
 # from a checkpoint has no MTP layer.
 SPECULATIVE_ARGS=()
-if [[ -n "${SPECULATIVE_TOKENS:-}" ]]; then
+if (( ${SPECULATIVE_TOKENS:-0} > 0 )); then
   DRAFT_MODEL=${DRAFT_MODEL:-$WORK_DIR/models/Qwen3.8-27B}
   SPECULATIVE_ARGS=(
     actor_rollout_ref.model.mtp.enable_rollout=true

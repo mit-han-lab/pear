@@ -36,8 +36,8 @@ MAX_PROMPT=${MAX_PROMPT:-4096}
 MAX_RESPONSE=${MAX_RESPONSE:-160000}
 # sessions a replica keeps generating at this budget
 SESSIONS_PER_REPLICA=${SESSIONS_PER_REPLICA:-64}
-# speculative decoding in the vLLM replicas: the tokens the model's MTP layer, frozen, proposes per step, empty for none
-SPECULATIVE_TOKENS=${SPECULATIVE_TOKENS:-}
+# speculative decoding in the vLLM replicas: the tokens the model's MTP layer, frozen, proposes per step, 0 for none
+SPECULATIVE_TOKENS=${SPECULATIVE_TOKENS:-3}
 # the directory of the MTP layer's weights, empty for the base model's (README.md)
 DRAFT_MODEL=${DRAFT_MODEL:-}
 # add "wandb" for Weights & Biases (WANDB_API_KEY in the machines' environment)
