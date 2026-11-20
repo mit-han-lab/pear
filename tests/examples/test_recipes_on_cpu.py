@@ -265,6 +265,15 @@ def test_on_the_rtx_5090_the_window_fits_an_fp8_kv_cache_beside_weights_in_host_
     assert set(config.env.PEAR_DEPLOY_MEMORY_PLAN.split(",")) == set(MemoryPlan.OPTIONS)
 
 
+def test_on_the_rtx_pro_6000_the_engine_takes_gb300s_window_on_the_models_kv_cache_without_trt_llm_attention():
+    engine, gb300_engine = ServerRecipeConfig.of("rtxpro6000").engine, ServerRecipeConfig.of("gb300").engine
+
+    assert engine.max_model_len == gb300_engine.max_model_len
+    assert engine.gpu_memory_utilization == gb300_engine.gpu_memory_utilization
+    assert engine.kv_cache_dtype == "auto"  # the model's bf16, unless an override names an FP8 cache
+    assert not engine.get("attention_config", {}).get("use_trtllm_attention", False)
+
+
 def test_a_gpu_without_engine_arguments_stops_the_server():
     with pytest.raises(MissingConfigException, match="gpu/a100"):
         ServerRecipeConfig.of("a100")
