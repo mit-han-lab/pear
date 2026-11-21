@@ -16,6 +16,7 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 
 from pear.models.qwen3_5.deploy.rtx_blackwell.nvfp4.rtx5090.draft import INT32_BYTES, DraftLaunch
+from pear.models.qwen3_5.deploy.rtx_blackwell.nvfp4.rtx5090.extension import Rtx5090Nvfp4Fp8KvExtension
 from pear.models.qwen3_5.deploy.rtx_blackwell.nvfp4.rtx5090.schedule import NT, SS_HOST
 from pear.models.qwen3_5.deploy.rtx_blackwell.nvfp4.rtx5090.step import DecodeStep, ModelView
 from pear.utils.logging_utils import get_logger
@@ -138,7 +139,7 @@ class LaunchedOutput(AsyncOutput):
         self.copy_event = torch.cuda.Event(blocking=True)  # recorded by copy_slot only
 
     def get_output(self) -> ModelRunnerOutput:
-        if self.seq is None or not torch.ops.pear_deploy_rtx_blackwell_nvfp4.wait_flag(
+        if self.seq is None or not Rtx5090Nvfp4Fp8KvExtension.ops().wait_flag(
             self.step.ss_flags, self.slot, self.seq, self.WAIT_US
         ):
             self.copy_slot()

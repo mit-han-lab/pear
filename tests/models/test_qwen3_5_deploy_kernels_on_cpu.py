@@ -225,9 +225,12 @@ def test_the_rtx_pro_6000s_megakernel_has_a_build_per_kv_cache_dtype():
         (RtxPro6000Nvfp4Fp8KvExtension, torch.uint8, True),  # vLLM allocates an FP8 cache as bytes
         (RtxPro6000Nvfp4Fp8KvExtension, torch.float8_e4m3fn, True),
         (RtxPro6000Nvfp4Fp8KvExtension, torch.bfloat16, False),
+        (Rtx5090Nvfp4Fp8KvExtension, torch.uint8, True),
+        (Rtx5090Nvfp4Fp8KvExtension, torch.float8_e4m3fn, True),
+        (Rtx5090Nvfp4Fp8KvExtension, torch.bfloat16, False),
     ],
 )
-def test_a_build_of_the_rtx_pro_6000s_megakernel_reads_the_kv_cache_of_its_dtype_as_bytes(build, dtype, is_read):
+def test_a_build_of_an_rtx_megakernel_reads_the_kv_cache_of_its_dtype_as_bytes(build, dtype, is_read):
     blocks, heads, block_tokens, row_elems = 3, 4, 16, 512
     # vLLM's NHD cache: memory [blocks][tokens][heads], logical (blocks, heads, tokens, k | v)
     kv_cache = torch.zeros(blocks, block_tokens, heads, row_elems, dtype=dtype).permute(0, 2, 1, 3)
@@ -248,16 +251,17 @@ def test_a_build_of_the_rtx_pro_6000s_megakernel_refuses_a_kv_cache_in_another_m
         RtxPro6000Nvfp4Bf16KvExtension.kv_cache_bytes(kv_cache, 4, 512)
 
 
+@pytest.mark.parametrize("build", [Rtx5090Nvfp4Fp8KvExtension, RtxPro6000Nvfp4Fp8KvExtension])
 @pytest.mark.parametrize("scales, is_served", [((1.0, 1.0, 1.0), True), ((1.0, 0.5, 1.0), False)])
-def test_the_rtx_pro_6000s_megakernel_reads_an_fp8_kv_cache_at_scale_one_only(scales, is_served):
+def test_an_rtx_megakernel_reads_an_fp8_kv_cache_at_scale_one_only(build, scales, is_served):
     attention_layer = types.SimpleNamespace(**{f"_{part}_scale_float": scale for part, scale in zip("qkv", scales)})
 
     RtxPro6000Nvfp4Bf16KvExtension.check_kv_scales(attention_layer)  # a bf16 cache has no scales
     if is_served:
-        RtxPro6000Nvfp4Fp8KvExtension.check_kv_scales(attention_layer)
+        build.check_kv_scales(attention_layer)
     else:
         with pytest.raises(AssertionError, match="scale 1"):
-            RtxPro6000Nvfp4Fp8KvExtension.check_kv_scales(attention_layer)
+            build.check_kv_scales(attention_layer)
 
 
 @pytest.mark.parametrize("total, pair_stages, sms", [(5440, 32, 188), (640, 80, 188), (7, 2, 3)])

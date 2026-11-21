@@ -18,6 +18,12 @@ __device__ __forceinline__ void sts_u16(uint32_t a, uint32_t v) {
   asm volatile("st.shared.u16 [%0], %1;" ::"r"(a), "h"((uint16_t)v) : "memory");
 }
 __device__ __forceinline__ void sts_u32(uint32_t a, uint32_t v) { asm volatile("st.shared.u32 [%0], %1;" ::"r"(a), "r"(v) : "memory"); }
+// a load from a 32-bit shared::cta address (volatile: kept in order with the barrier waits around it)
+__device__ __forceinline__ float4 lds_f4(uint32_t a) {
+  float4 v;
+  asm volatile("ld.shared.v4.f32 {%0, %1, %2, %3}, [%4];" : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w) : "r"(a));
+  return v;
+}
 
 // a published operand's byte b (0..127) of token row t within its K chunk: the B slot's swizzle (16-byte unit u at
 // u ^ t), so that the consumer's B build is a bulk copy of whole chunks
@@ -117,6 +123,11 @@ struct RingPos {
 __device__ __forceinline__ void named_sync(int id, int nthreads) { asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(nthreads) : "memory"); }
 
 __device__ __forceinline__ void fence_async_smem() { asm volatile("fence.proxy.async.shared::cta;" ::: "memory"); }
+// 16 bytes global -> shared through the LSU (cp.async, L2 only), and the wait for this thread's copies
+__device__ __forceinline__ void cp_async_16(void* smem, const void* gmem) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(smem_u32(smem)), "l"(gmem) : "memory");
+}
+__device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wait_all;" ::: "memory"); }
 
 // ---- cross-CTA dependency counters ----
 __device__ __forceinline__ uint32_t ld_acquire(const uint32_t* p) {
@@ -151,6 +162,9 @@ __device__ __forceinline__ void wait_counter(const uint32_t* p, uint32_t target)
   while (ctr_before(ld_relaxed(p), target)) {
   }
   (void)ld_acquire(p);
+}
+__device__ __forceinline__ void red_relaxed_add(uint32_t* p, uint32_t v) {
+  asm volatile("red.relaxed.gpu.global.add.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
 }
 // two tagged words to L2 (each 8-byte word single-copy atomic: its value and tag together), and back (strong)
 __device__ __forceinline__ void st_cg_v2_u64(unsigned long long* p, unsigned long long a, unsigned long long b) {
@@ -293,6 +307,14 @@ __device__ __forceinline__ void mma_bf16(float (&d)[4], const uint32_t (&a)[4], 
   asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+// a TMA tensor map's L2 prefetch of the box at {x, y} (the producer lanes' run-ahead past the ring)
+__device__ __forceinline__ void tma_prefetch_2d(const void* tmap, int x, int y) {
+  asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global [%0, {%1, %2}];" ::"l"(tmap), "r"(x), "r"(y) : "memory");
+}
+__device__ __forceinline__ void bulk_prefetch_l2(const void* gmem, uint32_t bytes) {
+  asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(gmem), "r"(bytes) : "memory");
 }
 
 }  // namespace mk

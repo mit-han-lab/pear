@@ -30,12 +30,16 @@ struct Smem {
   uint32_t* rel_cnt;   // the GEMV instructions whose op counter this SM's epilogue has released
   uint32_t* stg_ph;    // the prologue's stg_full parity (the GDN core's state rows; a word, not a loop register)
   uint32_t* q_rel;     // reserved (zeroed, unused)
+  uint8_t* pace_probe; // the pacer's probes' landing places [PACE_PS][128 bytes]
+  uint64_t* pace_bar;  // [PACE_PS] their completions
+  uint32_t* pace_w;    // [0] the pacer's GEMV stages landed, [1] the producer's GEMV stages loaded (volatile words)
 };
 // the layout from the dynamic shared memory's base, aligned up to SMEM_ALIGN
 __device__ __forceinline__ Smem smem_layout(uint8_t* raw) {
   Smem s;
-  uint8_t* p =
+  uint8_t* const base =
       reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(raw) + SMEM_ALIGN - 1) & ~uintptr_t(SMEM_ALIGN - 1));
+  uint8_t* p = base;
   s.stages = p, p += NSTAGE * STAGE_BYTES;
   s.xb = p, p += NB * B_SLOT_BYTES;
   s.accb = reinterpret_cast<float*>(p), p += NACC * ACC_SLOT_BYTES;
@@ -53,6 +57,9 @@ __device__ __forceinline__ Smem smem_layout(uint8_t* raw) {
   s.rel_cnt = s.epi_word + 1;
   s.stg_ph = s.rel_cnt + 1;
   s.q_rel = s.stg_ph + 1;
+  s.pace_probe = base + SMEM_BYTES - PACE_BYTES;  // (past the barriers' BAR_BYTES: 16-byte aligned)
+  s.pace_bar = reinterpret_cast<uint64_t*>(s.pace_probe + 128 * PACE_PS);
+  s.pace_w = reinterpret_cast<uint32_t*>(s.pace_bar + PACE_PS);
   return s;
 }
 constexpr int W_ROWS = 64;      // weight rows per MMA warp (of a stage's TILE)
@@ -93,6 +100,13 @@ __device__ __forceinline__ void produce_gemv(const Instr& in, const OpDesc& d, c
   auto load = [&](uint32_t st, uint32_t ue) {
     if (cc.n >= NSTAGE) mbar_wait(&sm.empty[cc.slot], cc.phase ^ 1);
     if (lane == 0) {
+      {  // (the gate: this SM's g-th GEMV stage once the pacer's probe of it landed: an L2 hit)
+        volatile uint32_t* pw = sm.pace_w;
+        const uint32_t g = pw[1];
+        while (pw[0] <= g) {
+        }
+        pw[1] = g + 1;
+      }
       const StageAt at = stage_at(d, st);
       uint64_t* bar = &sm.full[cc.slot];
       sm.stage_st[2 * cc.slot] = st, sm.stage_st[2 * cc.slot + 1] = ue;  // read by the MMA after the arrival
@@ -110,6 +124,33 @@ __device__ __forceinline__ void produce_gemv(const Instr& in, const OpDesc& d, c
   const uint32_t rk = rot_k(in);  // the rotation: the last unit's k stages first; each slot's range end for the MMA
   for (uint32_t st = in.r1 - rk; st < in.r1; st++) load(st, in.r1);
   for (uint32_t st = in.r0; st < in.r1 - rk; st++) load(st, in.r1 - rk);
+}
+
+// an owned op's stages (megakernel.cuh own_rows: never run): per stage C boxes of the tile's R rows; b_parity: the
+// parities of its B halves' releases
+__device__ __forceinline__ void produce_gemv_own(const Instr& in, const OpDesc& d, const Smem& sm, RingPos& cc,
+                                                 int lane, uint32_t& b_parity) {
+  const uint32_t R = own_rows(d), C = TILE / R;
+  const bool is_nvfp4 = d.kind == KIND_NVFP4;
+  const uint32_t bytes = A_BYTES + (is_nvfp4 ? SFA_BYTES : 0);
+  const void* tmap = reinterpret_cast<const void*>(d.tmap);
+  const uint8_t* sf = reinterpret_cast<const uint8_t*>(d.sf);  // [tile][chunk][R][16]: stage st at st * SFA_BYTES
+  for (uint32_t st = in.r0; st < in.r1; st++) {
+    const StageAt at = stage_at(d, st);
+    if (cc.n >= NSTAGE) mbar_wait(&sm.empty[cc.slot], cc.phase ^ 1);
+    if (lane == 0) {
+      uint64_t* bar = &sm.full[cc.slot];
+      sm.stage_st[2 * cc.slot] = st, sm.stage_st[2 * cc.slot + 1] = in.r1;
+      mbar_expect_tx(bar, bytes);
+      uint8_t* dst = sm.stages + cc.slot * STAGE_BYTES;
+      const uint64_t pol = l2_evict_first();
+      for (uint32_t c = 0; c < C; c++)
+        tma_load_2d_pol(dst + c * R * STAGE_K, tmap, (at.kc + c) * STAGE_K, at.row0, bar, pol);
+      if (is_nvfp4) bulk_g2s_pol(dst + A_BYTES, sf + (size_t)st * SFA_BYTES, SFA_BYTES, bar, pol);
+    }
+    __syncwarp();
+    cc.next(NSTAGE);
+  }
 }
 
 // ------------------------------------------------------------------------------------------------ MMA
@@ -271,13 +312,32 @@ constexpr uint32_t COEF_SIDE = 640;
 constexpr uint32_t COEF_TAP = 320;
 constexpr uint32_t CONV_GROUP_CH = 16;
 // DF_COLFIN: a column's 8 values finished by the part that completes its warp's 32-column count, which reloads the
-// totals until their count bits say every part is in (no fence: it would wait for in-flight TMA) and zeroes them.
-// DF_CONV_FIN: x = conv side 1 of bf16(sums) + the residual (x_out), its squares into sq; else bf16(sums) into out
+// totals, the 8 together, until their count bits say every part is in (no fence: it would wait for in-flight TMA) and
+// zeroes them. DF_CONV_FIN: x = conv side 1 of bf16(sums) + the residual (x_out),
+// its squares into sq; else bf16(sums) into out
 __device__ __forceinline__ void colfin_tile(const OpDesc& d, unsigned long long* acc, uint32_t tile, uint32_t idx,
                                             uint32_t rows_total, float (&v)[NT], unsigned long long (&sq)[NT], int lane,
                                             uint32_t epoch, uint32_t T) {
   const uint32_t npt = reinterpret_cast<const uint8_t*>(d.parts)[tile];
   const bool has_column = idx < d.n_out;
+  // the finish's other inputs, independent of the totals (the conv's base and coefficients, the residual), prefetched
+  // into L1 before the column count's atomic: their lines arrive under its round trip and the polls (every part issues
+  // them, the finisher uses them)
+  if ((d.dflags & DF_CONV_FIN) && has_column) {
+    const __nv_bfloat16* bk = reinterpret_cast<const __nv_bfloat16*>(d.base) + 2 * K_NORM;
+    const __nv_bfloat16* cf = reinterpret_cast<const __nv_bfloat16*>(d.coef) + COEF_SIDE + idx / CONV_GROUP_CH;
+    const uint8_t* ri = reinterpret_cast<const uint8_t*>(d.res_in);
+    const size_t rsz = d.res_bf16 ? 2u : 4u, rst = (size_t)d.n_out * rsz;  // (no memory clobber: d's words read once)
+    const uint8_t* r0 = ri + (size_t)idx * rsz;
+    asm volatile("prefetch.global.L1 [%0];" ::"l"(bk + idx));
+    asm volatile("prefetch.global.L1 [%0];" ::"l"(bk + K_NORM + idx));
+#pragma unroll
+    for (int t = 0; t < NT; t++) {
+      asm volatile("prefetch.global.L1 [%0];" ::"l"(cf + (size_t)t * COEF_ROW));
+      asm volatile("prefetch.global.L1 [%0];" ::"l"(cf + (size_t)t * COEF_ROW + COEF_TAP));
+      if (ri) asm volatile("prefetch.global.L1 [%0];" ::"l"(r0 + t * rst));
+    }
+  }
 #pragma unroll
   for (int t = 0; t < NT; t++) sq[t] = 0ull;
   bool is_finisher = true;
@@ -290,16 +350,21 @@ __device__ __forceinline__ void colfin_tile(const OpDesc& d, unsigned long long*
     is_finisher = count_before + 1 == npt * (epoch + 1);
     if (!is_finisher) return;
     if (has_column) {
+      // the totals polled together, each until its count bits say every part's sum is in (the loaded words live only
+      // within a round: the epilogue's registers)
+      uint32_t pending = (1u << min(T, (uint32_t)NT)) - 1u;
+      while (pending) {
+        unsigned long long w[NT];
 #pragma unroll
-      for (int t = 0; t < NT; t++) {
-        if (t < (int)T) {
-          unsigned long long* w = acc + (size_t)t * rows_total + idx;
-          unsigned long long tot;
-          do {
-            tot = ld_relaxed_u64(w);
-          } while ((uint32_t)(tot & ((1u << CNT_BITS) - 1)) != npt);
-          __stcg(w, 0ull);
-          v[t] = __ll2float_rn((long long)tot >> CNT_BITS) * CNT_INV;
+        for (int t = 0; t < NT; t++)
+          w[t] = (pending >> t) & 1u ? ld_relaxed_u64(acc + (size_t)t * rows_total + idx) : 0ull;
+#pragma unroll
+        for (int t = 0; t < NT; t++) {
+          if ((pending >> t) & 1u && (uint32_t)(w[t] & ((1u << CNT_BITS) - 1)) == npt) {
+            __stcg(acc + (size_t)t * rows_total + idx, 0ull);
+            v[t] = __ll2float_rn((long long)w[t] >> CNT_BITS) * CNT_INV;
+            pending &= ~(1u << t);
+          }
         }
       }
     }
@@ -320,19 +385,29 @@ __device__ __forceinline__ void colfin_tile(const OpDesc& d, unsigned long long*
   float* xo = reinterpret_cast<float*>(d.x_out);
   __nv_bfloat16* out = reinterpret_cast<__nv_bfloat16*>(d.out);
   const bool uses_fma = (d.dflags & DF_CONV_FMA) != 0u, rounds_res = (d.dflags & DF_RES_ROUND) != 0u;
+  // every token's coefficients and residual loaded before the first store: in the loop the stores to out / x_out keep
+  // the compiler from issuing a token's loads before the previous token's stores (out, x_out, res_in and coef are
+  // separate buffers, draft.py)
+  const bool is_res_bf16 = d.res_bf16 != 0u;
+  float cv0[NT], cv1[NT], rv[NT];
+#pragma unroll
+  for (int t = 0; t < NT; t++) {
+    cv0[t] = __bfloat162float(cf[(size_t)t * COEF_ROW]);
+    cv1[t] = __bfloat162float(cf[(size_t)t * COEF_ROW + COEF_TAP]);
+    rv[t] = 0.f;
+    if (ri) rv[t] = is_res_bf16 ? __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(ri)[(size_t)t * no + idx])
+                                : reinterpret_cast<const float*>(ri)[(size_t)t * no + idx];
+  }
   float prev_o = 0.f;
 #pragma unroll
   for (int t = 0; t < NT; t++) {
     const float o = bf16_round(v[t]);
     if (out) out[(size_t)t * no + idx] = __float2bfloat16(o);
-    const float c0 = __fadd_rn(b0, __bfloat162float(cf[(size_t)t * COEF_ROW])),
-                c1 = __fadd_rn(b1, __bfloat162float(cf[(size_t)t * COEF_ROW + COEF_TAP]));
+    const float c0 = __fadd_rn(b0, cv0[t]), c1 = __fadd_rn(b1, cv1[t]);
     const float tail = __fmul_rn(__fmul_rn(c1, prev_o), t >= 1 ? 1.0f : 0.0f);
     const float y = uses_fma ? __fmaf_rn(c0, o, tail) : __fadd_rn(__fmul_rn(c0, o), tail);
     prev_o = o;
-    float r = 0.f;
-    if (ri) r = d.res_bf16 ? __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(ri)[(size_t)t * no + idx])
-                           : reinterpret_cast<const float*>(ri)[(size_t)t * no + idx];
+    float r = rv[t];
     if (rounds_res) r = bf16_round(r);
     const float x = __fadd_rn(y, r);
     if (xo) xo[(size_t)t * no + idx] = x;
@@ -357,6 +432,7 @@ __device__ __forceinline__ void epilogue_gemv(const Instr& in, const OpDesc& d, 
   }
   // the instruction's segments, from the stage geometry; the rotation: the segment [r1 - k, r1) first, then those of
   // [r0, r1 - k); rend: the range's end, r1 for the first
+  bool is_late = false;  // a segment whose residuals load_res reads itself: none (megakernel.cuh own_rows)
   uint32_t st = rot_k(in) ? in.r1 - rot_k(in) : in.r0, rend = in.r1;
   for (;;) {
     if (st >= rend) {
@@ -386,11 +462,19 @@ __device__ __forceinline__ void epilogue_gemv(const Instr& in, const OpDesc& d, 
     float sp_g[NT], sp_u[NT];
     const bool loads_suffix = d.epi == EPI_SILU && st == unit * spu && ue != (unit + 1) * spu;
     if (loads_suffix) {
-      if (ept == 0) wait_counter(reinterpret_cast<uint32_t*>(d.sflag) + unit, epoch + 1);
+      // a pair in npt parts (2 or 3): each later part adds 1 to the flag a launch and leaves its sums in its slot, the
+      // second part slot 0, the third slot 1 (AUX_SILU_P2), slot-major
+      const uint32_t npt = reinterpret_cast<const uint8_t*>(d.parts)[unit];
+      if (ept == 0) wait_counter(reinterpret_cast<uint32_t*>(d.sflag) + unit, (npt - 1u) * (epoch + 1));
       named_sync(BAR_EPI, NEPI);
       const float* spart = reinterpret_cast<const float*>(d.spart) + ((size_t)unit * TILE + row) * (2 * NT);
 #pragma unroll
       for (int k = 0; k < NT; k++) sp_g[k] = __ldcg(spart + k), sp_u[k] = __ldcg(spart + NT + k);
+      if (npt > 2u) {
+        const float* sp2 = spart + (size_t)d.mtiles * TILE * (2 * NT);
+#pragma unroll
+        for (int k = 0; k < NT; k++) sp_g[k] += __ldcg(sp2 + k), sp_u[k] += __ldcg(sp2 + NT + k);
+      }
     }
     {
       mbar_wait(&sm.dfull[seg.slot], seg.phase);
@@ -418,12 +502,14 @@ __device__ __forceinline__ void epilogue_gemv(const Instr& in, const OpDesc& d, 
       seg.next(NACC);
     }
     if (d.epi == EPI_SILU) {
-      float* spart =
-          reinterpret_cast<float*>(d.spart) + ((size_t)unit * TILE + row) * (2 * NT);  // [pair][row][g 8 | u 8]
+      // [slot][pair][row][g 8 | u 8]
+      float* spart = reinterpret_cast<float*>(d.spart) + ((size_t)unit * TILE + row) * (2 * NT);
       uint32_t* flag = reinterpret_cast<uint32_t*>(d.sflag) + unit;
-      if (!is_first_part) {  // the suffix part: its sums for the prefix part
+      // a later part (the instruction's first segment): its sums for the prefix part, in its slot
+      if (!is_first_part) {
+        float* sp = spart + ((in.aux & AUX_SILU_P2) ? (size_t)d.mtiles * TILE * (2 * NT) : 0);
 #pragma unroll
-        for (int k = 0; k < NT; k++) __stcg(spart + k, v[k]), __stcg(spart + NT + k, u[k]);
+        for (int k = 0; k < NT; k++) __stcg(sp + k, v[k]), __stcg(sp + NT + k, u[k]);
         named_sync(BAR_EPI, NEPI);
         if (ept == 0) red_release_add(flag, 1);
       } else {
@@ -506,15 +592,26 @@ __device__ __forceinline__ void epilogue_gemv(const Instr& in, const OpDesc& d, 
         const bool is_solo = npt == 1;  // this segment is the whole value
         const float alpha = d.alpha;
         __nv_bfloat16* const out = reinterpret_cast<__nv_bfloat16*>(d.out);
-        const uint32_t xr = d.xr, no = d.n_out;
+        const uint32_t xr = d.xr, rb16 = d.res_bf16, no = d.n_out;
         float* const xo = reinterpret_cast<float*>(d.x_out);
         __nv_bfloat16* const ro = reinterpret_cast<__nv_bfloat16*>(d.r_out);
+        const void* const ri = reinterpret_cast<const void*>(d.res_in);
         float res[NT];
         // the residuals loaded at the segment's start; a split value takes them after the atomics' results (issued
         // before them they delay the atomics' return); none: the fc's x = out
         auto load_res = [&]() {
+          if (!is_late) {
 #pragma unroll
-          for (int t = 0; t < NT; t++) res[t] = rp[t];
+            for (int t = 0; t < NT; t++) res[t] = rp[t];
+          } else {
+#pragma unroll
+            for (int t = 0; t < NT; t++)
+              res[t] = xr && ri && t < (int)T
+                           ? (rb16 ? __bfloat162float(
+                                         __ldcg(reinterpret_cast<const __nv_bfloat16*>(ri) + (size_t)t * no + idx))
+                                   : __ldcg(reinterpret_cast<const float*>(ri) + (size_t)t * no + idx))
+                           : 0.f;
+          }
           if (d.dflags & DF_RES_ROUND) {
 #pragma unroll
             for (int t = 0; t < NT; t++) res[t] = bf16_round(res[t]);
@@ -833,6 +930,35 @@ __device__ __forceinline__ void enc_pub4(uint8_t* pub, uint32_t nch, uint32_t vi
   }
 }
 
+// NORM_Q's reads that do not depend on its dependency, issued before the wait (the instruction is reached early on the
+// draft's chain): the descriptor's 256 bytes by cp.async into the staging buffer's last 256 bytes, which no other op
+// of the prologue uses (the GDN core's staging ends there), read from there by pro_norm_q and pro_act_bulk (the L1
+// copy of words read before the wait is gone after its acquire); the slice's first group's norm weight and DF_CONV base
+// words prefetched into L2. No register is held across the wait
+constexpr uint32_t NQ_DESC_OFF = STG_BYTES - 256;
+static_assert(NQ_DESC_OFF >= 32512u, "the descriptor's copy past the GDN core's staging");
+template <int V>
+__device__ __forceinline__ void nq_early(const Instr& in, const OpDesc& d, const Smem& sm, int pt, uint32_t T) {
+  if (pt < 16) cp_async_16(sm.stg + NQ_DESC_OFF + pt * 16, reinterpret_cast<const uint4*>(&d) + pt);
+  if (!(in.aux & AUX_QPUB_DONE)) {  // (its slice published by this instruction: pro_norm_q's first group, g0 0)
+    const uint32_t df = d.dflags;
+    const bool is_plain = HAS_D<V> && (df & DF_PLAIN) != 0u, is_conv = HAS_D<V> && (df & DF_CONV) != 0u;
+    const uint32_t K = d.K, BPT = K / 16;
+    const uint32_t nblk = NT * BPT, per = (nblk + d.n_inst - 1) / d.n_inst;
+    const uint32_t b0 = min(nblk, in.idx * per), b1 = min(nblk, b0 + per);
+    const uint32_t ng = (b1 - b0) * 4;
+    const uint32_t blk = b0 + (pt < (int)ng ? pt / 4 : 0), t = blk / BPT, vi = (blk % BPT) * 16 + (pt % 4) * 4;
+    if (pt < (int)ng && t < T && !is_plain) {
+      asm volatile("prefetch.global.L2 [%0];" ::"l"(reinterpret_cast<const __nv_bfloat16*>(d.nw) + vi));
+      if (is_conv) {
+        const __nv_bfloat16* bk = reinterpret_cast<const __nv_bfloat16*>(d.base);
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(bk + vi));
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(bk + K_NORM + vi));
+      }
+    }
+  }
+}
+
 // PRO_NORM_Q: rstd per token from the producer's exact sums of squares, the instruction's slice of x's [NT][K / 16]
 // NVFP4 blocks normed (x * rs) * (1 + w) (DF_NW_PLAIN: * w; DF_PLAIN: no norm; DF_CONV: the grouped conv, side 0),
 // encoded into q_pub and counted (qctr), then the wait for every slice (one instruction of the op per SM)
@@ -1084,6 +1210,8 @@ __device__ __forceinline__ void mk_start(const MKArgs& a, const Smem& sm, uint32
     mbar_init(sm.bis, 1);
     mbar_init(&sm.xeo[0], NMMA), mbar_init(&sm.xeo[1], NMMA);  // reserved
     sm.dyn_total[0] = 0u, sm.dyn_total[1] = 0u, sm.rel_cnt[0] = 0u, sm.stg_ph[0] = 0u, sm.q_rel[0] = 0u;
+    for (uint32_t k = 0; k < PACE_PS; k++) mbar_init(&sm.pace_bar[k], 1);
+    sm.pace_w[0] = 0u, sm.pace_w[1] = 0u;
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     *epoch_sh = ld_relaxed(a.epoch);
   }
@@ -1112,12 +1240,13 @@ __device__ __forceinline__ void role_producer(const MKArgs& a, uint32_t* epoch_s
   RingPos cc;
   constexpr uint32_t NO_PREV_DEP = 0xffffffffu;  // no GEMV on this SM yet
   uint32_t rel_prev_dep = NO_PREV_DEP, n_gemv = 0;
+  uint32_t b_parity = 0;  // (produce_gemv_own's)
   for (uint32_t i = i0; i < i1; i++) {
     const Instr in = a.instrs[i];
     if (HAS_T<V> && in.op == OP_ATTN) {
       const AttnDesc& g = *reinterpret_cast<const AttnDesc*>(&a.descs[in.desc]);
       produce_attn<NSTAGE>(in, g, sm.stages, STAGE_BYTES, sm.full, sm.empty, cc, a.counters,
-                           dep_target(a, (uint16_t)g.prep_ctr, epoch), lane);
+                           dep_target(a, (uint16_t)g.prep_ctr, epoch), lane, sm.pace_w);
       continue;
     }
     if (HAS_D<V> && in.op == OP_D_ATTN) {
@@ -1136,8 +1265,154 @@ __device__ __forceinline__ void role_producer(const MKArgs& a, uint32_t* epoch_s
     }
     rel_prev_dep = in.dep;
     n_gemv++;
-    produce_gemv(in, a.descs[in.desc], sm, cc, lane);
+    if (own_rows(a.descs[in.desc])) produce_gemv_own(in, a.descs[in.desc], sm, cc, lane, b_parity);
+    else produce_gemv(in, a.descs[in.desc], sm, cc, lane);
   }
+}
+// a 3D tensor map's L2 prefetch of the box at {x, y, z} (the pacer's KV boxes)
+__device__ __forceinline__ void tma_prefetch_3d(const void* tmap, int x, int y, int z) {
+  asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global [%0, {%1, %2, %3}];"
+               ::"l"(tmap), "r"(x), "r"(y), "r"(z) : "memory");
+}
+// the pacer's walk of an attention item's KV, out of line (inlined, the MMA warps' loop
+// bound spills at REG_MMA); the probes' count and landings by value, returned as (n, landed): no stack. kctr, ktail_at:
+// the items' tail rule, role_pacer's
+__device__ __noinline__ uint64_t pace_attn_item(const AttnDesc& g, uint32_t r0, uint32_t n, uint32_t landed,
+                                                const uint32_t* kctr, uint32_t ktail_at) {
+  extern __shared__ __align__(16) uint8_t smem_raw[];
+  const Smem sm = smem_layout(smem_raw);
+  volatile uint32_t* pw = sm.pace_w;
+  const uint32_t hh = r0 / g.n_splits;
+  const AttTiles at = attn_tiles(g, attn_L(), r0 % g.n_splits);
+  const int32_t* bt = rec_att_bt(nullptr, (int)g.group);
+  const void* tmap = reinterpret_cast<const void*>(g.tmap);
+  const uint8_t* kv = reinterpret_cast<const uint8_t*>(g.kv) + (size_t)hh * ATT_HEAD_ROW_B;
+  uint32_t kseen = kctr ? ld_relaxed(kctr) : 0u;
+  for (uint32_t sx = 0, ns = 2 * (at.t1 - at.t0); sx < ns; sx++) {
+    uint32_t ti, part;
+    attn_swp_stage(sx, at.t1 - at.t0, ti, part);
+    uint32_t key0, row0;
+    attn_tile(g, bt, at.t0 + ti, at.per_mb, key0, row0);
+    const uint32_t last = row0 + min((uint32_t)ATT_TILE, g.block_tokens - key0 % g.block_tokens) - 1;
+#pragma unroll 1
+    for (uint32_t q = part * PACE_SPLIT; q < (part + 1) * PACE_SPLIT; q++) {
+      while (n / PACE_SPLIT >= pw[1] + PACE_LEAD)
+        if (landed < n && mbar_test(&sm.pace_bar[landed % PACE_PS], (landed / PACE_PS) & 1))
+          pw[0] = ++landed / PACE_SPLIT;
+      const uint32_t fly = kctr && (int32_t)(kseen - ktail_at) >= 0 ? PACE_TAIL : 1u;  // (wrap-safe)
+      while (landed + fly <= n) {
+        mbar_wait(&sm.pace_bar[landed % PACE_PS], (landed / PACE_PS) & 1);
+        pw[0] = ++landed / PACE_SPLIT;
+      }
+      const uint32_t sl = n % PACE_PS;
+      tma_prefetch_3d(tmap, (int)(q * 128), (int)hh, (int)row0);
+      mbar_expect_tx(&sm.pace_bar[sl], 128);
+      bulk_g2s(sm.pace_probe + sl * 128, kv + (size_t)last * (ATT_HKV * ATT_HEAD_ROW_B) + q * 128, 128,
+               &sm.pace_bar[sl]);
+      n++;
+      if (kctr) kseen = ld_relaxed(kctr);  // (used at the next probe)
+      while (landed < n && mbar_test(&sm.pace_bar[landed % PACE_PS], (landed / PACE_PS) & 1))
+        pw[0] = ++landed / PACE_SPLIT;
+    }
+  }
+  return (uint64_t)n << 32 | landed;
+}
+// The pacer (warp 7, lane 0; megakernel.cuh PACE_*): this SM's GEMV stages in the producer's order (produce_gemv: the
+// rotation's last k stages first), each into L2 in PACE_SPLIT parts of PACE_ROWS rows (the part's box prefetch through
+// the pacer's own tensor map, the NVFP4 scale atoms' with the first) each followed by a 128-byte probe copy of the
+// part's last row (the weights' base beside the tensor map: schedule.py), PACE_PS probes in flight and at most
+// PACE_LEAD stages past the producer's loads; the landed probes, in order, open the producer's gate (pace_w[0]: whole
+// stages). It never waits on a dependency (the weights are the launch's constants) and changes no value: prefetches
+// and a gate
+template <int V>
+__device__ __forceinline__ void role_pacer(const MKArgs& a, uint32_t* epoch_sh) {
+  MK_SMEM;
+  MK_WORDS;
+  if (lane == 0) {
+    volatile uint32_t* pw = sm.pace_w;
+    // probes issued / landed (PACE_SPLIT per stage of the producer's GEMV stages, in order); probe k: slot k % PS
+    uint32_t n = 0, landed = 0;
+    auto landed_now = [&]() { return mbar_test(&sm.pace_bar[landed % PACE_PS], (landed / PACE_PS) & 1); };
+    auto publish = [&]() { pw[0] = ++landed / PACE_SPLIT; };
+    auto land = [&]() {
+      mbar_wait(&sm.pace_bar[landed % PACE_PS], (landed / PACE_PS) & 1);
+      publish();
+    };
+    bool book_seen = false;
+    for (uint32_t i = i0; i < i1; i++) {
+      const Instr in = a.instrs[i];
+      if (HAS_T<V> && in.op == OP_ATTN) {
+        // (an attention item's KV in produce_attn's order: its split's tiles, each tile's ATT_PARTS stages, each
+        // stage's two 64-row boxes (bytes part * 256 + half * 128 of a (token, head) row: box q at q * 128); a box's
+        // prefetch through the item's own 3D map, then a probe of the tile's last row in its manager block (an
+        // allocated row))
+        const AttnDesc& g = *reinterpret_cast<const AttnDesc*>(&a.descs[in.desc]);
+        if (!book_seen) {  // (the step's positions: OP_BOOK's, in this launch; long done by the first attention layer)
+          if (g.book_ctr != NO_CTR) wait_dep(a, (uint16_t)g.book_ctr, epoch);
+          book_seen = true;
+        }
+        {
+          const uint32_t kcnt = in.done != NO_CTR ? __ldg(a.ctr_count + in.done) : 0u;
+          const uint64_t nl = pace_attn_item(g, in.r0, n, landed, in.done != NO_CTR ? a.counters + in.done : nullptr,
+                                             kcnt * epoch + (kcnt * PACE_KV_TAILF + 7) / 8);
+          n = (uint32_t)(nl >> 32), landed = (uint32_t)nl;
+        }
+        continue;
+      }
+      if (in.op != OP_GEMV) continue;
+      const OpDesc& d = a.descs[in.desc];
+      const bool nvf4 = d.kind == KIND_NVFP4;
+      const void* tmap = reinterpret_cast<const void*>(d.tmap + 2 * PACE_WPTR_OFF);  // (the pacer's map)
+      const uint8_t* w = reinterpret_cast<const uint8_t*>(*reinterpret_cast<const uint64_t*>(d.tmap + PACE_WPTR_OFF));
+      const uint8_t* sf = reinterpret_cast<const uint8_t*>(d.sf);
+      const uint32_t kgroups = d.K / 64, kb = d.kb, last = d.rows - 1, rk = rot_k(in);
+      // (the op's tail: its done count past this launch's base and PACE_TAILF eighths of its instructions; the count
+      // read after each probe)
+      const uint32_t cnt = in.done != NO_CTR ? __ldg(a.ctr_count + in.done) : 0u;
+      const uint32_t tail_at = in.done != NO_CTR ? cnt * epoch + (cnt * PACE_TAILF + 7) / 8 : 0xFFFFFFFFu;
+      uint32_t seen = 0;
+      // (a long instruction: its op's progress counter, in.pr1 - 1; schedule.py finalize)
+      uint32_t* const opc = in.pr1 ? a.counters + (in.pr1 - 1) : nullptr;
+      const uint64_t rl_g = opc ? __ldg(a.ctr_count + (in.pr1 - 1)) : 0u, rl_own = in.r1 - in.r0;
+      const uint32_t rl_base = (uint32_t)rl_g * epoch;
+      uint32_t rl_seen = rl_base;
+      for (uint32_t j = 0; j < in.r1 - in.r0; j++) {
+        const uint32_t st = j < rk ? in.r1 - rk + j : in.r0 + (j - rk);
+        const StageAt at = stage_at(d, st);
+#pragma unroll 1
+        for (uint32_t h = 0; h < PACE_SPLIT; h++) {
+          while (n / PACE_SPLIT >= pw[1] + PACE_LEAD)  // (the lead in stages; a landing meanwhile published)
+            if (landed < n && landed_now()) publish();
+          const bool behind = opc && (uint64_t)(j + PACE_RELL_D) * rl_g < (uint64_t)(rl_seen - rl_base) * rl_own;
+          const uint32_t fly = seen >= tail_at || behind ? PACE_TAIL : 1u;
+          {  // (two probes in flight while the producer has loaded every landed stage but PACE_GATE2: the steady
+            // stream, pacer-bound; one while it is held elsewhere, e.g. at a boundary, the pacer running ahead)
+            // (three for the FP8 weights' rows (5-6 KB: in_qkvz, qkv, out_proj, o_proj), two for NVFP4's)
+            const uint32_t g2 = d.kind == KIND_FP8 ? 3u : 2u;
+            // (not in the relative rule's long instructions, the LM heads: there one probe, three while behind the
+            // op's progress, so that the SMs with a tile more catch up)
+            const uint32_t fl2 = fly > 1u || opc || landed / PACE_SPLIT > pw[1] + PACE_GATE2 ? fly : g2;
+            while (landed + fl2 <= n) land();
+          }
+          const uint32_t sl = n % PACE_PS, r0 = at.row0 + h * PACE_ROWS;
+          tma_prefetch_2d(tmap, at.kc * STAGE_K, r0);
+          if (nvf4 && h == 0) bulk_prefetch_l2(sf + ((size_t)(at.row0 / TILE) * kgroups + at.kc * 4) * 512, SFA_BYTES);
+          mbar_expect_tx(&sm.pace_bar[sl], 128);
+          bulk_g2s(sm.pace_probe + sl * 128, w + (size_t)min(r0 + PACE_ROWS - 1, last) * kb + at.kc * STAGE_K, 128,
+                   &sm.pace_bar[sl]);
+          n++;
+          if (in.done != NO_CTR) seen = ld_relaxed(a.counters + in.done);  // (used at the next probe)
+          if (opc) {
+            if (h == 0) red_relaxed_add(opc, 1u);  // (a stage issued: the op's GPU-wide progress)
+            rl_seen = ld_relaxed(opc);             // (used at the next probe)
+          }
+          while (landed < n && landed_now()) publish();  // (published promptly)
+        }
+      }
+    }
+    while (landed < n) land();
+  }
+  __syncwarp();
 }
 template <int V>
 __device__ __forceinline__ void role_mma(const MKArgs& a, uint32_t* epoch_sh) {
@@ -1207,19 +1482,22 @@ __device__ __forceinline__ void role_prologue(const MKArgs& a, uint32_t* epoch_s
     if (in.op == OP_GEMV) cc.advance(in.r1 - in.r0, NSTAGE);  // the MMA warps' stages
     if (in.op == OP_GEMV) {
       const uint32_t pro = d.pro;
+      if (pro == PRO_NORM_Q) nq_early<V>(in, d, sm, pt, T);  // (its reads before the B slot's wait)
       mbar_wait(&sm.xempty[bs.slot], xempty_phase ^ 1);  // the B slot free before the prologue writes it
       if (pt == 0) {
         wait_dep(a, in.dep, epoch);
         if (a.trace) a.trace[(size_t)i * TR_N + TR_DEP] = gtimer();
       }
+      const OpDesc& dq = *reinterpret_cast<const OpDesc*>(sm.stg + NQ_DESC_OFF);  // (NORM_Q: nq_early's copy)
+      if (pro == PRO_NORM_Q && pt < 16) cp_async_wait_all();  // (the copy landed before the barrier)
       named_sync(BAR_PRO, NPRO);
       if (pro == PRO_ACT) {
         // the bulk copies below
       } else if (pro == PRO_NORM_Q) {
         const uint32_t qm = (in.aux & AUX_QPUB_DONE) ? QP_WAIT : QP_PUBLISH | QP_WAIT;
-        if (d.kind == KIND_NVFP4) pro_norm_q<KIND_NVFP4, V>(a, in, d, sm, pt, T, epoch, i, qm);
-        else if (d.kind == KIND_FP8) pro_norm_q<KIND_FP8, V>(a, in, d, sm, pt, T, epoch, i, qm);
-        else pro_norm_q<KIND_BF16, V>(a, in, d, sm, pt, T, epoch, i, qm);
+        if (d.kind == KIND_NVFP4) pro_norm_q<KIND_NVFP4, V>(a, in, dq, sm, pt, T, epoch, i, qm);
+        else if (d.kind == KIND_FP8) pro_norm_q<KIND_FP8, V>(a, in, dq, sm, pt, T, epoch, i, qm);
+        else pro_norm_q<KIND_BF16, V>(a, in, dq, sm, pt, T, epoch, i, qm);
       } else if (pro == PRO_NORM_X) {
         if (d.kind == KIND_NVFP4) pro_norm_x<KIND_NVFP4>(in, d, sm, pt, bs.slot, T, epoch);
         else if (d.kind == KIND_FP8) pro_norm_x<KIND_FP8>(in, d, sm, pt, bs.slot, T, epoch);
@@ -1236,13 +1514,16 @@ __device__ __forceinline__ void role_prologue(const MKArgs& a, uint32_t* epoch_s
       named_sync(BAR_PRO, NPRO);
       if (pt == 0) {
         if (a.trace) a.trace[(size_t)i * TR_N + TR_B] = gtimer();
-        if (pro == PRO_ACT || pro == PRO_NORM_Q)  // a published operand: its chunks by bulk copies
-          pro_act_bulk(in, d, sm, bs.slot, reinterpret_cast<const uint8_t*>(pro == PRO_ACT ? d.in0 : d.q_pub));
+        if (pro == PRO_NORM_Q)  // a published operand: its chunks by bulk copies
+          pro_act_bulk(in, dq, sm, bs.slot, reinterpret_cast<const uint8_t*>(dq.q_pub));
+        else if (pro == PRO_ACT)
+          pro_act_bulk(in, d, sm, bs.slot, reinterpret_cast<const uint8_t*>(d.in0));
         else
           for (int g = 0; g < BG; g++) mbar_arrive(&sm.xfull[bs.slot * BG + g]);
         if (pro == PRO_NORM_RESID && (d.x_out || d.r_out) && in.done != NO_CTR)
           red_release_add(a.counters + in.done, 1);
       }
+      __syncwarp();  // (thread 0's reads of the shared copy done before its warp's lanes write the next instruction's)
       bs.phase ^= 1u;  // NB 1: the groups' phases, one per instruction
       xempty_phase ^= 1u;
     } else if (in.op == OP_EMBED) {
@@ -1278,7 +1559,11 @@ __device__ __forceinline__ void role_prologue(const MKArgs& a, uint32_t* epoch_s
       const AttnDesc& g = *reinterpret_cast<const AttnDesc*>(&d);
       if (pt == 0) wait_dep(a, in.dep, epoch);  // Q from OP_ATTN_PREP
       named_sync(BAR_PRO, NPRO);
-      attn_item<NSTAGE>(in, g, sm.stages, STAGE_BYTES, sm.full, sm.empty, cc, sm.stg, pt, BAR_PRO);
+      // P's second buffer in the B slot: its last MMA's reads done (no arrival: the slot's phase stays)
+      static_assert(ATT_ROWS * ATT_TILE * 2 <= B_SLOT_BYTES, "P's second buffer in the B slot");
+      mbar_wait(&sm.xempty[bs.slot], xempty_phase ^ 1);
+      attn_item<NSTAGE>(in, g, sm.stages, STAGE_BYTES, sm.full, sm.empty, cc, sm.stg, pt, BAR_PRO,
+                        b_codes(sm, bs.slot));
       named_sync(BAR_PRO, NPRO);
       if (pt == 0 && in.done != NO_CTR) red_release_add(a.counters + in.done, 1);
     } else if (HAS_D<V> && in.op == OP_D_ATTN) {
@@ -1290,19 +1575,34 @@ __device__ __forceinline__ void role_prologue(const MKArgs& a, uint32_t* epoch_s
       if (pt == 0 && in.done != NO_CTR) red_release_add(a.counters + in.done, 1);
     } else if (HAS_D<V> && in.op >= OP_D_CTX && in.op <= OP_D_SELECT) {  // the draft's other ops (draft.cuh)
       const DraftDesc& g = *reinterpret_cast<const DraftDesc*>(&d);
+      // d.prep and d.combine (and in the FP8 KV cache's build d.topk and d.select) wait for their final dependency
+      // themselves, after their reads that do not depend on it (draft.cuh)
+      const bool waits_own_dep =
+          in.op == OP_D_TOPK || in.op == OP_D_SELECT || in.op == OP_D_PREP || in.op == OP_D_COMBINE;
+      const uint32_t* const dep_ctr = waits_own_dep && in.dep != NO_CTR ? a.counters + in.dep : nullptr;
+      const uint32_t dep_tgt = dep_ctr ? dep_target(a, in.dep, epoch) : 0u;
       if (pt == 0) {
-        wait_dep(a, in.dep, epoch);
+        if (!waits_own_dep) wait_dep(a, in.dep, epoch);
         if (in.pr0 != NO_CTR) wait_dep(a, (uint16_t)in.pr0, epoch);
       }
       named_sync(BAR_PRO, NPRO);
       if (in.op == OP_D_CTX) d_ctx(in.r0, g, pt);
-      else if (in.op == OP_D_PREP) d_prep(in.r0, g, pt);
-      else if (in.op == OP_D_COMBINE) d_combine(in.r0, g, pt, sm.stg, BAR_PRO);
+      else if (in.op == OP_D_PREP) d_prep(in.r0, g, pt, sm.stg, BAR_PRO, dep_ctr, dep_tgt);
+      else if (in.op == OP_D_COMBINE) d_combine(in.r0, g, pt, sm.stg, BAR_PRO, dep_ctr, dep_tgt);
       else if (in.op == OP_D_TOPK)
-        d_topk(in.r0, g, pt, sm.stg, BAR_PRO, a.trace ? a.trace + (size_t)i * TR_N : nullptr);
-      else d_select(in.r0, g, pt, sm.stg, BAR_PRO, a.trace ? a.trace + (size_t)i * TR_N : nullptr);
+        d_topk(in.r0, g, pt, sm.stg, BAR_PRO, a.trace ? a.trace + (size_t)i * TR_N : nullptr, dep_ctr, dep_tgt);
+      else d_select(in.r0, g, pt, sm.stg, BAR_PRO, a.trace ? a.trace + (size_t)i * TR_N : nullptr, dep_ctr, dep_tgt);
       named_sync(BAR_PRO, NPRO);
       if (pt == 0 && in.done != NO_CTR) red_release_add(a.counters + in.done, 1);
+      // a top-k item's 16 candidates' codebook rows (the selector's gathers: the merged candidates are among the
+      // items') into L2 after the item's release
+      if (in.op == OP_D_TOPK && pt < DQ_TOPK) {
+        const int32_t id = reinterpret_cast<const int32_t*>(sm.stg + DQ_TK_IDS_OFF)[pt];
+        if (id >= 0) {
+          bulk_prefetch_l2(reinterpret_cast<const __nv_bfloat16*>(g.pred_cb) + (size_t)id * DQ_RANK, DQ_RANK * 2);
+          bulk_prefetch_l2(reinterpret_cast<const __nv_bfloat16*>(g.succ_cb) + (size_t)id * DQ_RANK, DQ_RANK * 2);
+        }
+      }
     } else if (HAS_T<V> && in.op >= OP_SS_A && in.op <= OP_SS_C) {  // the spec sampler's phases (in.idx: the item)
       const SsDesc& sd = *reinterpret_cast<const SsDesc*>(&d);
       const bool ss_enabled = rec_i32(nullptr, SR_SS + SS_TOP_P) != 0;  // 0: vLLM samples the step's logits
@@ -1370,6 +1670,9 @@ __global__ void __launch_bounds__(NTHREADS, 1) mk_main(const __grid_constant__ M
     asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" ::"n"(REG_MMA) : "memory");
     mk_start(a, smem_layout(smem_raw), &epoch_sh);
     if (warp == W_PROD) role_producer<V>(a, &epoch_sh);
+    // (the FP8 KV cache's build: the pacer's branch before the MMA warps'; after them the MMA warps' code spills at
+    // REG_MMA)
+    else if (warp == W_MMA0 + NMMA) role_pacer<V>(a, &epoch_sh);
     else if (warp < W_MMA0 + NMMA) role_mma<V>(a, &epoch_sh);
   } else {
     asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" ::"n"(REG_PRO) : "memory");
