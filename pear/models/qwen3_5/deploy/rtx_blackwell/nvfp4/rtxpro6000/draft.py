@@ -12,13 +12,14 @@ from vllm import _custom_ops as vllm_ops
 from vllm.model_executor.layers.linear import LinearMethodBase
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
-from pear.models.qwen3_5.deploy.rtx_blackwell.nvfp4.quant import (
+from pear.models.qwen3_5.deploy.rtx_blackwell.nvfp4.rtxpro6000.extension import RtxPro6000Nvfp4Extension
+from pear.models.qwen3_5.deploy.rtx_blackwell.nvfp4.rtxpro6000.quant import (
     ATOM_BLOCKS,
     ATOM_ROWS,
     BLOCK,
     Fp4Weight,
 )
-from pear.models.qwen3_5.deploy.rtx_blackwell.nvfp4.schedule import (
+from pear.models.qwen3_5.deploy.rtx_blackwell.nvfp4.rtxpro6000.schedule import (
     DF,
     DRAFT,
     NO_CTR,
@@ -36,7 +37,7 @@ if TYPE_CHECKING:  # annotations only
     from vllm.v1.worker.gpu.input_batch import InputBatch
     from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
 
-    from pear.models.qwen3_5.deploy.rtx_blackwell.nvfp4.step import DecodeStep, Nvfp4Linear
+    from pear.models.qwen3_5.deploy.rtx_blackwell.nvfp4.rtxpro6000.step import DecodeStep, Nvfp4Linear
 
 logger = get_logger(__name__, default_level="INFO")
 
@@ -147,6 +148,7 @@ class DraftView:
         group_id = speculator.draft_kv_cache_group_id
         kv_cache_spec = speculator.kv_cache_config.kv_cache_groups[group_id].kv_cache_spec
 
+        extension = RtxPro6000Nvfp4Extension.loaded()
         layers = []
         for i, layer in enumerate(draft_decoder.layers):
             attention = layer.self_attn
@@ -158,19 +160,17 @@ class DraftView:
             )
             kv_cache = context[layer_names[i]].kv_cache
             kv_cache = kv_cache[0] if isinstance(kv_cache, (list, tuple)) else kv_cache
-            kv_bytes = kv_cache.view(torch.uint8)
-            # FlashInfer's NHD: logical [kernel blocks][8 heads][16 tokens][256], memory [blocks][tokens][heads]
-            kv_bytes = kv_bytes.permute(0, 2, 1, 3)
-            assert kv_bytes.shape[2:] == (NKVH, 2 * HD) and kv_bytes.is_contiguous(), (
-                tuple(kv_cache.shape),
-                kv_cache.stride(),
-            )
+            # the group's kernel block is the cache's
+            assert kv_cache.shape[2] == runner.block_tables.kernel_block_sizes[group_id], tuple(kv_cache.shape)
+            extension.check_kv_scales(context[layer_names[i]])
             layers.append(DraftLayer(
                 in_norm=to_device(layer.input_layernorm.weight),
                 post_norm=to_device(layer.post_attention_layernorm.weight),
                 q_norm=to_device(attention.q_norm.weight), k_norm=to_device(attention.k_norm.weight),
                 a_base=to_device(layer.attention_conv.base_kernel), m_base=to_device(layer.mlp_conv.base_kernel),
-                cache=kv_bytes.reshape(-1), **nvfp4_projections["layers"][i],
+                # the cache as the megakernel's build reads it: FP8 e4m3 (FlashInfer's) or bf16 (FLASH_ATTN's), NHD:
+                # logical [kernel blocks][8 heads][block tokens][k 128 | v 128], memory [blocks][tokens][heads]
+                cache=extension.kv_cache_bytes(kv_cache, NKVH, 2 * HD), **nvfp4_projections["layers"][i],
             ))  # fmt: skip
 
         fc, sel, ctx_kv = nvfp4_projections["fc"], nvfp4_projections["sel"], nvfp4_projections["ctx_kv"]
@@ -263,9 +263,12 @@ class DraftView:
 class DraftStep:
     """The draft's proposal as ops of the verify step's fused schedule, after the target's (step.attach_draft)."""
 
-    TOPK_CHUNKS = 24  # D_TOPK's vocabulary chunks per drafted position (at most csrc draft.cuh DQ_SEL_CHUNKS)
+    # D_TOPK's vocabulary chunks per drafted position (csrc draft.cuh DQ_SEL_CHUNKS): the 7 positions' items an SM each
+    # on the 188 SMs, one SM left for D_SELECT; 25 fill the selector's staging
+    TOPK_CHUNKS = 25
     EMBED_PARTS = 8  # the query block's embedding: the anchor's table row (host memory) in this many instructions
     MAX_SPLITS = 32  # D_ATTN's splits per KV head at most (csrc draft.cuh DQ_MAX_SPLITS)
+    PACE_TAIL_EARLY = 4  # pace_config()'s word: d.topk and d.select read their words before their final dependency
     ATT_ROWS = NT * 4  # D_ATTN's query rows per KV head: its 4 query heads x the block's tokens
     ATT_TILE_KEYS = 64  # D_ATTN's tensor-map box: the cache rows of a tile (csrc draft.cuh DQ_TILE)
     KP_ROWS = 1280  # the kernel projections' rows (2 sides x 2 taps x 320 groups)
@@ -283,6 +286,7 @@ class DraftStep:
         self, view: DraftView, step: DecodeStep, embed: torch.Tensor, lm_head: Nvfp4Linear, device: torch.device
     ) -> None:
         self.view, self.step, self.device = view, step, device
+        self.extension = RtxPro6000Nvfp4Extension.loaded()  # the megakernel's build the program is for
         self.num_sms = torch.cuda.get_device_properties(device).multi_processor_count
         self.n_splits = min(self.MAX_SPLITS, self.num_sms // NKVH)
         self.topk_chunk = self.topk_chunk_of(view.vocab, device)
@@ -434,7 +438,8 @@ class DraftStep:
 
         # the layers
         x_in, x_bf16, ssq, ctr = buffers["x0"], True, embed_ssq, embed_ctr
-        buffers["q"] = buffer(NKVH, self.ATT_ROWS, HD, dtype=torch.float16)
+        # (the FP8 cache's build: Q in f16, the bf16 values)
+        buffers["q"] = buffer(NKVH, self.ATT_ROWS, HD, dtype=self.extension.QUERY_DTYPE)
         buffers["po"] = buffer(NKVH, S, self.ATT_ROWS, HD, dtype=torch.float32)
         buffers["ml"] = buffer(NKVH, S, self.ATT_ROWS, 2, dtype=torch.float32)
         for i, layer in enumerate(view.layers):
@@ -486,9 +491,10 @@ class DraftStep:
                 qkv_ctr,
                 keep=[layer_buffers["qkv"], layer.q_norm, layer.k_norm, buffers["q"]],
             )
-            rows = layer.cache.numel() // (NKVH * 2 * HD)
-            tensor_map = torch.ops.pear_deploy_rtx_blackwell_nvfp4.make_tmap3d(
-                layer.cache.data_ptr(), rows, NKVH, 2 * HD, self.ATT_TILE_KEYS
+            head_row_bytes = 2 * HD * self.extension.kv_element_bytes()  # a (token, head)'s k | v
+            rows = layer.cache.numel() // (NKVH * head_row_bytes)
+            tensor_map = RtxPro6000Nvfp4Extension.ops().make_tmap3d(
+                layer.cache.data_ptr(), rows, NKVH, head_row_bytes, self.ATT_TILE_KEYS
             )
             tmap_index = schedule.n_tmaps
             schedule.n_tmaps += 1
@@ -598,6 +604,13 @@ class DraftStep:
             **final_norm_args,
         )
         buffers["parts"] = buffer(NSTEP, self.TOPK_CHUNKS, TOPK, dtype=torch.int64)
+        # the top-k's descriptor holds the codebooks: on an FP8 KV cache a top-k item prefetches its candidates'
+        # codebook rows and d.select reads its words before the top-k's end, so it runs on an SM without a top-k item,
+        # which reaches it early
+        codebooks, select_sm = dict(pred_cb=view.pred_cb, succ_cb=view.succ_cb), 0
+        reads_early = RtxPro6000Nvfp4Extension.ops().pace_config()[self.PACE_TAIL_EARLY]
+        if reads_early and NSTEP * self.TOPK_CHUNKS < self.num_sms:
+            select_sm = self.num_sms - 1
         topk_ctr = schedule.add_dop(
             Op.D_TOPK,
             self.ddesc(
@@ -606,6 +619,7 @@ class DraftStep:
                 chunks=self.TOPK_CHUNKS,
                 chunk_len=self.chunk_len,
                 topk_chunk=self.topk_chunk,
+                **codebooks,
             ),
             NSTEP * self.TOPK_CHUNKS,
             lm_head_ctr,
@@ -624,7 +638,7 @@ class DraftStep:
             1,
             topk_ctr,
             dep2=hsel_ctr,
-            sms=[0],
+            sms=[select_sm],
             keep=[buffers["hsel"], view.pred_cb, view.succ_cb],
         )
 

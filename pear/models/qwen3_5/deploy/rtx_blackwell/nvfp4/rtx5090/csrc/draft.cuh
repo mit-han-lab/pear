@@ -3,9 +3,9 @@
 // [kernel block][16 tokens][8 heads][k 128 | v 128] bytes). Included by kernel.cuh after the prologue's enc_pub4.
 #pragma once
 #include "common.cuh"
-#include "step.cuh"
+#include "../../common/csrc/step.cuh"
 #include "attention.cuh"
-#include "spec_sample.cuh"
+#include "../../common/csrc/spec_sample.cuh"
 
 namespace mk {
 template <int KIND>

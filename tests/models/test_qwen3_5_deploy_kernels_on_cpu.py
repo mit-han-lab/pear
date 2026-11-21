@@ -1,5 +1,6 @@
 import os
 import pkgutil
+import re
 import sys
 import types
 
@@ -22,16 +23,25 @@ from pear.models.qwen3_5.deploy.deploy_kernels import Qwen3_5DeployKernels
 from pear.models.qwen3_5.deploy.gpu_backend import DeployGpuBackend, Nvfp4CheckpointMixin
 from pear.models.qwen3_5.deploy.memory_plan import MemoryPlan
 from pear.models.qwen3_5.deploy.rtx_blackwell.gpu_backend import (
+    Rtx5090Nvfp4Fp8KvDeployGpuBackend,
     RtxBlackwellDeployGpuBackend,
     RtxBlackwellNvfp4DeployGpuBackend,
+    RtxPro6000Nvfp4Bf16KvDeployGpuBackend,
+    RtxPro6000Nvfp4Fp8KvDeployGpuBackend,
 )
-from pear.models.qwen3_5.deploy.rtx_blackwell.nvfp4.extension import RtxBlackwellNvfp4Extension
+from pear.models.qwen3_5.deploy.rtx_blackwell.nvfp4.rtx5090.extension import Rtx5090Nvfp4Fp8KvExtension
+from pear.models.qwen3_5.deploy.rtx_blackwell.nvfp4.rtxpro6000.extension import (
+    RtxPro6000Nvfp4Bf16KvExtension,
+    RtxPro6000Nvfp4Fp8KvExtension,
+)
+from pear.models.qwen3_5.deploy.rtx_blackwell.nvfp4.rtxpro6000.schedule import Schedule
 from repository import REPO
 
 GB300 = DeviceCapability(10, 3)
 RTX_5090 = DeviceCapability(12, 0)
 RTX_5090_NAME = "NVIDIA GeForce RTX 5090"  # NVML's
-RTX_PRO_6000_NAME = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"  # an SM120 GPU of more SMs and memory
+RTX_PRO_6000_NAME = "NVIDIA RTX PRO 6000 Blackwell Server Edition"  # an SM120 GPU of more SMs and memory
+RTX_PRO_5000_NAME = "NVIDIA RTX PRO 5000 Blackwell"  # an SM120 GPU without schedules
 NVFP4 = {"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION"}  # ModelOpt's mixed export's config.json
 BF16 = {}  # an unquantized checkpoint: no quantization_config
 
@@ -51,6 +61,8 @@ class EngineConfig:
         checkpoint_dtype: str = "bfloat16",
         dtype: torch.dtype = torch.bfloat16,
         cache_dtype: str = "auto",
+        mamba_cache_dtype: str = "auto",
+        calculates_kv_scales: bool = False,
     ) -> types.SimpleNamespace:
         hf_config = types.SimpleNamespace(
             quantization_config=NVFP4 if quantization is None else quantization,
@@ -66,7 +78,11 @@ class EngineConfig:
             ),
             parallel_config=types.SimpleNamespace(tensor_parallel_size=tp),
             scheduler_config=types.SimpleNamespace(max_num_seqs=max_num_seqs),
-            cache_config=types.SimpleNamespace(cache_dtype=cache_dtype),
+            cache_config=types.SimpleNamespace(
+                cache_dtype=cache_dtype,
+                mamba_ssm_cache_dtype=mamba_cache_dtype,
+                calculate_kv_scales=calculates_kv_scales,
+            ),
             use_v2_model_runner=is_v2_runner,
             speculative_config=speculative_config if draft_method is not None else None,
         )
@@ -110,14 +126,15 @@ def test_the_server_selects_the_gpu_backend_of_its_gpu_and_engine_config(
 @pytest.mark.parametrize(
     "gpu_name, overrides, gpu_backend",
     [
-        (RTX_5090_NAME, {}, RtxBlackwellNvfp4DeployGpuBackend),
-        (RTX_5090_NAME, {"cache_dtype": "fp8"}, RtxBlackwellNvfp4DeployGpuBackend),  # e4m3 on CUDA
+        (RTX_5090_NAME, {}, Rtx5090Nvfp4Fp8KvDeployGpuBackend),
+        (RTX_5090_NAME, {"cache_dtype": "fp8"}, Rtx5090Nvfp4Fp8KvDeployGpuBackend),  # e4m3 on CUDA
         (RTX_5090_NAME, {"cache_dtype": "auto"}, None),  # the model's bf16: the attention reads e4m3
         (RTX_5090_NAME, {"cache_dtype": "fp8_e5m2"}, None),
+        (RTX_5090_NAME, {"calculates_kv_scales": True}, None),  # the attention reads the cache at scale 1
         (RTX_5090_NAME, {"quantization": BF16}, None),
         (RTX_5090_NAME, {"draft_tokens": 3}, None),
         (RTX_5090_NAME, {"max_num_seqs": 2}, None),
-        (RTX_PRO_6000_NAME, {}, None),  # the schedules are built for the 5090
+        (RTX_PRO_5000_NAME, {}, None),  # no schedules for its SMs
     ],
 )
 def test_on_an_rtx_5090_the_server_selects_the_nvfp4_megakernel_on_an_fp8_kv_cache(
@@ -132,6 +149,128 @@ def test_on_an_rtx_5090_the_server_selects_the_nvfp4_megakernel_on_an_fp8_kv_cac
             Qwen3_5DeployKernels.select_gpu_backend(vllm_config)
     else:
         assert Qwen3_5DeployKernels.select_gpu_backend(vllm_config) is gpu_backend
+
+
+@pytest.mark.parametrize(
+    "overrides, gpu_backend",
+    [
+        ({}, RtxPro6000Nvfp4Bf16KvDeployGpuBackend),  # "auto": the model's bf16
+        ({"cache_dtype": "bfloat16"}, RtxPro6000Nvfp4Bf16KvDeployGpuBackend),
+        ({"cache_dtype": "fp8_e4m3"}, RtxPro6000Nvfp4Fp8KvDeployGpuBackend),
+        ({"cache_dtype": "fp8"}, RtxPro6000Nvfp4Fp8KvDeployGpuBackend),  # e4m3 on CUDA
+        ({"cache_dtype": "fp8_e5m2"}, None),
+        ({"cache_dtype": "fp8_e4m3", "calculates_kv_scales": True}, None),  # the attention reads the cache at scale 1
+        ({"mamba_cache_dtype": "bfloat16"}, None),  # the Gated DeltaNet reads fp32 states
+        ({"quantization": BF16}, None),
+        ({"draft_tokens": 3}, None),
+    ],
+)
+def test_on_an_rtx_pro_6000_the_server_selects_the_megakernels_build_of_the_kv_cache_dtype(
+    monkeypatch, overrides, gpu_backend
+):
+    monkeypatch.setattr(current_platform, "get_device_capability", lambda device_id=0: RTX_5090)
+    monkeypatch.setattr(current_platform, "get_device_name", lambda device_id=0: RTX_PRO_6000_NAME)
+    vllm_config = EngineConfig.of(**overrides)
+
+    if gpu_backend is None:
+        with pytest.raises(ValueError, match="no GPU backend"):
+            Qwen3_5DeployKernels.select_gpu_backend(vllm_config)
+    else:
+        assert Qwen3_5DeployKernels.select_gpu_backend(vllm_config) is gpu_backend
+
+
+@pytest.mark.parametrize(
+    "gpu_backend, package",
+    [
+        (Rtx5090Nvfp4Fp8KvDeployGpuBackend, "rtx5090"),
+        (RtxPro6000Nvfp4Bf16KvDeployGpuBackend, "rtxpro6000"),
+        (RtxPro6000Nvfp4Fp8KvDeployGpuBackend, "rtxpro6000"),
+    ],
+)
+def test_an_rtx_gpus_backend_launches_the_megakernel_of_its_package(gpu_backend, package):
+    for launched in (gpu_backend.extension, gpu_backend.decode_launch, gpu_backend.draft_launch):
+        assert launched.__module__.split(".")[-2] == package
+
+
+@pytest.mark.parametrize("package", ["rtx5090", "rtxpro6000"])
+def test_an_rtx_megakernels_sources_include_files_of_the_repository(package):
+    csrc = REPO / "pear" / "models" / "qwen3_5" / "deploy" / "rtx_blackwell" / "nvfp4" / package / "csrc"
+    common_csrc = csrc.parents[1] / "common" / "csrc"  # the files the GPUs' megakernels share
+
+    for source in (*csrc.iterdir(), *common_csrc.iterdir()):
+        for include in re.findall(r'#include "([^"]+)"', source.read_text()):
+            assert (source.parent / include).is_file(), (source.name, include)
+
+
+def test_each_build_of_the_rtx_megakernels_has_its_own_ops():
+    builds = (Rtx5090Nvfp4Fp8KvExtension, RtxPro6000Nvfp4Bf16KvExtension, RtxPro6000Nvfp4Fp8KvExtension)
+
+    assert len({build.OP_NAMESPACE for build in builds}) == len(builds)
+
+
+def test_the_rtx_pro_6000s_megakernel_has_a_build_per_kv_cache_dtype():
+    builds = (RtxPro6000Nvfp4Bf16KvExtension, RtxPro6000Nvfp4Fp8KvExtension)
+    flags = [{flag for flag in build.CUDA_FLAGS if flag.startswith("-DMK_")} for build in builds]
+
+    assert flags == [set(), {"-DMK_KV_FP8=1"}]
+    assert [build.kv_element_bytes() for build in builds] == [2, 1]
+    assert [build.QUERY_DTYPE for build in builds] == [torch.bfloat16, torch.float16]
+
+
+@pytest.mark.parametrize(
+    "build, dtype, is_read",
+    [
+        (RtxPro6000Nvfp4Bf16KvExtension, torch.bfloat16, True),
+        (RtxPro6000Nvfp4Bf16KvExtension, torch.uint8, False),
+        (RtxPro6000Nvfp4Fp8KvExtension, torch.uint8, True),  # vLLM allocates an FP8 cache as bytes
+        (RtxPro6000Nvfp4Fp8KvExtension, torch.float8_e4m3fn, True),
+        (RtxPro6000Nvfp4Fp8KvExtension, torch.bfloat16, False),
+    ],
+)
+def test_a_build_of_the_rtx_pro_6000s_megakernel_reads_the_kv_cache_of_its_dtype_as_bytes(build, dtype, is_read):
+    blocks, heads, block_tokens, row_elems = 3, 4, 16, 512
+    # vLLM's NHD cache: memory [blocks][tokens][heads], logical (blocks, heads, tokens, k | v)
+    kv_cache = torch.zeros(blocks, block_tokens, heads, row_elems, dtype=dtype).permute(0, 2, 1, 3)
+
+    if is_read:
+        kv_bytes = build.kv_cache_bytes(kv_cache, heads, row_elems)
+        assert kv_bytes.dtype == torch.uint8
+        assert kv_bytes.numel() == blocks * block_tokens * heads * row_elems * build.kv_element_bytes()
+    else:
+        with pytest.raises(AssertionError, match="KV cache"):
+            build.kv_cache_bytes(kv_cache, heads, row_elems)
+
+
+def test_a_build_of_the_rtx_pro_6000s_megakernel_refuses_a_kv_cache_in_another_memory_order():
+    kv_cache = torch.zeros(3, 4, 16, 512, dtype=torch.bfloat16)  # memory [blocks][heads][tokens]
+
+    with pytest.raises(AssertionError):
+        RtxPro6000Nvfp4Bf16KvExtension.kv_cache_bytes(kv_cache, 4, 512)
+
+
+@pytest.mark.parametrize("scales, is_served", [((1.0, 1.0, 1.0), True), ((1.0, 0.5, 1.0), False)])
+def test_the_rtx_pro_6000s_megakernel_reads_an_fp8_kv_cache_at_scale_one_only(scales, is_served):
+    attention_layer = types.SimpleNamespace(**{f"_{part}_scale_float": scale for part, scale in zip("qkv", scales)})
+
+    RtxPro6000Nvfp4Bf16KvExtension.check_kv_scales(attention_layer)  # a bf16 cache has no scales
+    if is_served:
+        RtxPro6000Nvfp4Fp8KvExtension.check_kv_scales(attention_layer)
+    else:
+        with pytest.raises(AssertionError, match="scale 1"):
+            RtxPro6000Nvfp4Fp8KvExtension.check_kv_scales(attention_layer)
+
+
+@pytest.mark.parametrize("total, pair_stages, sms", [(5440, 32, 188), (640, 80, 188), (7, 2, 3)])
+def test_a_paired_ops_split_puts_a_pair_in_at_most_two_parts(total, pair_stages, sms):
+    counts = Schedule.paired_counts(total, pair_stages, sms)
+    ends = [sum(counts[: i + 1]) for i in range(len(counts))]
+    parts_of_pair: dict[int, int] = {}
+    for count, end in zip(counts, ends):
+        for pair in range((end - count) // pair_stages, -(-end // pair_stages)) if count else ():
+            parts_of_pair[pair] = parts_of_pair.get(pair, 0) + 1
+
+    assert len(counts) == sms and sum(counts) == total
+    assert max(parts_of_pair.values()) <= 2
 
 
 def test_the_server_switches_on_the_runner_the_kernels_hook(monkeypatch):
@@ -154,6 +293,7 @@ def test_on_gb300_the_engine_compiles_its_graphs_anew(monkeypatch):
 
 def test_on_the_rtx_5090_the_engine_caches_its_graphs_by_the_megakernels_sources(monkeypatch, tmp_path):
     monkeypatch.setattr(current_platform, "get_device_capability", lambda device_id=0: RTX_5090)
+    monkeypatch.setattr(current_platform, "get_device_name", lambda device_id=0: RTX_5090_NAME)
     monkeypatch.delenv(DeployGpuBackend.COMPILE_CACHE_ENV, raising=False)
     monkeypatch.setenv("VLLM_CACHE_ROOT", str(tmp_path))
 
@@ -161,7 +301,7 @@ def test_on_the_rtx_5090_the_engine_caches_its_graphs_by_the_megakernels_sources
 
     cache_root = os.environ["VLLM_CACHE_ROOT"]
     assert os.path.dirname(cache_root) == str(tmp_path)
-    assert os.path.basename(cache_root).startswith(RtxBlackwellNvfp4Extension.OP_NAMESPACE)
+    assert os.path.basename(cache_root).startswith(RtxBlackwellNvfp4DeployGpuBackend.COMPILE_CACHE_NAME)
     assert DeployGpuBackend.COMPILE_CACHE_ENV not in os.environ
 
 
@@ -193,7 +333,7 @@ def test_the_family_deploy_config_names_the_familys_classes():
     "gpu_backend, megakernels",
     [
         (BlackwellNvfp4DeployGpuBackend, BlackwellDeployGpuBackend),
-        (RtxBlackwellNvfp4DeployGpuBackend, RtxBlackwellDeployGpuBackend),
+        (Rtx5090Nvfp4Fp8KvDeployGpuBackend, RtxBlackwellDeployGpuBackend),
     ],
     ids=["gb300", "rtx5090"],
 )

@@ -9,7 +9,11 @@ from pear.models.qwen3_5.deploy.blackwell.gpu_backend import (
 )
 from pear.models.qwen3_5.deploy.gpu_backend import DeployGpuBackend
 from pear.models.qwen3_5.deploy.memory_plan import MemoryPlan
-from pear.models.qwen3_5.deploy.rtx_blackwell.gpu_backend import RtxBlackwellNvfp4DeployGpuBackend
+from pear.models.qwen3_5.deploy.rtx_blackwell.gpu_backend import (
+    Rtx5090Nvfp4Fp8KvDeployGpuBackend,
+    RtxPro6000Nvfp4Bf16KvDeployGpuBackend,
+    RtxPro6000Nvfp4Fp8KvDeployGpuBackend,
+)
 from pear.models.qwen3_5.gpu_backend import VllmGpuBackend
 from pear.utils.logging_utils import get_logger
 
@@ -24,7 +28,13 @@ class Qwen3_5DeployKernels(DeployKernels):
     the backend of its GPU and its checkpoint."""
 
     # the backends, in priority order
-    GPU_BACKENDS = (BlackwellNvfp4DeployGpuBackend, BlackwellBf16DeployGpuBackend, RtxBlackwellNvfp4DeployGpuBackend)
+    GPU_BACKENDS = (
+        BlackwellNvfp4DeployGpuBackend,
+        BlackwellBf16DeployGpuBackend,
+        Rtx5090Nvfp4Fp8KvDeployGpuBackend,
+        RtxPro6000Nvfp4Bf16KvDeployGpuBackend,
+        RtxPro6000Nvfp4Fp8KvDeployGpuBackend,
+    )
 
     @classmethod
     def configure_server(cls, compilation_config: dict, max_num_seqs: int, max_num_batched_tokens: int) -> None:

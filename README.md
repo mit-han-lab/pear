@@ -43,11 +43,12 @@ PEAR evaluates with:
 
 PEAR deploys with:
 
-- A [model server](examples/models/qwen3_8_27b_pear/deploy/README.md): vLLM server on one RTX 5090 or GB300, with decode megakernels
+- A [model server](examples/models/qwen3_8_27b_pear/deploy/README.md): vLLM server on one GB300, RTX PRO 6000 or RTX 5090, with decode megakernels
 - A [robot station](examples/models/qwen3_8_27b_pear/deploy/README.md#drive-a-robot): the agent loop that drives a YAM or an SO-101 robot
 
 ## News
 
+- [2026/11] The model server now runs on one [RTX PRO 6000](examples/models/qwen3_8_27b_pear/deploy/README.md#hardware), with the model's full 260k-token context. With the DFlash2 checkpoint, the NVFP4 model decodes at **264 tokens/s** on a bf16 KV cache and **276 tokens/s** on an FP8 KV cache.
 - [2026/11] PEAR now trains with [MTP speculative decoding](examples/models/qwen3_8_27b_pear/train/README.md#variables) by default, which makes **end-to-end training ~40% faster**.
 - [2026/11] We released a [DFlash2 checkpoint](https://huggingface.co/mit-han-lab/Qwen3.8-27B-PEAR-DFlash2) for Qwen3.8-27B-PEAR. With it, the NVFP4 model decodes at **921 tokens/s** on one GB300 and **262 tokens/s** on one RTX 5090.
 - [2026/11] The robot station can now serve the model through [Claude Code](examples/models/qwen3_8_27b_pear/deploy/README.md#serve-through-claude-code), which compacts a task's conversation whenever the context fills, supporting tasks of unlimited length!
@@ -95,7 +96,7 @@ Then start a Ray cluster and launch your first run:
 
 | Platform | Hardware |
 | --- | --- |
-| NVIDIA Blackwell | GB300, RTX 5090 (the model server) |
+| NVIDIA Blackwell | GB300, RTX PRO 6000 and RTX 5090 (the model server) |
 | NVIDIA Hopper | H100, H200 |
 
 ## Acknowledgment

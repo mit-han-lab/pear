@@ -2,7 +2,7 @@
 // (value head hv, third of its 128 state rows), 144 items (GDN_ITEMS), run by the 256 prologue threads: the state rows
 // replay the previous block's committed tokens, then give this block's outputs by the delta rule's parallel form.
 #pragma once
-#include "common.cuh"
+// (after the GPU's csrc/common.cuh, which every includer includes first)
 #include "step.cuh"
 
 namespace mk {

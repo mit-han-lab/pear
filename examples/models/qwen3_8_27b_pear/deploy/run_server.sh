@@ -3,8 +3,8 @@
 # until it is stopped: vLLM's OpenAI-compatible server in the server's environment (scripts/install.sh server), with
 # the Qwen3.5 family's deploy kernels, which pick the decode megakernel of the GPU and the checkpoint. The GPU's engine
 # arguments are gpu/<GPU>.yaml; extra arguments are Hydra overrides (kernels=null: vLLM's own kernels):
-#   export WORK_DIR=<work dir> GPU=<gb300 | rtx5090> MODEL=<checkpoint> DRAFT=<DFlash draft> RUN=<run dir>
-#   bash examples/models/qwen3_8_27b_pear/deploy/run_server.sh
+#   export WORK_DIR=<work dir> GPU=<gb300 | rtx5090 | rtxpro6000> MODEL=<checkpoint> DRAFT=<DFlash draft> RUN=<run dir>
+#   bash examples/models/qwen3_8_27b_pear/deploy/run_server.sh [engine.kv_cache_dtype=bfloat16|fp8_e4m3]
 set -euo pipefail
 
 RECIPE_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -13,7 +13,7 @@ ROOT=$(cd "$RECIPE_DIR/../../../.." && pwd)
 # ---- user-adjustable ----
 WORK_DIR=${WORK_DIR:?the directory scripts/install.sh built}
 # the GPU's engine arguments: a file of gpu/
-GPU=${GPU:?gb300 | rtx5090}
+GPU=${GPU:?gb300 | rtx5090 | rtxpro6000}
 MODEL=${MODEL:?the checkpoint}
 # the DFlash draft of the model, whose verify steps the megakernels run
 DRAFT=${DRAFT:?the DFlash draft}
