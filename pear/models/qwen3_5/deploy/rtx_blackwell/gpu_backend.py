@@ -9,7 +9,7 @@ import vllm.envs
 from vllm.platforms import current_platform
 
 from pear.models.qwen3_5.cuda_extension import CudaExtension
-from pear.models.qwen3_5.deploy.gpu_backend import DeployGpuBackend, Nvfp4CheckpointMixin
+from pear.models.qwen3_5.deploy.gpu_backend import DeployGpuBackend, Fp8KvCacheMixin, Nvfp4CheckpointMixin
 from pear.models.qwen3_5.deploy.rtx_blackwell.nvfp4.rtx5090.draft import DraftLaunch as Rtx5090DraftLaunch
 from pear.models.qwen3_5.deploy.rtx_blackwell.nvfp4.rtx5090.extension import Rtx5090Nvfp4Fp8KvExtension
 from pear.models.qwen3_5.deploy.rtx_blackwell.nvfp4.rtx5090.runner import DecodeLaunch as Rtx5090DecodeLaunch
@@ -80,23 +80,6 @@ class RtxBlackwellNvfp4DeployGpuBackend(Nvfp4CheckpointMixin, RtxBlackwellDeploy
         sources_hash.update(current_platform.get_device_name().encode())
         cache_dir = f"{cls.COMPILE_CACHE_NAME}-{sources_hash.hexdigest()[: cls.CACHE_KEY_CHARS]}"
         os.environ["VLLM_CACHE_ROOT"] = os.path.join(vllm.envs.VLLM_CACHE_ROOT, cache_dir)
-
-
-class Fp8KvCacheMixin:
-    """What a backend adds whose build of the megakernel reads an FP8 KV cache: the cache's e4m3 rows at scale 1."""
-
-    KV_CACHE_DTYPES = ("fp8", "fp8_e4m3")  # "fp8" is e4m3 on CUDA
-
-    @classmethod
-    def can_implement(cls, vllm_config: VllmConfig) -> tuple[bool, str | None]:
-        is_implementable, reason = super().can_implement(vllm_config)
-        if not is_implementable:
-            return is_implementable, reason
-
-        if getattr(vllm_config.cache_config, "calculate_kv_scales", False):
-            return False, "its attention reads the FP8 KV cache at scale 1, not with calculated KV scales"
-
-        return True, None
 
 
 class Rtx5090Nvfp4Fp8KvDeployGpuBackend(Fp8KvCacheMixin, RtxBlackwellNvfp4DeployGpuBackend):
