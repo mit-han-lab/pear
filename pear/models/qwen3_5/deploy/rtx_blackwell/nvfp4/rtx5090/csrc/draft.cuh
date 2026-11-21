@@ -1,6 +1,7 @@
 // The DFlash 2 draft's proposal on sm_120a: the ops of its schedule that are not GEMVs (draft.py), as vLLM's
-// DFlash2Speculator / DFlash2Qwen3ForCausalLM, over the FP8 e4m3 KV cache of the draft's group (FlashInfer's NHD rows
-// [kernel block][16 tokens][8 heads][k 128 | v 128] bytes). Included by kernel.cuh after the prologue's enc_pub4.
+// DFlash2Speculator / DFlash2Qwen3ForCausalLM, over the FP8 e4m3 KV cache (scale 1) of the draft's group, NHD rows
+// [kernel block of 16 tokens][tokens][8 heads][k 128 | v 128] (FlashInfer's; 256 bytes a (token, head)), rows as vLLM's
+// reshape_and_cache_flash writes them. Included by kernel.cuh after the prologue's enc_pub4.
 #pragma once
 #include "common.cuh"
 #include "../../common/csrc/step.cuh"
@@ -17,20 +18,22 @@ constexpr int DQ_TOPK = 16, DQ_RANK = 256, DQ_NL = 5;
 constexpr int DQ_QKV = 6144, DQ_KOFF = 4096, DQ_VOFF = 5120;  // qkv_proj's rows: q 32 x 128, k 8 x 128, v 8 x 128
 constexpr int DQ_CTX_ROW = DQ_NL * 2 * DQ_NKVH * DQ_HD;     // the context projection's outputs per token (10240)
 constexpr int DQ_ROWS = DQ_G * DQ_QB;                       // query rows per KV head (row 4t + j: token t, head 4h + j)
-constexpr int DQ_ROWB = DQ_NKVH * 2 * DQ_HD;                // a cache row's bytes (2048)
+constexpr int DQ_KV_B = 1;                                  // a cache element's bytes: e4m3
+constexpr int DQ_HEAD_ROW_B = 2 * DQ_HD * DQ_KV_B;          // a KV head's cache row: k 128 | v 128 elements
+constexpr int DQ_V_OFF_B = DQ_HD * DQ_KV_B;                 // v in a KV head's cache row (bytes)
+constexpr int DQ_ROWB = DQ_NKVH * DQ_HEAD_ROW_B;            // a cache row's bytes
 constexpr int DQ_TILE = 64, DQ_BOX = DQ_TILE * 128;         // keys per tile, a TMA box (64 keys x 128 bytes)
 constexpr int DQ_MAX_SPLITS = 32;                           // D_ATTN's splits per KV head at most (draft.py MAX_SPLITS)
 constexpr int DQ_NPRO = 256;
 constexpr int TOPK_THREADS_FI = 1024;                       // FlashInfer's radix top-k CTA (its tie order)
+constexpr uint32_t DQ_TK_IDS_OFF = 1024;                     // (FP8) D_TOPK's candidate ids in its staging: past the lists
 constexpr int DQ_WARPS = 8;                                 // the prologue warps of an item
 constexpr int DQ_CTX_LAYER = 2048;                          // a layer's k | v in a context projection row
 constexpr int DQ_CTX_V = 1024;                              // v's offset in it
-constexpr int DQ_HEAD_ROW_B = 256;                          // a KV head's cache row: k 128 | v 128 bytes
-constexpr int DQ_V_OFF_B = 128;                             // v in a KV head's cache row (bytes)
 constexpr int DQ_CS_ROW = 128;                              // cos_sin's row: cos 0..63, then sin
 constexpr int DQ_CS_SIN = 64;                               // sin's offset in the row
-// the attention item's staging (stg): Q [32][128] f16 (16-byte unit u of row r at u ^ (r & 7)), P [32][64] f16 (same
-// swizzle over its 8 units), the row maxima exchange [8 warps][32]; at the end the l partials in P's place
+// the attention item's staging (stg): Q [32][128] (16-byte unit u of row r at u ^ (r & 7)), P [32][64] (same swizzle
+// over its 8 units), both f16, the row maxima exchange [8 warps][32]; at the end the l partials in P's place
 constexpr uint32_t DQ_Q_OFF = 0, DQ_P_OFF = DQ_ROWS * DQ_HD * 2, DQ_XM_OFF = DQ_P_OFF + DQ_ROWS * DQ_TILE * 2;
 constexpr uint32_t DQ_XL_OFF = DQ_P_OFF;
 static_assert(DQ_XM_OFF + DQ_WARPS * DQ_ROWS * 4 <= STG_BYTES, "the draft attention's staging");
@@ -38,8 +41,9 @@ static_assert(DQ_XM_OFF + DQ_WARPS * DQ_ROWS * 4 <= STG_BYTES, "the draft attent
 struct DraftDesc {   // 256 bytes (schedule.py DRAFT)
   uint64_t src;      // D_CTX: the context K / V bf16 [NT][10240] (layer l: k at 2048 l, v at 2048 l + 1024); D_PREP:
                      // qkv bf16 [NT][6144]; D_TOPK: the logits bf16 [NT][V]; D_SELECT: D_TOPK's lists
-  uint64_t cache[5]; // D_CTX: the 5 layers' caches; D_PREP / D_ATTN: [0] the layer's (uint8 [rows][8][256])
-  uint64_t tmap;     // D_ATTN: CUtensorMap 3D over the layer's cache {256 B, 8 heads, rows}, box {128 B, 1, 64}
+  uint64_t cache[5]; // D_CTX: the 5 layers' caches; D_PREP / D_ATTN: [0] the layer's (uint8 [rows][8][k | v]: a head's
+                     // row 256 B, e4m3)
+  uint64_t tmap;     // D_ATTN: CUtensorMap 3D over the layer's cache {a head's row, 8 heads, rows}, box {128 B, 1, 64}
   uint64_t qn_w;     // D_PREP: q_norm's weight (bf16 [128], applied as w)
   uint64_t kn_w;     // D_CTX: the 5 layers' k_norm weights (bf16 [5][128]); D_PREP: the layer's
   uint64_t cos_sin;  // bf16 [positions][128]: cos 0..63, sin 64..127 (neox over the whole head)
@@ -106,6 +110,10 @@ __device__ __forceinline__ void dq_norm_rope(float (&x)[4], const __nv_bfloat16*
 __device__ __forceinline__ uint32_t e4m3x4(const float (&v)[4]) {
   return f32x2_to_e4m3x2(v[0], v[1]) | (f32x2_to_e4m3x2(v[2], v[3]) << 16);
 }
+__device__ __forceinline__ uint2 bf16x4(const float (&v)[4]) {
+  const __nv_bfloat162 a = __floats2bfloat162_rn(v[0], v[1]), b = __floats2bfloat162_rn(v[2], v[3]);
+  return make_uint2(*reinterpret_cast<const uint32_t*>(&a), *reinterpret_cast<const uint32_t*>(&b));
+}
 
 // ---- OP_D_CTX, item (layer l, token t), warp w = KV head w: the committed token t's (t < n_valid) k (k_norm, rope at
 // its position) and v from the context projection (hidden_norm(fc(aux)) x the 5 layers' K / V rows) into the cache
@@ -131,34 +139,94 @@ __device__ __noinline__ void d_ctx(uint32_t item, const DraftDesc& g, int pt) {
 }
 
 // ---- OP_D_PREP, item (KV head h, token t) of a layer: the query block's token t (position L + 1 + t), warps 0..3 its
-// query heads 4 h + j (q_norm, rope; f16) into Q, warp 4 its key (k_norm, rope), warp 5 its value into the cache
-__device__ __noinline__ void d_prep(uint32_t item, const DraftDesc& g, int pt) {
-  constexpr int KEY_WARP = 4;    // the warp of the key, after the 4 query heads'
-  constexpr int VALUE_WARP = 5;  // the warp of the value
-  const uint32_t h = item / NT, t = item % NT;
-  const int w = pt >> 5, lane = pt & 31;
-  if (w > VALUE_WARP) return;
+// query heads 4 h + j (q_norm, rope) into Q, warp 4 its key (k_norm, rope), warp 5 its value into the cache. Every word
+// but the dependency's output (the descriptor, the draft state, the norm weights, cos / sin, the cache row) is read
+// before the dependency, which d_prep waits for itself (dctr, dtgt: role_prologue skips it); the writers of those words
+// completed before this SM's earlier draft instructions' dependencies (the draft state) or before every op (the block
+// table's, the launch's OP_BOOK)
+constexpr int DQ_KEY_WARP = 4;    // OP_D_PREP's warp of the key, after the 4 query heads'
+constexpr int DQ_VALUE_WARP = 5;  // its warp of the value
+// dq_norm_rope with its weight and cos / sin words loaded before (dq_norm_rope's arithmetic)
+__device__ __forceinline__ void dq_norm_rope_e(float (&x)[4], uint2 wu, uint2 cu, uint2 su, int lane, float eps) {
+  float ss = 0.f;
+#pragma unroll
+  for (int i = 0; i < 4; i++) ss = fmaf(x[i], x[i], ss);
+  ss = warp_sum(ss);
+  const float rstd = rsqrt_tri(div_full(ss, (float)DQ_HD) + eps);
+  const float wv[4] = {bf16lo(wu.x), bf16hi(wu.x), bf16lo(wu.y), bf16hi(wu.y)};
+  float n[4];
+#pragma unroll
+  for (int i = 0; i < 4; i++) n[i] = __fmul_rn(__fmul_rn(x[i], rstd), wv[i]);
+  const float c[4] = {bf16lo(cu.x), bf16hi(cu.x), bf16lo(cu.y), bf16hi(cu.y)};
+  const float s[4] = {bf16lo(su.x), bf16hi(su.x), bf16lo(su.y), bf16hi(su.y)};
+  const bool hi = lane >= 16;
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    const float p = __shfl_xor_sync(0xffffffffu, n[i], 16);
+    // Inductor: fma(xn, cos, -(partner sin)) for the first half, fma(xn, cos, partner sin) for the second
+    x[i] = bf16_round(hi ? __fmaf_rn(n[i], c[i], __fmul_rn(p, s[i])) : __fmaf_rn(n[i], c[i], -__fmul_rn(p, s[i])));
+  }
+}
+// the early words, in the staging buffer (no register held across the wait): per warp w its projection row, its
+// destination (the query row; the cache row, or null: no write) and the norm's epsilon; per lane (w <= DQ_KEY_WARP)
+// the norm weight's and the position's cos / sin words, by cp.async
+constexpr uint32_t DQP_OFF = 8192;  // (past the words a top-k item's threads read after its release)
+struct DqPrepSmem {
+  uint2 wu[DQ_KEY_WARP + 1][32], cu[DQ_KEY_WARP + 1][32], su[DQ_KEY_WARP + 1][32];
+  const __nv_bfloat16* src[DQ_VALUE_WARP + 1];
+  uint8_t* dst[DQ_VALUE_WARP + 1];
+  float eps;
+};
+static_assert(DQP_OFF + sizeof(DqPrepSmem) <= STG_BYTES, "d_prep's early words in the staging buffer");
+__device__ __forceinline__ void dq_prep_early(uint32_t h, uint32_t t, int w, int lane, const DraftDesc& g, DqPrepSmem& ps) {
   const DraftState st = draft_state();
   const int64_t pos = st.L + 1 + t;
   const int64_t rpos = min(pos, (int64_t)g.max_len - 1);  // (vLLM's clamped query positions)
-  const __nv_bfloat16* qkv = reinterpret_cast<const __nv_bfloat16*>(g.src) + (size_t)t * DQ_QKV;
-  const uint32_t off = w < KEY_WARP ? (h * DQ_G + w) * DQ_HD : (w == KEY_WARP ? DQ_KOFF : DQ_VOFF) + h * DQ_HD;
-  const uint2 xu = __ldcg(reinterpret_cast<const uint2*>(qkv + off) + lane);
+  if (w <= DQ_KEY_WARP) {
+    const __nv_bfloat16* cs = reinterpret_cast<const __nv_bfloat16*>(g.cos_sin) + (size_t)rpos * DQ_CS_ROW;
+    const int dl = (4 * lane) & (DQ_CS_SIN - 1);  // the rotation index
+    const __nv_bfloat16* nw = reinterpret_cast<const __nv_bfloat16*>(w < DQ_KEY_WARP ? g.qn_w : g.kn_w);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;" ::"r"(smem_u32(&ps.wu[w][lane])), "l"(nw + 4 * lane) : "memory");
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;" ::"r"(smem_u32(&ps.cu[w][lane])), "l"(cs + dl) : "memory");
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;" ::"r"(smem_u32(&ps.su[w][lane])), "l"(cs + DQ_CS_SIN + dl) : "memory");
+  }
+  if (lane == 0) {
+    const uint32_t off = w < DQ_KEY_WARP ? (h * DQ_G + w) * DQ_HD : (w == DQ_KEY_WARP ? DQ_KOFF : DQ_VOFF) + h * DQ_HD;
+    ps.src[w] = reinterpret_cast<const __nv_bfloat16*>(g.src) + (size_t)t * DQ_QKV + off;
+    uint8_t* dst = nullptr;
+    if (w < DQ_KEY_WARP) {
+      dst = reinterpret_cast<uint8_t*>(g.q) + ((size_t)h * DQ_ROWS + t * DQ_G + w) * DQ_HD * 2;
+    } else if (pos < (int64_t)g.max_len) {
+      const int64_t row = dr_row(pos);
+      if (row >= 0)
+        dst = reinterpret_cast<uint8_t*>(g.cache[0]) + (size_t)row * DQ_ROWB + h * DQ_HEAD_ROW_B +
+              (w == DQ_KEY_WARP ? 0 : DQ_V_OFF_B);
+    }
+    ps.dst[w] = dst;
+    if (w == 0) ps.eps = g.eps;
+  }
+}
+__device__ __noinline__ void d_prep(uint32_t item, const DraftDesc& g, int pt, uint8_t* stg, int bar, const uint32_t* dctr,
+                                    uint32_t dtgt) {
+  const uint32_t h = item / NT, t = item % NT;
+  const int w = pt >> 5, lane = pt & 31;
+  DqPrepSmem& ps = *reinterpret_cast<DqPrepSmem*>(stg + DQP_OFF);
+  if (w <= DQ_VALUE_WARP) dq_prep_early(h, t, w, lane, g, ps);
+  cp_async_wait_all();
+  if (dctr && pt == 0) wait_counter(dctr, dtgt);
+  named_sync(bar, DQ_NPRO);
+  if (w > DQ_VALUE_WARP) return;
+  const uint2 xu = __ldcg(reinterpret_cast<const uint2*>(ps.src[w]) + lane);
   float x[4] = {bf16lo(xu.x), bf16hi(xu.x), bf16lo(xu.y), bf16hi(xu.y)};
-  const __nv_bfloat16* cs = reinterpret_cast<const __nv_bfloat16*>(g.cos_sin) + (size_t)rpos * DQ_CS_ROW;
-  if (w < KEY_WARP) {
-    dq_norm_rope(x, reinterpret_cast<const __nv_bfloat16*>(g.qn_w), cs, lane, g.eps);
+  if (w <= DQ_KEY_WARP) dq_norm_rope_e(x, ps.wu[w][lane], ps.cu[w][lane], ps.su[w][lane], lane, ps.eps);
+  uint8_t* const dst = ps.dst[w];
+  if (w < DQ_KEY_WARP) {
     uint2 o;
     o.x = pack_f16x2(x[0], x[1]), o.y = pack_f16x2(x[2], x[3]);
-    reinterpret_cast<uint2*>(reinterpret_cast<uint8_t*>(g.q) + ((size_t)h * DQ_ROWS + t * DQ_G + w) * DQ_HD * 2)[lane] = o;
+    reinterpret_cast<uint2*>(dst)[lane] = o;
     return;
   }
-  if (w == KEY_WARP) dq_norm_rope(x, reinterpret_cast<const __nv_bfloat16*>(g.kn_w), cs, lane, g.eps);
-  if (pos >= (int64_t)g.max_len) return;
-  const int64_t row = dr_row(pos);
-  if (row < 0) return;
-  uint8_t* dst = reinterpret_cast<uint8_t*>(g.cache[0]) + (size_t)row * DQ_ROWB + h * DQ_HEAD_ROW_B +
-                 (w == KEY_WARP ? 0 : DQ_V_OFF_B);
+  if (!dst) return;
   reinterpret_cast<uint32_t*>(dst)[lane] = e4m3x4(x);
 }
 
@@ -191,8 +259,8 @@ __device__ __forceinline__ uint32_t dq_stages(const Instr& in, const DraftDesc& 
   const DqTiles tt = dq_tiles(g, in.r0 % g.n_splits);
   return tt.t1 - tt.t0;
 }
-// the producer: each tile as one ring stage (K box at 0, V box at DQ_BOX); the tiles from the step's first position on
-// wait for D_PREP and D_CTX (their rows written this launch)
+// the producer: each tile as two ring stages (K: boxes of dims 0..63, 64..127 at 0, DQ_BOX; then V likewise); the tiles
+// from the step's first position on wait for D_PREP and D_CTX (their rows written this launch)
 template <int NST>
 __device__ __forceinline__ void produce_dattn(const Instr& in, const DraftDesc& g, uint8_t* stages, uint32_t stage_bytes,
                                               uint64_t* full, uint64_t* empty, RingPos& cc, const uint32_t* counters,
@@ -268,7 +336,7 @@ __device__ __forceinline__ void dattn_item(const Instr& in, const DraftDesc& g, 
   for (uint32_t i = tt.t0; i < tt.t1; i++) {
     const int32_t key0 = dq_key0(g, i, tt.per);
     const int tile_len = min(DQ_TILE, (int)(g.block_tokens - (uint32_t)key0 % g.block_tokens));
-    // the tile's valid keys [klo, khi) (the window's and the block's; past them any bytes, e4m3 NaN too); row r's
+    // the tile's valid keys [klo, khi) (the window's and the block's; past them any bytes, NaN too); row r's
     // FlashInfer bound: keys >= L + 1 + t - W, t = r / 4 (rlo + t relative to the tile)
     const int klo = max(0, tt.lo - key0), khi = min(tile_len, tt.hi - key0 + 1), rlo = tt.L + 1 - W - key0;
     mbar_wait(&full[cc.slot], cc.phase);
@@ -328,9 +396,10 @@ __device__ __forceinline__ void dattn_item(const Instr& in, const DraftDesc& g, 
         m_run[mt][k] = mx;
         const float p0 = exp2f(sacc[mt][2 * k] - mn), p1 = exp2f(sacc[mt][2 * k + 1] - mn);
         l_run[mt][k] = l_run[mt][k] * scale[mt][k] + (p0 + p1);
-        const uint32_t c = warp * 8 + 2 * tq;
+        const uint32_t c = warp * 8 + 2 * tq;  // (the key column)
         asm volatile("st.shared.u32 [%0], %1;"
-                     ::"r"(ps + r * P_ROW_B + ((((c >> 3) ^ (r & 7)) & 7) << 4) + (c & 7) * 2), "r"(pack_f16x2(p0, p1))
+                     ::"r"(ps + r * P_ROW_B + ((((c >> 3) ^ (r & 7)) & 7) << 4) + (c & 7) * 2),
+                       "r"(pack_f16x2(p0, p1))
                      : "memory");
       }
     }
@@ -409,13 +478,21 @@ __device__ __forceinline__ void dattn_item(const Instr& in, const DraftDesc& g, 
 }
 
 // ---- OP_D_COMBINE, item = query head qh, thread (token t = pt / 32, dims 4 (pt % 32) ..): the splits merged, the
-// bf16 output quantized as o_proj's NVFP4 operand
-__device__ __noinline__ void d_combine(uint32_t item, const DraftDesc& g, int pt, uint8_t* stg, int bar) {
+// bf16 output quantized as o_proj's NVFP4 operand. The descriptor's words are read before the item's dependency, which
+// d_combine waits for itself (dctr, dtgt)
+__device__ __noinline__ void d_combine(uint32_t item, const DraftDesc& g, int pt, uint8_t* stg, int bar,
+                                       const uint32_t* dctr, uint32_t dtgt) {
   constexpr int LOADS = 8;                 // splits' partial outputs in flight
   constexpr int NVFP4_CHUNK = 256;        // o_proj's operand: K chunks of 256 values
   const uint32_t qh = item, h = qh / DQ_G, j = qh % DQ_G, S = g.n_splits;
   const float* ml = reinterpret_cast<const float*>(g.ml) + (size_t)h * S * DQ_ROWS * 2;
   const float* po = reinterpret_cast<const float*>(g.po) + (size_t)h * S * DQ_ROWS * DQ_HD;
+  uint8_t* const act = reinterpret_cast<uint8_t*>(g.act);
+  const float gs = g.gs;
+  if (dctr) {
+    if (pt == 0) wait_counter(dctr, dtgt);
+    named_sync(bar, DQ_NPRO);
+  }
   float2* wsm = reinterpret_cast<float2*>(stg);  // [8 tokens][S]
   for (uint32_t e = pt; e < DQ_QB * S; e += DQ_NPRO) {
     const uint32_t tt = e / S, s = e % S;
@@ -447,8 +524,7 @@ __device__ __noinline__ void d_combine(uint32_t item, const DraftDesc& g, int pt
   float y[4];
 #pragma unroll
   for (int i = 0; i < 4; i++) y[i] = bf16_round(acc[i] * inv);  // (the attention's bf16 output)
-  enc_pub4<KIND_NVFP4>(reinterpret_cast<uint8_t*>(g.act), DQ_NQH * DQ_HD / NVFP4_CHUNK, qh * DQ_HD + d0, t, y, g.gs,
-                       rcp_approx_ftz(g.gs), 0.f, true);
+  enc_pub4<KIND_NVFP4>(act, DQ_NQH * DQ_HD / NVFP4_CHUNK, qh * DQ_HD + d0, t, y, gs, rcp_approx_ftz(gs), 0.f, true);
 }
 
 // ---- keys of the candidates: (order-preserving bf16 logit) << 32 | ~(FlashInfer's tie rank of the index)
@@ -502,8 +578,13 @@ __device__ __forceinline__ uint64_t dq_merge16(uint64_t c, int lane) {
 
 // ---- OP_D_TOPK, item (step s, vocabulary chunk c): the top 16 keys of the chunk's logits of token s + 1; each warp a
 // running top 16 over its vectors (a batch of 32 keys merged only when one beats the list's 16th), then the 8 lists
-// merged by warp 0
-__device__ __noinline__ void d_topk(uint32_t item, const DraftDesc& g, int pt, uint8_t* stg, int bar, uint64_t* tr) {
+// merged by warp 0. The FP8 build's d_topk and d_select read their descriptor words before their final dependency, which
+// they wait for themselves (dctr, dtgt: role_prologue skips it); d_select also its draft state, cached candidates,
+// temperature and seed (their writers completed before its other dependency, which role_prologue waited for)
+#define DQ_TKC tkc  // (their copies read before the dependency)
+#define DQ_CHUNKS chunks
+__device__ __noinline__ void d_topk(uint32_t item, const DraftDesc& g, int pt, uint8_t* stg, int bar, uint64_t* tr,
+                                    const uint32_t* dctr, uint32_t dtgt) {
   constexpr uint32_t TK_LISTS_B = 1024;  // the warps' lists at the staging buffer's start (8 x 16 keys)
   constexpr int TK_TR_STAGED = 0;           // trace stamps: the chunk staged,
   constexpr int TK_TR_LISTS = 1;            // the warps' lists written,
@@ -518,6 +599,12 @@ __device__ __noinline__ void d_topk(uint32_t item, const DraftDesc& g, int pt, u
   const int w = pt >> 5, lane = pt & 31;
   uint64_t list = 0ull;  // lanes 0..15: the warp's sorted top 16 (0: none)
   const uint32_t nvec = (v1 - v0 + 7) / 8, vb = v0 / 8;
+  const uint32_t tkc = g.topk_chunk;
+  uint64_t* const parts = reinterpret_cast<uint64_t*>(g.parts) + ((size_t)s * g.chunks + c) * DQ_TOPK;
+  if (dctr) {
+    if (pt == 0) wait_counter(dctr, dtgt);
+    named_sync(bar, DQ_NPRO);
+  }
   // the chunk staged in smem first (after the warps' lists' 1 KB), every load in flight at once, not a round trip
   // from L2 per pass
   uint4* xs = reinterpret_cast<uint4*>(stg + TK_LISTS_B);
@@ -545,7 +632,7 @@ __device__ __noinline__ void d_topk(uint32_t item, const DraftDesc& g, int pt, u
   // (a key's tie rank, two divisions by a runtime value, only where the element's logit order reaches the running
   // bound's: the ranks order equal logits only, so the keys compared are the same)
   auto key_of = [&](uint32_t id, uint32_t hi) -> uint64_t {
-    return ((uint64_t)hi << 32) | (uint32_t)~dq_tie_rank(id, g.topk_chunk);
+    return ((uint64_t)hi << 32) | (uint32_t)~dq_tie_rank(id, DQ_TKC);
   };
   if (is_staged) {
     // the lanes' maxima by logit order alone (no tie ranks), thr0 = (the 16th largest, rank 0): at or below the full
@@ -577,7 +664,9 @@ __device__ __noinline__ void d_topk(uint32_t item, const DraftDesc& g, int pt, u
     for (uint32_t base = w * 32; base < nvec; base += DQ_WARPS * 32) {
       const uint32_t vi = base + lane;
       const bool in_range = vi < nvec;
-      const uint4 u = in_range ? xs[vi] : make_uint4(0, 0, 0, 0);
+      // (every use of the words below is masked by in_range: an unpredicated load of a valid vector, so that no zeroed
+      // register is overwritten by a predicated load)
+      const uint4 u = xs[in_range ? vi : 0u];
       const uint32_t wd[4] = {u.x, u.y, u.z, u.w};
       // (the lane's elements whose logit order reaches thr0's: one vote per vector, the per-element compaction only
       // for the few vectors holding one)
@@ -593,11 +682,13 @@ __device__ __noinline__ void d_topk(uint32_t item, const DraftDesc& g, int pt, u
       for (int e = 0; e < 8; e++) {
         const uint32_t id = (vb + vi) * 8 + e;
         const uint32_t hi = dq_bf16_order((wd[e / 2] >> (16 * (e & 1))) & 0xffffu);
-        const uint64_t k = (reach_mask >> e) & 1u ? key_of(id, hi) : 0ull;
-        const bool is_hit = k != 0ull && k >= thr0;
+        // (the tie rank's two divisions deferred to the compacted entries. thr0 = thi << 32 here, so a key reaches thr0
+        // exactly when its logit order reaches thi (the reach_mask bit), and no key is 0 (a tie rank is far below
+        // 2^32 - 1): the same entries at the same positions, stored as (order, id) and keyed before the sort)
+        const bool is_hit = (reach_mask >> e) & 1u;
         const uint32_t m = __ballot_sync(0xffffffffu, is_hit);
         const uint32_t pos = nc + __popc(m & ((1u << lane) - 1u));
-        if (is_hit && pos < TK_CAP) cand[pos] = k;
+        if (is_hit && pos < TK_CAP) cand[pos] = ((uint64_t)hi << 32) | id;
         nc += __popc(m);
       }
     }
@@ -606,7 +697,11 @@ __device__ __noinline__ void d_topk(uint32_t item, const DraftDesc& g, int pt, u
     if (tr && pt == 0) tr[TK_TR_CANDIDATES] = nc;
     if (nc <= TK_CAP) {
       for (uint32_t b = 0; b < nc; b += 32) {
-        const uint64_t k = b + lane < nc ? cand[b + lane] : 0ull;
+        uint64_t k = 0ull;
+        if (b + lane < nc) {
+          const uint64_t e = cand[b + lane];
+          k = key_of((uint32_t)e, (uint32_t)(e >> 32));
+        }
         const uint64_t sorted_key = dq_sort_desc(k, lane);
         const uint64_t batch_top = ((uint64_t)__shfl_sync(0xffffffffu, (uint32_t)(sorted_key >> 32), lane & 15) << 32) |
                                    __shfl_sync(0xffffffffu, (uint32_t)sorted_key, lane & 15);
@@ -627,7 +722,7 @@ __device__ __noinline__ void d_topk(uint32_t item, const DraftDesc& g, int pt, u
       const uint32_t id = (vb + vi) * 8 + e;
       const uint32_t bits = (wd[e / 2] >> (16 * (e & 1))) & 0xffffu;
       const uint64_t k =
-          in_range && id < v1 ? ((uint64_t)dq_bf16_order(bits) << 32) | (uint32_t)~dq_tie_rank(id, g.topk_chunk) : 0ull;
+          in_range && id < v1 ? ((uint64_t)dq_bf16_order(bits) << 32) | (uint32_t)~dq_tie_rank(id, DQ_TKC) : 0ull;
       const uint64_t thr = ((uint64_t)__shfl_sync(0xffffffffu, (uint32_t)(list >> 32), 15) << 32) |
                            __shfl_sync(0xffffffffu, (uint32_t)list, 15);
       if (__ballot_sync(0xffffffffu, k > thr && k >= thr0) == 0u) continue;
@@ -648,7 +743,12 @@ __device__ __noinline__ void d_topk(uint32_t item, const DraftDesc& g, int pt, u
       const uint64_t next_list = lists[k * 16 + (lane & 15)];
       acc = dq_merge16(lane < 16 ? acc : next_list, lane);
     }
-    if (lane < 16) reinterpret_cast<uint64_t*>(g.parts)[((size_t)s * g.chunks + c) * DQ_TOPK + lane] = acc;
+    if (lane < 16) parts[lane] = acc;
+    // (the item's candidate ids (-1: none) for the selector's codebook rows, prefetched into L2 by role_prologue after
+    // the item's release)
+    if (lane < 16)
+      reinterpret_cast<int32_t*>(stg + DQ_TK_IDS_OFF)[lane] =
+          acc != 0ull ? (int32_t)dq_rank_id(~(uint32_t)acc, DQ_TKC) : -1;
     if (tr && lane == 0) tr[TK_TR_MERGED] = gtimer();
   }
 }
@@ -667,7 +767,8 @@ struct DqSelSmem {
   uint64_t lists[DQ_NSTEP * DQ_SEL_CHUNKS * DQ_TOPK];  // D_TOPK's chunks' lists, loaded at once
 };
 static_assert(sizeof(DqSelSmem) <= STG_BYTES, "the selector's staging");
-__device__ __noinline__ void d_select(uint32_t item, const DraftDesc& g, int pt, uint8_t* stg, int bar, uint64_t* tr) {
+__device__ __noinline__ void d_select(uint32_t item, const DraftDesc& g, int pt, uint8_t* stg, int bar, uint64_t* tr,
+                                      const uint32_t* dctr, uint32_t dtgt) {
   constexpr int SEL_TR_MERGED = 0;  // trace stamps: the chunks' lists merged,
   constexpr int SEL_TR_SCORES = 1;  // the scores,
   constexpr int SEL_TR_PATH = 2;    // the path,
@@ -676,23 +777,38 @@ __device__ __noinline__ void d_select(uint32_t item, const DraftDesc& g, int pt,
   DqSelSmem& ss = *reinterpret_cast<DqSelSmem*>(stg);
   const int w = pt >> 5, lane = pt & 31;
   const uint32_t ns = (uint32_t)rec_i32(nullptr, SR_DR + DR_NSTEP), nr = ns * DQ_TOPK;
-  // the chunks' lists of step w merged: lane l holds the head of list l; 16 rounds of the warp's largest head. Every
-  // list staged in smem first, all loads at once, issued before the draft state's dependent loads (they run under them)
-  constexpr uint32_t SEL_PER = (DQ_NSTEP * DQ_SEL_CHUNKS * DQ_TOPK + DQ_NPRO - 1) / DQ_NPRO;
-  const uint64_t* src = reinterpret_cast<const uint64_t*>(g.src);
-  const uint32_t n = ns * min(g.chunks, (uint32_t)DQ_SEL_CHUNKS) * DQ_TOPK;
-  uint64_t lv[SEL_PER];
-#pragma unroll
-  for (uint32_t j = 0; j < SEL_PER; j++) {
-    const uint32_t e = pt + j * DQ_NPRO;
-    lv[j] = e < n ? __ldcg(src + e) : 0ull;
-  }
+  // (before the top-k's dependency: the descriptor's words, the draft state, the cached candidates, temperature, seed)
+  const uint32_t chunks = g.chunks, tkc = g.topk_chunk;
+  const __nv_bfloat16* const hsel = reinterpret_cast<const __nv_bfloat16*>(g.hsel);
+  const __nv_bfloat16* const pred_cb = reinterpret_cast<const __nv_bfloat16*>(g.pred_cb);
+  const __nv_bfloat16* const succ_cb = reinterpret_cast<const __nv_bfloat16*>(g.succ_cb);
+  const uint64_t* const src = reinterpret_cast<const uint64_t*>(g.src);
   const DraftState st = draft_state();
   const size_t V = (size_t)rec_i32(nullptr, SR_DR + DR_VOCAB);
   int64_t* cached = reinterpret_cast<int64_t*>(rec_u64(SR_DR + DR_CAND));
   if (pt < (int)nr) ss.cached_cand[pt] = cached[pt];
   const float temp = *reinterpret_cast<const volatile float*>(rec_u64(SR_DR + DR_TEMP));
   const uint64_t seed = (uint64_t)*reinterpret_cast<const volatile int64_t*>(rec_u64(SR_DR + DR_SEED));
+  if (dctr) {
+    if (pt == 0) wait_counter(dctr, dtgt);
+    named_sync(bar, DQ_NPRO);
+  }
+  // (the scores' rows that do not depend on the merge, into L2 while the lists load and merge: the selector's hidden
+  // rows 1..ns, written by d.sel_proj long before and evicted since, and the bonus token's predecessor row (step 0's);
+  // after the wait: issued long before it (the instruction is reached early on its own SM), they would be evicted again
+  // by the LM head's stream)
+  if (pt <= (int)ns)
+    bulk_prefetch_l2(pt < (int)ns ? hsel + (size_t)(pt + 1) * DQ_RANK : pred_cb + (size_t)st.bonus * DQ_RANK, DQ_RANK * 2);
+  // the chunks' lists of step w merged: lane l holds the head of list l; 16 rounds of the warp's largest head. Every
+  // list staged in smem first, all loads at once, issued before the draft state's dependent loads (they run under them)
+  constexpr uint32_t SEL_PER = (DQ_NSTEP * DQ_SEL_CHUNKS * DQ_TOPK + DQ_NPRO - 1) / DQ_NPRO;
+  const uint32_t n = ns * min(DQ_CHUNKS, (uint32_t)DQ_SEL_CHUNKS) * DQ_TOPK;
+  uint64_t lv[SEL_PER];
+#pragma unroll
+  for (uint32_t j = 0; j < SEL_PER; j++) {
+    const uint32_t e = pt + j * DQ_NPRO;
+    lv[j] = e < n ? __ldcg(src + e) : 0ull;
+  }
 #pragma unroll
   for (uint32_t j = 0; j < SEL_PER; j++) {
     const uint32_t e = pt + j * DQ_NPRO;
@@ -701,8 +817,8 @@ __device__ __noinline__ void d_select(uint32_t item, const DraftDesc& g, int pt,
   named_sync(bar, DQ_NPRO);
   if (tr && pt == 0) tr[SEL_TR_LOADED] = gtimer();
   if (w < (int)ns) {
-    const uint64_t* lists = ss.lists + (size_t)w * g.chunks * DQ_TOPK;
-    uint64_t head = lane < (int)g.chunks ? lists[(size_t)lane * DQ_TOPK] : 0ull;
+    const uint64_t* lists = ss.lists + (size_t)w * DQ_CHUNKS * DQ_TOPK;
+    uint64_t head = lane < (int)DQ_CHUNKS ? lists[(size_t)lane * DQ_TOPK] : 0ull;
     uint64_t lane_key = 0ull;  // the lane's rank of the merged top 16
     uint32_t head_pos = 0;
     // the 16 rounds of the warp's largest head (each a dependent load and two reductions)
@@ -716,7 +832,7 @@ __device__ __noinline__ void d_select(uint32_t item, const DraftDesc& g, int pt,
       }
     }
     if (lane < DQ_TOPK) {
-      ss.cand[w * DQ_TOPK + lane] = dq_rank_id(~(uint32_t)lane_key, g.topk_chunk);
+      ss.cand[w * DQ_TOPK + lane] = dq_rank_id(~(uint32_t)lane_key, DQ_TKC);
       ss.unary[w * DQ_TOPK + lane] = dq_order_value((uint32_t)(lane_key >> 32));
     }
   }
@@ -727,14 +843,14 @@ __device__ __noinline__ void d_select(uint32_t item, const DraftDesc& g, int pt,
   // the scores of step w: P = bf16(pred * h) (h: the hidden projection of token w + 1), bf16(P succ^T) (fp32 sums),
   // plus the unary logits in fp32; A and B fragments straight from the codebooks (L2 / host)
   if (w < (int)ns) {
-    const uint32_t* hs = reinterpret_cast<const uint32_t*>(reinterpret_cast<const __nv_bfloat16*>(g.hsel) + (size_t)(w + 1) * DQ_RANK);
+    const uint32_t* hs = reinterpret_cast<const uint32_t*>(hsel + (size_t)(w + 1) * DQ_RANK);
     const int gq = lane >> 2, tq = lane & 3;
     const int64_t p0 = w == 0 ? st.bonus : ss.cand[(w - 1) * DQ_TOPK + gq];
     const int64_t p1 = w == 0 ? st.bonus : ss.cand[(w - 1) * DQ_TOPK + gq + 8];
-    const uint32_t* pr0 = reinterpret_cast<const uint32_t*>(reinterpret_cast<const __nv_bfloat16*>(g.pred_cb) + (size_t)p0 * DQ_RANK);
-    const uint32_t* pr1 = reinterpret_cast<const uint32_t*>(reinterpret_cast<const __nv_bfloat16*>(g.pred_cb) + (size_t)p1 * DQ_RANK);
-    const uint32_t* sc0 = reinterpret_cast<const uint32_t*>(reinterpret_cast<const __nv_bfloat16*>(g.succ_cb) + (size_t)ss.cand[w * DQ_TOPK + gq] * DQ_RANK);
-    const uint32_t* sc1 = reinterpret_cast<const uint32_t*>(reinterpret_cast<const __nv_bfloat16*>(g.succ_cb) + (size_t)ss.cand[w * DQ_TOPK + 8 + gq] * DQ_RANK);
+    const uint32_t* pr0 = reinterpret_cast<const uint32_t*>(pred_cb + (size_t)p0 * DQ_RANK);
+    const uint32_t* pr1 = reinterpret_cast<const uint32_t*>(pred_cb + (size_t)p1 * DQ_RANK);
+    const uint32_t* sc0 = reinterpret_cast<const uint32_t*>(succ_cb + (size_t)ss.cand[w * DQ_TOPK + gq] * DQ_RANK);
+    const uint32_t* sc1 = reinterpret_cast<const uint32_t*>(succ_cb + (size_t)ss.cand[w * DQ_TOPK + 8 + gq] * DQ_RANK);
     float d[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
     auto pmul = [](uint32_t p, uint32_t h) { return pack_bf16x2(__fmul_rn(bf16lo(p), bf16lo(h)), __fmul_rn(bf16hi(p), bf16hi(h))); };
 #pragma unroll 4
