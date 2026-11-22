@@ -251,6 +251,7 @@ def test_on_gb300_the_engine_runs_trt_llm_attention_and_leaves_the_megakernels_t
 
     assert engine.attention_config.use_trtllm_attention
     assert engine.gpu_memory_utilization < 1
+    assert engine.kv_cache_dtype == "auto"  # the model's bf16, unless an override names an FP8 cache
 
 
 def test_on_the_rtx_5090_the_window_fits_an_fp8_kv_cache_beside_weights_in_host_memory():

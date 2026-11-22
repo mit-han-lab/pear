@@ -5,10 +5,11 @@ vLLM on one GPU, and `run_station.sh` lets it drive a YAM or an SO-101 robot fro
 
 ## Hardware
 
-| GPU | `GPU` | Model |
-| --- | --- | --- |
-| GB300 | `gb300` | NVFP4 or bf16 |
-| RTX 5090 | `rtx5090` | NVFP4 |
+| GPU | `GPU` | Model | KV cache |
+| --- | --- | --- | --- |
+| GB300 | `gb300` | NVFP4 | bf16 or FP8 |
+| GB300 | `gb300` | bf16 | bf16 |
+| RTX 5090 | `rtx5090` | NVFP4 | FP8 |
 
 The model is served with a DFlash draft of it.
 
@@ -21,7 +22,7 @@ export WORK_DIR=<work dir>
 bash scripts/install.sh server
 
 export GPU=gb300 MODEL=<model dir> DRAFT=<draft dir> RUN=<run dir>   # on an RTX 5090: GPU=rtx5090
-bash examples/models/qwen3_8_27b_pear/deploy/run_server.sh
+bash examples/models/qwen3_8_27b_pear/deploy/run_server.sh           # [engine.kv_cache_dtype=bfloat16|fp8_e4m3]
 ```
 
 The server answers at `http://<host>:8000/v1` under the name `qwen3_8_27b`.
