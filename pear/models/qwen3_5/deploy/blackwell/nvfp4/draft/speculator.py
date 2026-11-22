@@ -11,6 +11,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
 from pear.models.qwen3_5.deploy.blackwell.nvfp4.draft.proposal import DraftProposal
 from pear.models.qwen3_5.deploy.blackwell.nvfp4.draft.schedule import ARGS_WORDS, ArgBlocks
 from pear.models.qwen3_5.deploy.blackwell.nvfp4.draft.weights import DraftWeights
+from pear.models.qwen3_5.deploy.blackwell.nvfp4.extension import BlackwellNvfp4Extension
 from pear.models.qwen3_5.deploy.blackwell.nvfp4.step import RING
 
 if TYPE_CHECKING:  # annotations only
@@ -117,7 +118,11 @@ class ProposalLaunch:
     def build(speculator: DFlash2Speculator, target_model: torch.nn.Module) -> DraftProposal:
         """The proposal over the speculator's draft model, the target's embedding and LM head, the draft's KV caches."""
         layers = get_layers_from_vllm_config(speculator.vllm_config, AttentionLayerBase)
-        caches = [layers[name].kv_cache for name in speculator.model.get_draft_kv_cache_layer_names()]
+        extension = BlackwellNvfp4Extension.loaded()  # the megakernel's build: the draft's caches are of its dtype
+        names = speculator.model.get_draft_kv_cache_layer_names()
+        caches = [extension.kv_cache_of(layers[name]) for name in names]
+        for name in names:
+            extension.check_kv_scales(layers[name])
         kv_cache_spec = speculator.kv_cache_config.kv_cache_groups[speculator.draft_kv_cache_group_id].kv_cache_spec
         weights = DraftWeights.from_vllm(speculator.model, target_model.get_language_model())
         proposal = DraftProposal(

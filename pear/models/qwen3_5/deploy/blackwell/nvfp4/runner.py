@@ -84,7 +84,7 @@ class TopKLogProbs:
         token_ids = torch.empty((rows, self.K + 1), dtype=torch.int64, device=logits.device)
         logprobs = torch.empty((rows, self.K + 1), dtype=torch.float32, device=logits.device)
         ranks = torch.empty(rows, dtype=torch.int64, device=logits.device)
-        torch.ops.pear_deploy_blackwell_nvfp4.topk_logprobs(
+        BlackwellNvfp4Extension.ops().topk_logprobs(
             logits,
             sampled_token_ids.to(torch.int64),
             self.partials,
@@ -210,7 +210,7 @@ class LaunchedOutput(AsyncOutput):
         self.copy_event = torch.cuda.Event(blocking=True)  # recorded by copy_slot only
 
     def get_output(self) -> ModelRunnerOutput:
-        if self.seq is None or not torch.ops.pear_deploy_blackwell_nvfp4.wait_flag(
+        if self.seq is None or not BlackwellNvfp4Extension.ops().wait_flag(
             self.step.ss_flags, self.slot, self.seq, self.WAIT_US
         ):
             self.copy_slot()
@@ -279,7 +279,6 @@ class DecodeLaunch:
                 raise RuntimeError(
                     f"the decode megakernel runs the verify steps of a DFlash 2 draft of {NT - 1} tokens"
                 )
-            BlackwellNvfp4Extension.load()
             cls.step = DecodeStep(view, runner.device, proposal)
             cls.topk = TopKLogProbs(runner.device)
             cls.spec_sampler = SpecSampler()

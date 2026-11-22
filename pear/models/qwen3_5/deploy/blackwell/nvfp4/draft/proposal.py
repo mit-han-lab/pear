@@ -2,6 +2,7 @@ import math
 
 import torch
 
+from pear.models.qwen3_5.deploy.blackwell.nvfp4.draft.extension import BlackwellNvfp4DraftExtension
 from pear.models.qwen3_5.deploy.blackwell.nvfp4.draft.quant import Fp4Weight
 from pear.models.qwen3_5.deploy.blackwell.nvfp4.draft.schedule import (
     NB,
@@ -59,8 +60,11 @@ class DraftProposal:
     ) -> None:
         assert 1 <= nstep <= NSTEP, "drafts per proposal (the kernel's B rows: the block of nstep + 1 tokens, padded)"
         assert len(caches) == len(weights.layers)
+        # the draft's KV cache in vLLM's FlashAttention layout [blocks][kv heads][kv_block][k | v] (its kernel block the
+        # group's block): bf16, or FP8 e4m3 at scale 1 for the FP8 KV cache's build of the kernel
+        self.kv_dtype = BlackwellNvfp4DraftExtension.loaded().KV_DTYPE
         for cache in caches:
-            assert cache.dtype == torch.bfloat16 and cache.is_contiguous()
+            assert cache.dtype == self.kv_dtype and cache.is_contiguous(), f"a {cache.dtype} draft KV cache"
             assert tuple(cache.shape[1:]) == (NKVH, kv_block, 2 * HDIM)
 
         self.weights, self.device, self.nstep = weights, device, nstep
@@ -86,7 +90,7 @@ class DraftProposal:
         """One proposal on the step's StepArgs block (ArgBlocks.step)."""
         tensors = self.tensors
 
-        torch.ops.pear_deploy_blackwell_nvfp4_draft.run(
+        BlackwellNvfp4DraftExtension.ops().run(
             tensors["instrs"],
             tensors["sm_off"],
             tensors["descs"],
@@ -120,8 +124,8 @@ class DraftProposal:
         self.qkv_sum = [
             buffer(2, QKV_SLOTS, (NQH + 2 * NKVH), NB, HDIM, dtype=torch.float32) for _ in range(num_layers)
         ]
-        # the block's k | v rows (the cache's row layout)
-        self.kvq = [buffer(QB, NKVH, 2, HDIM) for _ in range(num_layers)]
+        # the block's k | v rows (the cache's row layout and dtype)
+        self.kvq = [buffer(QB, NKVH, 2, HDIM, dtype=self.kv_dtype) for _ in range(num_layers)]
         self.head_ctr = [buffer(NKVH, dtype=torch.int32) for _ in range(num_layers)]
         self.part_o = [buffer(self.n_splits, NKVH, ATT_ROWS, HDIM, dtype=torch.float32) for _ in range(num_layers)]
         self.part_ml = [buffer(self.n_splits, NKVH, ATT_ROWS, 2, dtype=torch.float32) for _ in range(num_layers)]

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+from pear.models.qwen3_5.deploy.blackwell.nvfp4.extension import BlackwellNvfp4Extension
 from pear.models.qwen3_5.deploy.blackwell.nvfp4.schedule import (
     ATT_KV_HEADS,
     ATT_PAGE,
@@ -17,6 +18,7 @@ from pear.models.qwen3_5.deploy.blackwell.nvfp4.schedule import (
     NT,
     SS_HOST,
     Kind,
+    OpDescField,
     Pro,
     Schedule,
 )
@@ -147,7 +149,8 @@ class AttentionCore:
     eps: float
     cos_sin: torch.Tensor  # bf16 [positions][64]
     scale: float
-    kv_cache: torch.Tensor  # bf16 [kernel blocks][kv heads][64][k | v]
+    # bf16 [kernel blocks][kv heads][64][k | v], or e4m3 [kernel blocks][kv heads][16, 32 or 64][k | v]
+    kv_cache: torch.Tensor
     group: int
 
 
@@ -193,6 +196,7 @@ class ModelView:
         )
         kv_cache_config = runner.kv_cache_config
         context = runner.compilation_config.static_forward_context
+        extension = BlackwellNvfp4Extension.loaded()  # the megakernel's build the caches are read by
         group_of = {
             name: group_index
             for group_index, group in enumerate(kv_cache_config.kv_cache_groups)
@@ -215,9 +219,10 @@ class ModelView:
                     eps=attention.q_norm.variance_epsilon,
                     cos_sin=rotary.cos_sin_cache.to(torch.bfloat16).contiguous(),
                     scale=attention.scaling,
-                    kv_cache=context[name].kv_cache,
+                    kv_cache=extension.kv_cache_of(context[name]),
                     group=group_of[name],
                 )
+                extension.check_kv_scales(context[name])
             else:
                 gdn = layer.linear_attn
                 conv_state, ssm_state = context[gdn.prefix].kv_cache[:2]
@@ -391,12 +396,25 @@ class DecodeStep:
         if not view.aux_layers or not all(0 < layer_index <= len(view.layers) for layer_index in view.aux_layers):
             return f"the draft's aux layers {view.aux_layers}, not of decoder layers 1..{len(view.layers)}"
 
-        # its attention reads kernel blocks of ATT_PAGE tokens
+        # its attention reads a bf16 cache in kernel blocks of ATT_PAGE tokens, or an FP8 e4m3 one in kernel blocks of a
+        # quarter, a half or a whole page
+        kv_dtypes = set()
         for layer in view.layers:
             if isinstance(layer.core, AttentionCore):
-                shape = tuple(layer.core.kv_cache.shape[1:])
-                if shape != (ATT_KV_HEADS, ATT_PAGE, ATT_ROW_BYTES // 2):
-                    return f"attention KV cache blocks {shape} (block size {view.block_size})"
+                kv_cache = layer.core.kv_cache
+                shape = tuple(kv_cache.shape[1:])
+                kv_dtypes.add(kv_cache.dtype)
+                if kv_cache.dtype == torch.bfloat16:
+                    if shape != (ATT_KV_HEADS, ATT_PAGE, ATT_ROW_BYTES // 2):
+                        return f"attention KV cache blocks {shape} (block size {view.block_size})"
+                elif kv_cache.dtype == torch.float8_e4m3fn:
+                    block_tokens = (ATT_PAGE // 4, ATT_PAGE // 2, ATT_PAGE)
+                    if shape not in [(ATT_KV_HEADS, tokens, ATT_ROW_BYTES // 2) for tokens in block_tokens]:
+                        return f"FP8 attention KV cache blocks {shape} (block size {view.block_size})"
+                else:
+                    return f"attention KV cache dtype {kv_cache.dtype}"
+        if len(kv_dtypes) > 1:
+            return f"attention KV caches of several dtypes {sorted(map(str, kv_dtypes))}"
 
         return None
 
@@ -498,7 +516,7 @@ class DecodeStep:
             sampler_words[SS_TOP_P : SS_TOP_P + 1].view(np.float32)[0] = spec_inputs["top_p"]
 
         tensors = self.tensors
-        torch.ops.pear_deploy_blackwell_nvfp4.run(
+        BlackwellNvfp4Extension.ops().run(
             tensors["instrs"],
             tensors["sm_off"],
             tensors["descs"],
@@ -524,11 +542,24 @@ class DecodeStep:
         layers = view.layers
 
         # the previous launched step's outputs, then the step's inputs first (launch(prev_launch=..., book_req=...))
+        # (the FP8 KV cache's build: no OP_EMBED; layer 0's NORM_IN prologues read the table's rows by token id after
+        # OP_BOOK's counter and in_proj_qkvz's write x0 as slices, released by in_proj_ba's prologue counts, which every
+        # SM's layer-0 core acquires; with OP_BOOK, in_proj_qkvz takes the rows' ids by OP_BOOK's formula from its
+        # sources instead of waiting for it, and in_proj_ba keeps the wait that orders the later readers of its outputs)
+        reads_table = schedule.is_kv_fp8
+        book_ctr, book_copy = NO_CTR, 0
         if self.has_book_op:
             schedule.add_prev(
                 rec=record_ptr, ring=self.ss_ring, host=self.ss_host, flags=self.ss_flags, post=self.post_tensors
             )
-            schedule.add_book(rec=record_ptr, ring=self.ss_ring, **view.book_tensors)
+            book_ctr = schedule.add_book(
+                rec=record_ptr, ring=self.ss_ring, has_counter=reads_table, **view.book_tensors
+            )
+            if reads_table:  # (megakernel.cu book_id reads OP_BOOK's sources through a copy of its descriptor)
+                book_desc = torch.frombuffer(bytearray(schedule.descs[schedule.book_index]), dtype=torch.uint8)
+                book_desc = book_desc.to(device)
+                schedule.keep.append(book_desc)
+                book_copy = book_desc.data_ptr()
 
         # newly allocated blocks: vLLM's KVBlockZeroer segments (attention layers), zeroed by the step itself
         zero_ctr = None
@@ -537,10 +568,12 @@ class DecodeStep:
             zero_ctr = schedule.add_zero(seg_addrs=meta[0], seg_strides=meta[1], seg_pages=meta[2], rec=record_ptr)
 
         embeddings = torch.zeros(NT, hidden_size, dtype=torch.bfloat16, device=device)
-        embed_ctr = schedule.add_embed(table=view.embed, out=embeddings, rec=record_ptr)
-        dep, in_proj_outputs = self.in_proj(
-            schedule, layers[0], dep=embed_ctr, pro=dict(pro=Pro.NORM_IN, in0=embeddings)
-        )
+        if reads_table:  # (without OP_BOOK: the record's token, or vLLM's input ids written before the launch)
+            first_dep, first_pro = book_ctr, dict(pro=Pro.NORM_IN, res_in=view.embed, r_out=embeddings)
+        else:
+            first_dep = schedule.add_embed(table=view.embed, out=embeddings, rec=record_ptr)
+            first_pro = dict(pro=Pro.NORM_IN, in0=embeddings)
+        dep, in_proj_outputs = self.in_proj(schedule, layers[0], dep=first_dep, pro=first_pro, book_copy=book_copy)
         residual = embeddings
         schedule.keep.append(embeddings)
 
@@ -653,8 +686,10 @@ class DecodeStep:
 
         return schedule
 
-    def in_proj(self, schedule: Schedule, layer: Layer, *, dep: int, pro: dict) -> tuple[int, list]:
-        """Layer `layer`'s input RMSNorm + projections (FP8 qkv / qkvz, bf16 ba); returns (dependency, [desc, ...])."""
+    def in_proj(self, schedule: Schedule, layer: Layer, *, dep: int, pro: dict, book_copy: int = 0) -> tuple[int, list]:
+        """Layer `layer`'s input RMSNorm + projections (FP8 qkv / qkvz, bf16 ba); returns (dependency, [desc, ...]).
+        book_copy (the first layer, with OP_BOOK in the FP8 KV cache's build): the address of a copy of OP_BOOK's
+        descriptor, from whose sources in_proj_qkvz's prologue takes the rows' ids, without the dependency."""
         in_norm = layer.in_norm
         gemv_args = dict(eps=in_norm.eps, nw=in_norm.weight, K=K_NORM, is_aligned=True, **pro)
         if isinstance(layer.core, AttentionCore):
@@ -669,13 +704,23 @@ class DecodeStep:
         if pro["pro"] == Pro.NORM_IN:
             # the first layer, on the embedding: in_proj_qkvz and in_proj_ba as ops (the core reads both outputs)
             proj_ctr, proj_desc = schedule.add_gemv(
-                w=qkvz.weight, kind=Kind.FP8, dep=dep, alpha=qkvz.alpha, gs=qkvz.input_scale, **gemv_args
+                w=qkvz.weight,
+                kind=Kind.FP8,
+                dep=NO_CTR if book_copy else dep,
+                alpha=qkvz.alpha,
+                gs=qkvz.input_scale,
+                **gemv_args,
             )
+            if book_copy:
+                schedule.set_field(proj_desc, OpDescField.REC, book_copy)
             gemv_args.pop("is_aligned")
+            gemv_args.pop("r_out", None)  # (x0's slices: in_proj_qkvz's prologues only)
             ba_bytes = ba_weight.view(torch.uint8).view(ba_weight.shape[0], -1)
             ba_ctr, ba_desc = schedule.add_gemv(
                 w=ba_bytes, kind=Kind.BF16, dep=dep, alpha=1.0, gs=1.0, is_exact=True, **gemv_args
             )
+            if book_copy:  # (no dry run before its wait: in_proj_qkvz, its SM's previous GEMV, has no dependency)
+                schedule.no_warm.add(ba_desc)
             return ba_ctr, [proj_desc, ba_desc]  # ba_ctr completes after proj_ctr on every SM
 
         # in_proj_qkv (the rows the core reads; its sums as tagged words per K part, its prologue leaving the normed
@@ -713,9 +758,8 @@ class DecodeStep:
         """A full-attention layer's core and o_proj; returns the o_proj's (counter, desc)."""
         core = layer.core
         kv_cache = core.kv_cache
-        assert isinstance(kv_cache, torch.Tensor) and kv_cache.dtype == torch.bfloat16 and kv_cache.dim() == 4, (
-            "a bf16 HND KV cache"
-        )
+        assert isinstance(kv_cache, torch.Tensor) and kv_cache.dim() == 4, "an HND KV cache"
+        assert kv_cache.dtype in (torch.bfloat16, torch.float8_e4m3fn), "a bf16 or FP8 e4m3 KV cache"
         assert self.block_size % kv_cache.shape[2] == 0
         o_proj = core.o_proj
 

@@ -72,6 +72,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) dk_main(const __grid_constant__ D
   tc_fence_after();
   sm.tmem = tmem_slot;
   const uint32_t i0 = irange[0], i1 = irange[1];
+#if !MK_KV_FP8
   if (warp < W_EPI0) {  // warpgroup 0: the convs' base taps into TMEM
     set_max_regs<REG_IDLE>();
     BaseRole role;
@@ -80,7 +81,9 @@ __global__ void __launch_bounds__(NTHREADS, 1) dk_main(const __grid_constant__ D
       const Instr in = a.instrs[ii];
       role.instr(in, a, sm, lane);
     }
-  } else if (warp >= W_PROD && warp < W_WRK0) {  // warpgroup 2: the TMA and MMA roles
+  } else
+#endif
+  if (warp >= W_PROD && warp < W_WRK0) {  // the TMA and MMA roles' warpgroup
     set_max_regs<REG_LO>();
     RingPos cc, seg;
     if (warp == W_PROD) {
@@ -97,19 +100,29 @@ __global__ void __launch_bounds__(NTHREADS, 1) dk_main(const __grid_constant__ D
         role.instr(in, ii, i0, a, sm, cc, seg, lane);
       }
       if (lane == 0) mark(a, R_MMA, i1, i0);
-    }  // (warps 10, 11: idle)
-  } else if (warp < W_PROD) {  // warpgroup 1: the epilogue
+    }  // (the warpgroup's other two warps: idle)
+  } else if (warp < W_PROD) {  // the epilogue's warpgroup
     set_max_regs<REG_EPI>();
     const int ept = threadIdx.x - W_EPI0 * 32;
     RingPos seg;
     EpiRole role;
     role.begin(a, sm, ept, epoch);
+#if MK_KV_FP8
+    // the convs' base taps too, as the decode megakernel's draft phase writes them: those of the two-phase GEMV two
+    // instructions on (its TMEM region's previous reader long done) while this instruction's accumulator is due
+    constexpr uint32_t BASE_AHEAD = 2;
+    BaseRole base;
+    for (uint32_t ii = i0; ii < i0 + BASE_AHEAD && ii < i1; ii++) base.instr(a.instrs[ii], a, sm, lane);
+#endif
     for (uint32_t ii = i0; ii < i1; ii++) {
+#if MK_KV_FP8
+      if (ii + BASE_AHEAD < i1) base.instr(a.instrs[ii + BASE_AHEAD], a, sm, lane);
+#endif
       const Instr in = a.instrs[ii];
       role.instr(in, ii, i0, a, sm, seg, ept, epoch);
     }
     if (ept == 0) mark(a, R_EPI, i1, i0);
-  } else {  // warpgroups 3-4: the workers
+  } else {  // the last two warpgroups: the workers
     set_max_regs<REG_HI>();
     const int pt = threadIdx.x - W_WRK0 * 32;
     RingPos cc;
@@ -215,14 +228,22 @@ std::vector<int64_t> dk_sizes() {
           (int64_t)dk::SMEM_BYTES, (int64_t)dk::BBUF_BYTES, (int64_t)dk::NSTAGE * dk::STAGE_STRIDE, (int64_t)sizeof(dk::DkArgs)};
 }
 
-TORCH_LIBRARY(pear_deploy_blackwell_nvfp4_draft, m) {
+#if MK_KV_FP8  // the FP8 KV cache's build: an op namespace of its own (extension.py BlackwellNvfp4Fp8KvDraftExtension)
+#define DK_OP_NAMESPACE pear_deploy_blackwell_nvfp4_fp8_kv_draft
+#else
+#define DK_OP_NAMESPACE pear_deploy_blackwell_nvfp4_draft
+#endif
+// (macros of their own: they expand DK_OP_NAMESPACE before TORCH_LIBRARY pastes it into its names)
+#define DK_LIBRARY(ns, m) TORCH_LIBRARY(ns, m)
+#define DK_LIBRARY_IMPL(ns, k, m) TORCH_LIBRARY_IMPL(ns, k, m)
+DK_LIBRARY(DK_OP_NAMESPACE, m) {
   m.def("run(Tensor instrs, Tensor sm_off, Tensor descs, Tensor(a!) counters, Tensor ctr_count, Tensor(b!) epoch, "
         "Tensor(c!) ssq, Tensor step, Tensor tab, Tensor(d!) progress, Tensor(e!) tstamp, int nsm) -> ()");
   m.def("make_tmap(Tensor w, int rows, int row_bytes, int box_rows) -> Tensor");
   m.def("sizes() -> int[]");
 }
-TORCH_LIBRARY_IMPL(pear_deploy_blackwell_nvfp4_draft, CUDA, m) { m.impl("run", &dk_run); }
-TORCH_LIBRARY_IMPL(pear_deploy_blackwell_nvfp4_draft, CompositeExplicitAutograd, m) {
+DK_LIBRARY_IMPL(DK_OP_NAMESPACE, CUDA, m) { m.impl("run", &dk_run); }
+DK_LIBRARY_IMPL(DK_OP_NAMESPACE, CompositeExplicitAutograd, m) {
   m.impl("make_tmap", &dk_make_tmap);
 }
-TORCH_LIBRARY_IMPL(pear_deploy_blackwell_nvfp4_draft, CatchAll, m) { m.impl("sizes", &dk_sizes); }
+DK_LIBRARY_IMPL(DK_OP_NAMESPACE, CatchAll, m) { m.impl("sizes", &dk_sizes); }

@@ -5,6 +5,8 @@ from enum import IntEnum
 
 import torch
 
+from pear.models.qwen3_5.deploy.blackwell.nvfp4.extension import BlackwellNvfp4Extension
+
 # the packed layouts of csrc/: Instr (step.cuh) and the 256-byte descriptors OpDesc (megakernel.cu), AttnDesc
 # (attention.cuh)
 INSTR = struct.Struct("<4H6I")
@@ -13,6 +15,7 @@ DESC = struct.Struct("<14Q4f20I2Q2I3Q")
 # mtiles, outs, erstd, ssq_prev, cs, baw
 SHARED_B_EXT = struct.Struct("<8Q2f8I3Q")
 ATTN = struct.Struct("<8Q4f6IQQI132x")  # AttnDesc (attention.cuh): ... trace (0), ml, kb_shift
+ATTN_FP8 = struct.Struct("<8Q4f6IQQIIQ120x")  # the FP8 KV cache's build's AttnDesc: ... kb_shift, pad0, tmap4
 GDNT = struct.Struct("<13Q2f12I4Q2f2I48x")  # GdnTDesc (gdn_t.cuh)
 SSD = struct.Struct("<12Q4I144x")  # SsDesc (spec_sample.cuh)
 BOOK = struct.Struct("<15Q4I120x")  # BookDesc (step.cuh)
@@ -70,6 +73,9 @@ AUX_DRAFT_ROWS = 1 << 5
 # bit 6 (mark_fastact) on an out_proj instruction after the GDN core on its SM (AUX_ZNEXT; validated, no dependency):
 # its prologue warps' path of its own
 AUX_FASTACT = 1 << 6
+# bit 7 (mark_fastpub, the FP8 KV cache's build) on a PRO_ACT consumer: its prologue by the path every layer's PRO_ACT
+# consumers share (megakernel.cu fast_pub)
+AUX_FASTPUB = 1 << 7
 # bit 20 (mark_split): its CTA pair builds the op's RMSNorm B operands together (Instr.pr0 / pr1: the other CTA's range)
 AUX_SPLIT = 1 << 20
 # bit 21 (mark_perm): its stages are loaded in a permuted order, the parked block first (megakernel.cu perm_stage)
@@ -156,6 +162,7 @@ class OpDescField(IntEnum):
     NW = 5
     X_OUT = 6
     R_OUT = 7
+    REC = 9  # OpDesc::rec (layer 0's in_proj_qkvz in the FP8 KV cache's build: the address of a copy of OP_BOOK's)
     P0 = 10  # p[0]
     P2 = 12  # p[2]
     ALPHA = 14
@@ -237,8 +244,12 @@ class Schedule:
 
     def __init__(self, nsm: int, device: torch.device) -> None:
         self.nsm, self.device = nsm, device
+        self.extension = BlackwellNvfp4Extension.loaded()  # the megakernel's build the program is for
+        self.is_kv_fp8 = self.extension.KV_DTYPE == torch.float8_e4m3fn  # (its attention reads an FP8 KV cache)
         self.descs: list[bytes] = []
         self.sm_instrs: list[list[bytes]] = [[] for _ in range(nsm)]
+        self.book_index: int | None = None  # OP_BOOK's descriptor (add_book)
+        self.no_warm: set[int] = set()  # the GEMV ops mark_warm leaves without AUX_WARM
         self.ctr_count: list[int] = []
         self.ctr_val: dict[int, bool] = {}  # a GEMV op's counter -> whether the op is validated (val)
         self.keep: list[torch.Tensor] = []  # the tensors the descriptors point to
@@ -295,10 +306,13 @@ class Schedule:
         assert last_sm > 0 and not self.sm_instrs[last_sm], "OP_PREV is the last SM's first instruction"
         self.sm_instrs[last_sm].append(INSTR.pack(Op.PREV, len(self.descs) - 1, NO_CTR, NO_CTR, 0, 0, 0, 0, 0, 0))
 
-    def add_book(self, *, rec: int, inputs: dict, states: dict, tables: dict, ring: dict) -> None:
+    def add_book(
+        self, *, rec: int, inputs: dict, states: dict, tables: dict, ring: dict, has_counter: bool = False
+    ) -> int:
         """OP_BOOK, SM 0's first instruction: the step's inputs written into the V2 runner's buffers, its request from
         the step record, and with the record's PREV_POST the previous launched step's last sampled token and computed
-        tokens from its ring slot."""
+        tokens from its ring slot. has_counter (no OP_EMBED: layer 0's prologues read the ids after it): a counter of
+        its own, returned; otherwise NO_CTR (the embedding's release, SM 0's next, publishes the inputs)."""
         # inputs: input_ids, positions, seq_lens, is_padding; states: last_sampled, draft_tokens, num_computed; tables:
         # src / dst (uint64 bases per KV cache group), stride, num_blocks; ring: sampled, num_sampled, num_rejected
         draft_tokens, num_blocks = states["draft_tokens"], tables["num_blocks"]
@@ -330,8 +344,11 @@ class Schedule:
             )
         )
 
+        self.book_index = len(self.descs) - 1
         assert not self.sm_instrs[0], "OP_BOOK is SM 0's first instruction (before the embedding and any mark())"
-        self.sm_instrs[0].append(INSTR.pack(Op.BOOK, len(self.descs) - 1, NO_CTR, NO_CTR, 0, 0, 0, 0, 0, 0))
+        counter = self.new_counter(2) if has_counter else NO_CTR  # (the prologue warps' release and the epilogue's)
+        self.sm_instrs[0].append(INSTR.pack(Op.BOOK, len(self.descs) - 1, NO_CTR, counter, 0, 0, 0, 0, 0, 0))
+        return counter
 
     def add_zero(self, *, seg_addrs: torch.Tensor, seg_strides: torch.Tensor, seg_pages: torch.Tensor, rec: int) -> int:
         """Zero the step's newly allocated blocks (ids in the step record) in the attention layers' caches as vLLM's
@@ -495,6 +512,10 @@ class Schedule:
             sf = self.paired_scales(sf, n_out, K)
             self.keep.append(sf)
         self.check_prologue(pro, K, kind, src, ranges, spm, res_bf16)
+        if pro == Pro.NORM_IN and self.ptr(res_in):  # (the embedding table's rows by token id; x0 as the r_out slices)
+            assert res_in.dtype == torch.bfloat16 and res_in.is_contiguous() and res_in.data_ptr() % 16 == 0
+            assert res_in.shape[1] == K
+            assert not self.ptr(r_out) or all(r0 < r1 for r0, r1 in ranges), "NORM_IN's r_out: every slice written"
         # (megakernel.cu rms_rsqrt5120: rsqrt.approx.ftz of a mean + eps >= eps)
         if pro in (Pro.NORM_IN, Pro.NORM_RESID):
             assert math.isfinite(eps) and eps >= self.RMS_EPS_MIN, (
@@ -648,20 +669,32 @@ class Schedule:
     ) -> int:
         """A full-attention core of T <= ATT_NT tokens on the qkv projection op src: OP_ATTN (kv heads x splits) then
         OP_ATTN_COMBINE, which publishes o_proj's FP8 operand (act_of_ctr); returns the combine's counter."""
-        assert kv_cache.dtype == torch.bfloat16 and kv_cache.is_contiguous()
-        # tokens per kernel block: 64, or 32 when 64 does not divide vLLM's block size (800 tokens at 3 drafts per step)
+        assert kv_cache.is_contiguous()
+        # tokens per kernel block: 64, or 32 when 64 does not divide vLLM's block size (800 tokens at 3 drafts per step);
+        # an FP8 e4m3 cache: rows of 512 bytes, kernel blocks of 16 (vLLM's 1648-token blocks at 7 drafts per step), 32
+        # or 64 tokens, each one TMA box of its rows
         block_tokens = kv_cache.shape[2]
-        assert block_tokens in (ATT_PAGE // 2, ATT_PAGE), "kernel blocks"
+        is_fp8 = kv_cache.dtype == torch.float8_e4m3fn
+        assert is_fp8 == self.is_kv_fp8, f"a {kv_cache.dtype} KV cache, the megakernel built for the other"
+        assert kv_cache.dtype in (torch.bfloat16, torch.float8_e4m3fn)
+        assert block_tokens in ((ATT_PAGE // 4, ATT_PAGE // 2, ATT_PAGE) if is_fp8 else (ATT_PAGE // 2, ATT_PAGE)), (
+            "kernel blocks"
+        )
         assert tuple(kv_cache.shape[1:]) == (ATT_KV_HEADS, block_tokens, ATT_ROW_BYTES // 2), "kernel blocks"
+        row_bytes = ATT_ROW_BYTES // 2 * kv_cache.element_size()
         assert self.acc[src]["fmt"] == AccFmt.F32, "the attention core reads the qkv sums as fp32"
         assert cos_sin.dtype == torch.bfloat16 and cos_sin.is_contiguous()
         n_splits = max(1, self.nsm // ATT_KV_HEADS)
         assert n_splits <= ATT_MAX_SPLITS
 
         rows = kv_cache.shape[0] * ATT_KV_HEADS * block_tokens
-        tmap = torch.ops.pear_deploy_blackwell_nvfp4.make_tmap(kv_cache, rows, ATT_ROW_BYTES, block_tokens).to(
-            self.device
-        )
+        tmap = BlackwellNvfp4Extension.ops().make_tmap(kv_cache, rows, row_bytes, block_tokens).to(self.device)
+        # the FP8 cache's kernel blocks of 16 tokens: a 4D map too, one box over a head's 4 consecutive kernel blocks
+        tmap4 = None
+        if is_fp8 and block_tokens == ATT_PAGE // 4:
+            tmap4 = BlackwellNvfp4Extension.ops().make_tmap4(kv_cache, kv_cache.shape[0], block_tokens, row_bytes)
+            tmap4 = tmap4.to(self.device)
+            self.keep.append(tmap4)
         # the splits' partials: o, bf16 blocks [query head][quarter][split][tokens][64]; m, l [query head][split][T][2]
         po = torch.zeros(
             ATT_Q_HEADS * self.ATT_HEAD_QUARTERS * n_splits * ATT_PO_BLOCK, dtype=torch.bfloat16, device=self.device
@@ -670,13 +703,15 @@ class Schedule:
         act = torch.zeros(ATT_OUT // STAGE_BYTES * CHUNK_B, dtype=torch.uint8, device=self.device)  # o_proj's B layout
         self.keep += [tmap, po, ml, act, kv_cache, q_norm_w, k_norm_w, cos_sin]
 
-        self.descs.append(
-            ATTN.pack(
-                kv_cache.data_ptr(), tmap.data_ptr(), q_norm_w.data_ptr(), k_norm_w.data_ptr(), cos_sin.data_ptr(),
-                po.data_ptr(), act.data_ptr(), rec, scale * LOG2E, eps, o_s_in, 0.0, src, n_splits, kb_per_mb,
-                sections[1], sections[2], att_group, 0, ml.data_ptr(), block_tokens.bit_length() - 1,
-            )
+        fields = (
+            kv_cache.data_ptr(), tmap.data_ptr(), q_norm_w.data_ptr(), k_norm_w.data_ptr(), cos_sin.data_ptr(),
+            po.data_ptr(), act.data_ptr(), rec, scale * LOG2E, eps, o_s_in, 0.0, src, n_splits, kb_per_mb,
+            sections[1], sections[2], att_group, 0, ml.data_ptr(), block_tokens.bit_length() - 1,
         )  # fmt: skip
+        if is_fp8:
+            self.descs.append(ATTN_FP8.pack(*fields, 0, 0 if tmap4 is None else tmap4.data_ptr()))
+        else:
+            self.descs.append(ATTN.pack(*fields))
 
         desc = len(self.descs) - 1
         n = ATT_KV_HEADS * n_splits
@@ -901,6 +936,8 @@ class Schedule:
         self.mark_znext()
         self.mark_twin()
         self.mark_fastact()
+        if self.is_kv_fp8:  # the FP8 KV cache's build's prologue path
+            self.mark_fastpub()
         self.mark_shared_b()
 
         # the draft's lists join after the marks, which read this kernel's instruction layout
@@ -1010,9 +1047,7 @@ class Schedule:
 
     def tmap(self, w: torch.Tensor, box_rows: int) -> int:
         """An SW128 TMA descriptor (box 128 B x box_rows) over a row-major weight matrix; returns its device address."""
-        tma_desc = torch.ops.pear_deploy_blackwell_nvfp4.make_tmap(
-            w, w.shape[0], w.shape[1] * w.element_size(), box_rows
-        )
+        tma_desc = BlackwellNvfp4Extension.ops().make_tmap(w, w.shape[0], w.shape[1] * w.element_size(), box_rows)
         tma_desc = tma_desc.to(self.device)
         self.keep.append(tma_desc)
         return tma_desc.data_ptr()
@@ -1036,6 +1071,7 @@ class Schedule:
                     and fields[InstrField.DEP] != prev_fields[InstrField.DEP]
                     and fields[InstrField.DEP] != NO_CTR
                     and fields[InstrField.R0] < fields[InstrField.R1]
+                    and fields[InstrField.DESC_INDEX] not in self.no_warm
                 ):
                     fields[InstrField.AUX] |= AUX_WARM
                     sm_list[k] = INSTR.pack(*fields)
@@ -1291,6 +1327,29 @@ class Schedule:
                 assert prev_fields[InstrField.OP] == Op.GDNT and prev_fields[InstrField.AUX] & AUX_ZNEXT
                 prev_fields[InstrField.AUX] |= AUX_FAPRE
                 sm_list[k - 1] = INSTR.pack(*prev_fields)
+
+    def mark_fastpub(self) -> None:
+        """AUX_FASTPUB on the active GEMV instructions of a PRO_ACT consumer without a CTA pair and not AUX_FASTACT; on
+        one with a twin or in_proj_ba's products only with shared B (in_proj_qkv: megakernel.cu fast_pub stages its
+        twin's B and computes b / a from the published words)."""
+        for sm_list in self.sm_instrs:
+            for k, instr in enumerate(sm_list):
+                fields = list(INSTR.unpack(instr))
+                if (
+                    fields[InstrField.OP] != Op.GEMV
+                    or fields[InstrField.R0] >= fields[InstrField.R1]
+                    or fields[InstrField.AUX] & (AUX_TWIN | AUX_SPLIT | AUX_FASTACT | AUX_FASTPUB)
+                ):
+                    continue
+
+                desc = DESC.unpack(self.descs[fields[InstrField.DESC_INDEX]])
+                if desc[OpDescField.PRO] != Pro.ACT or (
+                    (desc[DESC_TWIN] or desc[DESC_XN]) and not desc[OpDescField.NW]
+                ):
+                    continue
+
+                fields[InstrField.AUX] |= AUX_FASTPUB
+                sm_list[k] = INSTR.pack(*fields)
 
     def mark_shared_b(self) -> None:
         """AUX_SHARED_B on the instructions of the ops whose finishers build a consumer's B (link_shared_b),

@@ -23,7 +23,7 @@ static_assert(NSTEP * TOPK * 8 * (1 + WG_WARPS) + NSTEP * WG_WARPS * 4 <= XCHG_F
 // (null by a mask: no select against zero; a null tstamp gives an address the mask clears)
 __device__ __forceinline__ uint64_t* stamps(const DkArgs& a, int role, uint32_t ii, uint32_t i0) {
   const uint64_t p = reinterpret_cast<uint64_t>(a.tstamp) +
-                     sizeof(uint64_t) * (((size_t)blockIdx.x * NROLE + role) * (MAX_INSTR + 1) + (ii - i0)) * NSUB;
+                     sizeof(uint64_t) * (((size_t)fresh(blockIdx.x) * NROLE + role) * (MAX_INSTR + 1) + (ii - i0)) * NSUB;
   const uint64_t stamp_mask =
       lt_mask64(0u, (uint32_t)(a.tstamp != nullptr)) & lt_mask64(ii - i0, (uint32_t)MAX_INSTR + 1);
   return reinterpret_cast<uint64_t*>(p & stamp_mask);
@@ -31,7 +31,7 @@ __device__ __forceinline__ uint64_t* stamps(const DkArgs& a, int role, uint32_t 
 
 // the role's progress word: the instruction it is on (relative, + 1) << 16 | its stage / step within it
 __device__ __forceinline__ void mark(const DkArgs& a, int role, uint32_t ii, uint32_t i0, uint32_t sub = 0) {
-  asm volatile("st.relaxed.gpu.global.u32 [%0], %1;" ::"l"(a.progress + blockIdx.x * NROLE + role),
+  asm volatile("st.relaxed.gpu.global.u32 [%0], %1;" ::"l"(a.progress + fresh(blockIdx.x) * NROLE + role),
                "r"(((ii - i0 + 1) << PROG_SHIFT) | (sub & PROG_SUB_MASK))
                : "memory");
   if (uint64_t* ts = stamps(a, role, ii, i0)) {
@@ -42,7 +42,7 @@ __device__ __forceinline__ void mark(const DkArgs& a, int role, uint32_t ii, uin
 }
 
 __device__ __forceinline__ Trace trace(const DkArgs& a, int role, uint32_t ii, uint32_t i0) {
-  return Trace{a.progress + blockIdx.x * NROLE + role, ii - i0 + 1, stamps(a, role, ii, i0)};
+  return Trace{a.progress + fresh(blockIdx.x) * NROLE + role, ii - i0 + 1, stamps(a, role, ii, i0)};
 }
 
 __device__ __forceinline__ uint32_t ctr_target(const DkArgs& a, uint16_t ctr, uint32_t epoch) {
@@ -236,6 +236,7 @@ __device__ __forceinline__ void finish_operand(const Instr& in, const GemvDesc& 
                                                uint32_t epoch, const Trace& tr) {
   const GemvDesc dr = d_smem;  // (registers: the shared copy's fields would be reloaded after every memory clobber)
   const GemvDesc& d = dr;
+  pt = fresh(pt);
   const int wid = pt >> 5, lane = pt & 31;
   const uint32_t h = lane >> 4, b = lane & (HALF - 1), nch = b_slots(in);
   const ChunkSeq cs(in, nch);
@@ -281,7 +282,7 @@ __device__ __forceinline__ void finish_operand(const Instr& in, const GemvDesc& 
   cp_async_wait<0>();
   named_sync(BAR_WRK, NWT);
   tc_fence_after();
-  const uint32_t tbase = sm.tmem + T_BASE + r * BASE_REGION, last_step = (nch - 1) / CPS;  // (the last step's taps)
+  const uint32_t tbase = fresh(sm.tmem) + T_BASE + r * BASE_REGION, last_step = (nch - 1) / CPS;  // (the last step's taps)
   const Fp4Q f(d.gs);
   ConvIn conv_in = load_conv(coefs + min(h, nch - 1) * CONV_REC, tbase, wid, b);
 #pragma unroll 1

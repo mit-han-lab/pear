@@ -123,6 +123,15 @@ constexpr int SS_BIN_TOP = 0xFFFF - SS_ORDER_POS + 2, SS_ROW_BINS = 2 * SS_BIN_T
 constexpr int SS_MICRO_CAP = 32;
 constexpr int SS_BATCH = 8;  // 16-byte loads a thread has in flight in a sweep over a row
 constexpr int SS_RUN = 4;    // a thread's bins per round of the crossing's scan (their exps at once)
+// SS_WARM (the FP8 KV cache's build, MK_KV_FP8): phase A's dry run (the phases' warm-up while the LM head streams)
+// also runs a row's code past its first crossing, every branch once (the micro bins' masses and the crossing again, the
+// micro crossing, both ties, the row's test; the row sweeps and the ties over one vector, nothing stored), so that the
+// step's tail does not fetch that code cold
+#if MK_KV_FP8
+constexpr bool SS_WARM = true;
+#else
+constexpr bool SS_WARM = false;
+#endif
 static_assert(LP_CHUNK_VECS * SS_VEC < 1 << 16, "a chunk's counts in 16 bits");
 
 // a == b, a >= b (64-bit) as all-ones / zero masks (set.*)
@@ -464,7 +473,8 @@ __device__ __forceinline__ void ss_sweep(const uint4* x, int V, int tid, Fn&& fn
 // The masses of row r's logits below 2^-10 in magnitude (not zero) above the window's bottom lo, by sign, into
 // sh.micro (every thread): from the chunks' lists (lane c: chunk c's), or with a list short of its chunk's from the row
 template <int NTH>
-__device__ void ss_micro_mass(const LpGrp<NTH>& g, SsSmem<NTH>& sh, const SsArgs& a, int r, float M, float lo) {
+__device__ void ss_micro_mass(const LpGrp<NTH>& g, SsSmem<NTH>& sh, const SsArgs& a, int r, float M, float lo,
+                              bool warm = false) {
   const int lane = g.tid & 31;
   if (g.tid < 32) {
     const SsPart& p = a.part[r * a.chunks + min(lane, a.chunks - 1)];
@@ -490,9 +500,10 @@ __device__ void ss_micro_mass(const LpGrp<NTH>& g, SsSmem<NTH>& sh, const SsArgs
     if (lane == 0) sh.micro[0] = pos_mass, sh.micro[1] = neg_mass, sh.list_overflowed = list_overflowed;
   }
   g.sync();
-  if (!sh.list_overflowed) return;
+  if (!sh.list_overflowed && !warm) return;  // (warm: the row's sweep over one vector)
   unsigned long long pos_mass = 0ull, neg_mass = 0ull, t;
-  ss_sweep<NTH>(reinterpret_cast<const uint4*>(a.logits + (int64_t)r * a.stride), a.V, g.tid, [&](const uint4& q, int f) {
+  ss_sweep<NTH>(reinterpret_cast<const uint4*>(a.logits + (int64_t)r * a.stride), warm ? SS_VEC : a.V, g.tid,
+                [&](const uint4& q, int f) {
 #pragma unroll 1
     for (int e = 0; e < SS_VEC; e++) {
       const float x = lp_elem<__nv_bfloat16>(q, e);
@@ -514,13 +525,13 @@ __device__ void ss_micro_mass(const LpGrp<NTH>& g, SsSmem<NTH>& sh, const SsArgs
 // into sh.key and sh.n, the mass above it into sh.above (every thread)
 template <int NTH>
 __device__ void ss_micro_crossing(const LpGrp<NTH>& g, SsSmem<NTH>& sh, const SsArgs& a, int r, float M, float lo,
-                                  bool is_neg) {
+                                  bool is_neg, bool warm = false) {
   const uint4* x = reinterpret_cast<const uint4*>(a.logits + (int64_t)r * a.stride);
   const uint32_t sign = is_neg ? SS_SIGN16 : 0u;
   for (int i = g.tid; i < SS_MICRO_EXP; i += NTH) sh.em[i] = 0ull;
   for (int i = g.tid; i < SS_MANT; i += NTH) sh.mc[i] = 0u;
   g.sync();
-  ss_sweep<NTH>(x, a.V, g.tid, [&](const uint4& q, int f) {
+  ss_sweep<NTH>(x, warm ? SS_VEC : a.V, g.tid, [&](const uint4& q, int f) {
 #pragma unroll 1
     for (int e = 0; e < SS_VEC; e++) {
       const float v = lp_elem<__nv_bfloat16>(q, e);
@@ -542,7 +553,7 @@ __device__ void ss_micro_crossing(const LpGrp<NTH>& g, SsSmem<NTH>& sh, const Ss
   }
   g.sync();
   const uint32_t ex = sh.tie;
-  ss_sweep<NTH>(x, a.V, g.tid, [&](const uint4& q, int f) {
+  ss_sweep<NTH>(x, warm ? SS_VEC : a.V, g.tid, [&](const uint4& q, int f) {
 #pragma unroll 1
     for (int e = 0; e < SS_VEC; e++) {
       const float v = lp_elem<__nv_bfloat16>(q, e);
@@ -583,7 +594,7 @@ __device__ __forceinline__ uint32_t ss_ties(const uint4& q, int f, uint32_t b1, 
 // warp 0 walks the share holding it down, a vector a lane (nothing held across the barriers)
 template <int NTH>
 __device__ uint32_t ss_tie_index(const LpGrp<NTH>& g, SsSmem<NTH>& sh, const SsArgs& a, int r, int e0, int e1, uint32_t k,
-                                 uint32_t rho) {
+                                 uint32_t rho, bool warm = false) {
   constexpr int W = LpGrp<NTH>::WARPS;
   const int tid = g.tid, warp = tid >> 5, lane = tid & 31;
   const uint4* x = reinterpret_cast<const uint4*>(a.logits + (int64_t)r * a.stride);
@@ -608,6 +619,7 @@ __device__ uint32_t ss_tie_index(const LpGrp<NTH>& g, SsSmem<NTH>& sh, const SsA
 #pragma unroll
   for (int w = 0; w < W; w++) suf += (uint32_t)sh.u[w] & lp_lt(warp, w);
   if (suf - c < rho && rho <= suf) sh.holder = (uint32_t)tid, sh.rest = rho - (suf - c);
+  if (warm && tid == 0) sh.holder = 0u, sh.rest = 1u;  // (warm: share 0's walk, once)
   g.sync();
   if (warp == 0) {  // the holder's share from its top: lane i its vector i below the top, 32 at once
     const int h0 = min(f0 + (int)sh.holder * per, f1), h1 = min(h0 + per, f1);
@@ -662,18 +674,25 @@ __device__ unsigned long long ss_nucleus(const LpGrp<NTH>& g, SsSmem<NTH>& sh, c
   if (!is_dry_run)
     for (int j = tid; j < sh.rend; j += NTH) rh[j] = 0u;
   ss_crossing(g, sh, cnt, span, top, M, P);
-  if (is_dry_run) return 0ull;
+  const bool warm = SS_WARM && is_dry_run;  // (SS_WARM: the dry run through every branch below)
+  if (is_dry_run && !warm) return 0ull;
   const int jp = top - 1, jn = top + 1;  // (the micro bins': 1 and -1)
   const bool has_micro_bins = (jp >= 0 && jp < span && cnt[jp] != 0u) || (jn >= 0 && jn < span && cnt[jn] != 0u);
-  if (top - sh.cross <= 1 && has_micro_bins) {  // (the crossing not above them, or none found: their masses)
-    ss_micro_mass(g, sh, a, r, M, lo);
+  if ((top - sh.cross <= 1 && has_micro_bins) || warm) {  // (the crossing not above them, or none found: their masses)
+    ss_micro_mass(g, sh, a, r, M, lo, warm);
     ss_crossing(g, sh, cnt, span, top, M, P);
   }
   const int j = sh.cross, bin = top - j;
-  if (bin == 1 || bin == -1) {
-    ss_micro_crossing(g, sh, a, r, M, lo, bin < 0);
+  const bool is_micro_bin = bin == 1 || bin == -1;
+  if (is_micro_bin || warm) {
+    ss_micro_crossing(g, sh, a, r, M, lo, bin < 0, warm);
     key = sh.key;
-  } else {
+  }
+#if MK_KV_FP8
+  if (!is_micro_bin || warm) {  // (warm: both branches)
+#else
+  else {
+#endif
     key = ss_bin_order(bin);
     if (tid == 0) sh.n = cnt[j];
     g.sync();
@@ -681,12 +700,16 @@ __device__ unsigned long long ss_nucleus(const LpGrp<NTH>& g, SsSmem<NTH>& sh, c
   const unsigned long long one = ss_mass(ss_logit(key), M), above = sh.above;
   const unsigned long long kept_count = min((unsigned long long)sh.n, (sh.goal - above + one - 1) / one);
   idx = 0u;
-  if (kept_count < sh.n) {
-    if (bin == 1 || bin == -1) {
-      idx = ss_tie_index(g, sh, a, r, 0, a.V, key, (uint32_t)kept_count);
-    } else {
+  if (kept_count < sh.n || warm) {
+    if (is_micro_bin || warm) idx = ss_tie_index(g, sh, a, r, 0, warm ? SS_VEC : a.V, key, (uint32_t)kept_count, warm);
+#if MK_KV_FP8
+    if (!is_micro_bin || warm) {  // (warm: both ties)
+#else
+    else {
+#endif
       if (warp == 0) {  // the chunk of the kept-th highest index (lane c: chunk c's count of the bin; a suffix)
-        const int c = min(lane, a.chunks - 1), i = j - sh.delta[c], ic = max(i, 0);
+        const int c = min(lane, a.chunks - 1), i = j - sh.delta[c];
+        const int ic = SS_WARM ? min(max(i, 0), SS_HIST_BINS - 1) : max(i, 0);  // (warm: i of stale parts)
         const uint32_t nc =
             (__ldcg(hist + c * SS_HIST_WORDS + ic / 2) >> (ic % 2 * 16)) & 0xFFFFu & ~lp_lt(i, 0) & lp_lt(lane, a.chunks);
         uint32_t suf = nc;
@@ -697,8 +720,9 @@ __device__ unsigned long long ss_nucleus(const LpGrp<NTH>& g, SsSmem<NTH>& sh, c
       }
       g.sync();
       int row, chunk, v0, v1;
-      ss_item(a, r * a.chunks + (int)sh.tie, row, chunk, v0, v1);
-      idx = ss_tie_index(g, sh, a, r, v0 * SS_VEC, min(v1 * SS_VEC, a.V), key, sh.rank);
+      ss_item(a, r * a.chunks + (warm ? 0 : (int)sh.tie), row, chunk, v0, v1);
+      idx = ss_tie_index(g, sh, a, r, v0 * SS_VEC, warm ? (v0 + 1) * SS_VEC : min(v1 * SS_VEC, a.V), key, sh.rank,
+                         warm);
     }
   }
   return above + kept_count * one;
@@ -733,12 +757,13 @@ __device__ void ss_row(const LpGrp<NTH>& g, SsSmem<NTH>& sh, const SsArgs& a, in
   float tlse = M + log_tri(S);
   if (a.top_p < 1.0f)
     tlse = M + log_tri(__ull2float_rn(ss_nucleus(g, sh, a, r, M, S, key, idx, is_dry_run)) * (1.0f / SS_MASS_ONE));
-  if (tid != 0 || is_dry_run) return;
+  if (tid != 0 || (is_dry_run && !SS_WARM)) return;  // (SS_WARM: the dry run's test too, not stored)
   const uint64_t tk = ((uint64_t)ss_order(__float_as_uint(f.xt) >> 16) << 32) | (uint32_t)f.tok;
   const bool is_kept = f.tok >= 0 && tk >= (((uint64_t)key << 32) | idx);
   const float tlp = f.xt - tlse, dlp = f.xd - sh.dlse;
   const float u = tl_rand32((uint64_t)*a.seed, (uint64_t)f.pos);
-  a.rows[r] = SsRow{(uint32_t)(r < K && is_kept && tlp > log_tri(u) + dlp), key, idx, tlse, sh.dlse, {0u, 0u, 0u}};
+  if (!(SS_WARM && is_dry_run))
+    a.rows[r] = SsRow{(uint32_t)(r < K && is_kept && tlp > log_tri(u) + dlp), key, idx, tlse, sh.dlse, {0u, 0u, 0u}};
 }
 
 // A: item i = (row, chunk) of the target rows: the chunk's max and sum of exp, with top_p < 1 its histogram (the counts

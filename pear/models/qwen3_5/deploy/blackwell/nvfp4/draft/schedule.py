@@ -3,6 +3,8 @@ from enum import IntEnum
 
 import torch
 
+from pear.models.qwen3_5.deploy.blackwell.nvfp4.draft.extension import BlackwellNvfp4DraftExtension
+
 # the packed layouts of csrc/: Instr, GemvDesc, StepArgs, Tables (dk_layout.cuh), the attention's and the selector's
 # descriptors
 INSTR = struct.Struct("<4H2I4HIHH")  # (csrc Instr: ..., flags, xn, slot)
@@ -108,7 +110,7 @@ class DraftSchedule:
 
     def __init__(self, nsm: int, device: torch.device) -> None:
         self.nsm, self.device = nsm, device
-        self.bbuf_bytes = torch.ops.pear_deploy_blackwell_nvfp4_draft.sizes()[SizesField.BBUF_BYTES]
+        self.bbuf_bytes = BlackwellNvfp4DraftExtension.ops().sizes()[SizesField.BBUF_BYTES]
         self.last_b = (0, 0)  # the previous GEMV's B footprint (bytes, B slots) at most
         self.descs: list[bytes] = []
         self.sm_instrs: list[list[bytes]] = [[] for _ in range(nsm)]
@@ -217,7 +219,7 @@ class DraftSchedule:
         assert epi != Epi.QKV or max(slots) <= QKV_SLOTS, "the qkv sums' slots (csrc qkv_part)"
 
         # the descriptor: the weights' TMA map, the split-K accumulator and tile counts, the B and finisher tensors
-        tmap = torch.ops.pear_deploy_blackwell_nvfp4_draft.make_tmap(w, rows, row_bytes, TILE_M).to(self.device)
+        tmap = BlackwellNvfp4DraftExtension.ops().make_tmap(w, rows, row_bytes, TILE_M).to(self.device)
         acc = torch.zeros(mtiles * (ACC_FLOATS // n) * TILE_M * n, dtype=torch.float32, device=self.device)
         tile_ctr = torch.zeros(mtiles, dtype=torch.int32, device=self.device)
         tile_words = [
@@ -347,7 +349,7 @@ class DraftSchedule:
     ) -> None:
         """OP_SELECT on SM 0: the candidates' merge, the selector's scores, the walk and the proposal's outputs."""
         # the SMs' lists from the ring's start, reaching into the B buffer below the selector's scratch
-        ring_bytes = torch.ops.pear_deploy_blackwell_nvfp4_draft.sizes()[SizesField.RING_BYTES]
+        ring_bytes = BlackwellNvfp4DraftExtension.ops().sizes()[SizesField.RING_BYTES]
         assert part.numel() * part.element_size() <= ring_bytes + SEL_SS_OFF, "the lists' smem"
         assert n_part <= 32 * HEADS_PER_LANE, "the merge's list heads per lane"
 
@@ -360,7 +362,7 @@ class DraftSchedule:
 
     def finalize(self) -> dict:
         """The schedule's device tensors."""
-        sizes = torch.ops.pear_deploy_blackwell_nvfp4_draft.sizes()
+        sizes = BlackwellNvfp4DraftExtension.ops().sizes()
         assert sizes[:2] == [INSTR.size, DESC_SIZE] and sizes[SizesField.DK_ARGS_BYTES] == 8 * ARGS_WORDS, sizes
         assert (
             sizes[SizesField.STEP_ARGS_BYTES] == 8 * STEP_WORDS and sizes[SizesField.TABLES_BYTES] == 8 * TABLE_WORDS
