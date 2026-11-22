@@ -1,0 +1,268 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [mp] fix: the connector keeps vLLM's lookahead block hashes
+ on, so an MTP prefix hit keeps its last block
+
+vLLM 0.34 resolves its lookahead block hashes (VllmConfig._resolve_num_hash_lookahead_tokens) through the KV connector
+class: with EAGLE / MTP it folds the token after each block into the block's hash, which proves the drafter's KV at the
+block's last position, only when the connector's supports_lookahead_block_hashes() is True, and the base class returns
+False. LMCacheMPConnector did not override it, so with LMCache the engine ran without lookahead hashes and kept the
+trailing-block drop: every local prefix-cache hit lost its last matched block, and the align-mode Mamba checkpoints
+followed that replay boundary (HybridKVCacheCoordinator sets drop_eagle_checkpoint_block), so a hit whose attention
+blocks reached past it fell back to an earlier Mamba state. A hybrid model's alignment makes the block large, and so
+the loss per hit; most of LMCache's own hits were the block vLLM had dropped.
+
+The connector now declares the support. Its stores and retrieves follow the request's tokens, never vLLM's block
+hashes, and LMCache's chunk keys stay token-only, so spec and non-spec engines keep sharing KV. An LMCache hit that ends
+at a chunk boundary may hand the drafter KV computed with another next token, which only the draft acceptance can see:
+the target verifies every draft token. This follows LMCache PR #6619 (closed upstream once vLLM main made the support
+every connector's default, vLLM PR #65448) and vLLM main's in-tree LMCache connector.
+
+Lazy offload snapshots each block's vLLM hash when a store is offered and drops the store if the hash is missing, and
+vLLM hashes a block only once its lookahead tokens exist. With lazy offload, GetStoreMetadata now holds those tokens
+back (as #6619 and the open #6699 do), so a chunk-aligned prompt's last chunk is stored once the next token follows.
+
+tests/v1/test_mp_connector_lookahead_opt_in.py resolves vLLM's hash lookahead through the connector class (1 for an
+MTP drafter, 0 before this change); tests/v1/test_mp_tracker_store_bound.py covers the held-back chunk; the
+hand-built connectors of two tests get the new attribute.
+---
+ .../integration/vllm/lmcache_mp_connector.py  | 36 +++++++++++
+ .../integration/vllm/lmcache_mp_metadata.py   |  7 ++-
+ tests/v1/lazy_offload/test_mp_connector.py    |  1 +
+ .../v1/test_mp_connector_lookahead_opt_in.py  | 60 +++++++++++++++++++
+ tests/v1/test_mp_store_current_block_table.py |  1 +
+ tests/v1/test_mp_tracker_store_bound.py       | 32 ++++++++++
+ 6 files changed, 136 insertions(+), 1 deletion(-)
+ create mode 100644 tests/v1/test_mp_connector_lookahead_opt_in.py
+
+diff --git a/lmcache/integration/vllm/lmcache_mp_connector.py b/lmcache/integration/vllm/lmcache_mp_connector.py
+index 776f6f6bb3d84aec705a95acc686da31c0f5750a..6614bc3cbe59a680ae4b4da56b0633ed8904bc92 100644
+--- a/lmcache/integration/vllm/lmcache_mp_connector.py
++++ b/lmcache/integration/vllm/lmcache_mp_connector.py
+@@ -830,6 +830,16 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+         self.lazy_offload = vllm_config.kv_transfer_config.get_from_extra_config(
+             "lmcache.mp.lazy_offload", False
+         )
++        # Lazy offload snapshots each block's vLLM hash when a store is
++        # offered and drops the store if the hash is missing or changes later.
++        # With lookahead block hashes (supports_lookahead_block_hashes) vLLM
++        # hashes a block only once the tokens after it exist, so a store holds
++        # those back. vLLM releases before lookahead hashing lack the field.
++        self._store_lookahead_tokens: int = (
++            getattr(vllm_config, "num_hash_lookahead_tokens", 0)
++            if self.lazy_offload
++            else 0
++        )
+         if self.lazy_offload and self._save_unfull_chunk:
+             raise ValueError(
+                 "lmcache.mp.save_unfull_chunk does not support lmcache.mp.lazy_offload"
+@@ -1940,6 +1950,30 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+             return self._lazy_offload_manager.has_inflight_store_work()
+         return bool(self._pinned_store_operations)
+ 
++    @classmethod
++    def supports_lookahead_block_hashes(
++        cls, kv_transfer_config: "KVTransferConfig"
++    ) -> bool:
++        """Keep vLLM's lookahead block hashes on for EAGLE / MTP.
++
++        An EAGLE / MTP drafter computes the draft KV at a block's last position
++        from the token after the block. vLLM folds that token into its block
++        hashes only for a connector that supports it; for any other (vLLM
++        0.34's default) it drops the last matched block of every local
++        prefix-cache hit and moves the Mamba checkpoints of align mode back
++        with it. Stores and retrieves here follow the request's tokens, never
++        vLLM's block hashes, and LMCache's chunk keys stay token-only, so spec
++        and non-spec engines keep sharing KV.
++
++        Args:
++            kv_transfer_config: The connector's transfer config (unused; the
++                support does not depend on it).
++
++        Returns:
++            Always True.
++        """
++        return True
++
+     @classmethod
+     def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> str | None:
+         """Defer to vLLM; a connector preference is unsafe for now.
+@@ -2074,6 +2108,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+                 self._group_tokens_per_block,
+                 save_decode_cache=self._save_decode_cache,
+                 block_state=block_state,
++                lookahead_tokens=self._store_lookahead_tokens,
+             )
+             if r_meta is not None:
+                 # In lazy_offload mode, add to pending queue instead of immediate store
+@@ -2126,6 +2161,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+                 self._group_tokens_per_block,
+                 save_decode_cache=self._save_decode_cache,
+                 block_state=block_state,
++                lookahead_tokens=self._store_lookahead_tokens,
+             )
+ 
+             if r_meta is not None:
+diff --git a/lmcache/integration/vllm/lmcache_mp_metadata.py b/lmcache/integration/vllm/lmcache_mp_metadata.py
+index cff01230d59a6661e1fb4972e4839191d4960487..3f05366156773c851d5d90309b1ed038e99ddefe 100644
+--- a/lmcache/integration/vllm/lmcache_mp_metadata.py
++++ b/lmcache/integration/vllm/lmcache_mp_metadata.py
+@@ -348,6 +348,7 @@ class LMCacheMPRequestMetadata:
+         *,
+         save_decode_cache: bool = False,
+         block_state: "KVConnectorBlockState | None" = None,
++        lookahead_tokens: int = 0,
+     ) -> "LMCacheMPRequestMetadata | None":
+         """
+         Generate the store metadata for the current request tracker.
+@@ -366,6 +367,10 @@ class LMCacheMPRequestMetadata:
+             block_state: vLLM's connector block state of this step; the store
+                 reads the request's blocks from its current block table
+                 (``LMCacheMPRequestTracker.current_block_ids``).
++            lookahead_tokens: Tokens after each block that vLLM folds into its
++                block hashes (EAGLE / MTP) and that a store holds back: lazy
++                offload needs vLLM's hash of every block it stores, which vLLM
++                computes only once those tokens exist.
+ 
+         Returns:
+             Metadata for newly storable chunks, or None when no complete
+@@ -416,7 +421,7 @@ class LMCacheMPRequestMetadata:
+             default=0,
+         )
+         min_available_tokens = min(
+-            len(tracker.all_token_ids),
++            len(tracker.all_token_ids) - lookahead_tokens,
+             allocated_tokens,
+             computed_tokens,
+         )
+diff --git a/tests/v1/lazy_offload/test_mp_connector.py b/tests/v1/lazy_offload/test_mp_connector.py
+index 49f94c98a83be7ee622c603b9ac966988b30bc2e..a65f7c08464e155781f8058a676696cc4dc42c2d 100644
+--- a/tests/v1/lazy_offload/test_mp_connector.py
++++ b/tests/v1/lazy_offload/test_mp_connector.py
+@@ -232,6 +232,7 @@ def _make_connector() -> _Harness:
+     # Default config: store only complete prompt chunks, no decode tokens.
+     connector._save_decode_cache = False
+     connector._save_unfull_chunk = False
++    connector._store_lookahead_tokens = 0
+     connector._mamba_relocation_window = 0
+     return _Harness(connector, manager, adapter)
+ 
+diff --git a/tests/v1/test_mp_connector_lookahead_opt_in.py b/tests/v1/test_mp_connector_lookahead_opt_in.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c5ef59e33ddabd5fbe2564e2a3cc206b4d222efc
+--- /dev/null
++++ b/tests/v1/test_mp_connector_lookahead_opt_in.py
+@@ -0,0 +1,60 @@
++# SPDX-License-Identifier: Apache-2.0
++"""The MP connector keeps vLLM's lookahead block hashes on under EAGLE / MTP."""
++
++# Standard
++from types import SimpleNamespace
++
++# Third Party
++import pytest
++
++MODULE = "lmcache.integration.vllm.lmcache_mp_connector"
++# An MTP drafter computes a block's last draft KV from the one token after it.
++DRAFTER_LOOKAHEAD_TOKENS = 1
++
++
++@pytest.fixture
++def connector_cls():
++    """Import lazily: the connector module initializes process-wide MP
++    transfer state at import time, which contaminates later cache-server
++    tests when imported at collection. Skips where vLLM is not installed
++    (e.g. the LMCache-only unit environment)."""
++    module = pytest.importorskip(MODULE, reason="requires vLLM")
++    return module.LMCacheMPConnector
++
++
++def make_transfer_config():
++    # Third Party
++    from vllm.config import KVTransferConfig
++
++    return KVTransferConfig(
++        kv_connector="LMCacheMPConnector",
++        kv_connector_module_path=MODULE,
++        kv_role="kv_both",
++    )
++
++
++def test_connector_supports_lookahead_block_hashes(connector_cls):
++    assert connector_cls.supports_lookahead_block_hashes(make_transfer_config())
++
++
++def test_vllm_keeps_lookahead_block_hashes_with_the_connector(connector_cls):
++    """vLLM resolves its hash lookahead through the configured connector
++    class: 0 for a connector without the opt-in, which makes every local
++    prefix-cache hit drop its last block under EAGLE / MTP."""
++    # Third Party
++    from vllm.config import VllmConfig
++
++    resolve = getattr(VllmConfig, "_resolve_num_hash_lookahead_tokens", None)
++    if resolve is None:
++        pytest.skip("this vLLM has no lookahead block hashes")
++    config = SimpleNamespace(
++        speculative_config=SimpleNamespace(
++            use_eagle_block_drop=lambda: True,
++            disable_lookahead_block_hashes=False,
++        ),
++        kv_transfer_config=make_transfer_config(),
++        cache_config=SimpleNamespace(enable_prefix_caching=True),
++        num_prefill_lookahead_tokens=DRAFTER_LOOKAHEAD_TOKENS,
++    )
++
++    assert resolve(config) == DRAFTER_LOOKAHEAD_TOKENS
+diff --git a/tests/v1/test_mp_store_current_block_table.py b/tests/v1/test_mp_store_current_block_table.py
+index 3bb47bd09aa87f7841f98442a43824ce24231872..feae1c90ccafbe7568fe613101ee17cba29cad2c 100644
+--- a/tests/v1/test_mp_store_current_block_table.py
++++ b/tests/v1/test_mp_store_current_block_table.py
+@@ -192,6 +192,7 @@ def _connector(pool: BlockPool, tracker: LMCacheMPRequestTracker) -> LMCacheMPCo
+     connector._save_decode_cache = True
+     connector._save_unfull_chunk = False
+     connector.lazy_offload = False
++    connector._store_lookahead_tokens = 0
+     connector._gpu_block_pool = pool
+     connector._next_store_op_id = 0
+     connector._pinned_store_operations = {}
+diff --git a/tests/v1/test_mp_tracker_store_bound.py b/tests/v1/test_mp_tracker_store_bound.py
+index 77e1dccc9b249d663c375f9e353f212c6a2cf48b..39e3c3fe46d604d309302b588477083c22943e5c 100644
+--- a/tests/v1/test_mp_tracker_store_bound.py
++++ b/tests/v1/test_mp_tracker_store_bound.py
+@@ -93,3 +93,35 @@ def test_without_engine_position_falls_back_to_hits():
+     _lookup(tracker, vllm_hit=112, lmcache_hit=64)
+     tracker.increase_num_scheduled_tokens(188)
+     assert _store_range(tracker) == (64, 192)
++
++
++@pytest.mark.parametrize(
++    ("lookahead_tokens", "stored_range"), [(0, (0, 256)), (1, (0, 192))]
++)
++def test_lookahead_holds_back_a_chunk_until_its_next_token_exists(
++    lookahead_tokens, stored_range
++):
++    """Lazy offload needs vLLM's hash of every stored block, which a lookahead
++    hash has only once the tokens after the block exist: a chunk-aligned
++    prompt's last chunk waits for the first generated token."""
++    request = SimpleNamespace(
++        request_id="req-lookahead",
++        cache_salt="",
++        lora_request=None,
++        prompt_token_ids=list(range(256)),
++        all_token_ids=ConstantList(list(range(256))),
++        num_prompt_tokens=256,
++        mm_features=[],
++        sampling_params=SimpleNamespace(extra_args=None, max_tokens=16),
++    )
++    tracker = LMCacheMPRequestTracker(request)
++    tracker.append_block_ids((list(range(1, 5)), list(range(101, 117))))
++    tracker.increase_num_scheduled_tokens(256)
++    tracker.update_num_engine_computed_tokens(0, 256)
++
++    meta = LMCacheMPRequestMetadata.GetStoreMetadata(
++        tracker, CHUNK, GROUP_TOKENS_PER_BLOCK, lookahead_tokens=lookahead_tokens
++    )
++
++    assert meta is not None
++    assert (meta.op.start, meta.op.end) == stored_range
