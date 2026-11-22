@@ -5,10 +5,12 @@ from typing import Any
 
 import torch
 
+from pear.models.qwen3_5.deploy.rtx_blackwell.nvfp4.rtx5090.extension import Rtx5090Nvfp4Fp8KvExtension
+
 # the packed layouts of csrc/megakernel.cuh: Instr and the 256-byte OpDesc
 INSTR = struct.Struct("<4H6I")
 DESC = struct.Struct("<16Q4f18I3Q4I")
-ATTN = struct.Struct("<10Q4f7I132x")  # AttnDesc (csrc/attention.cuh)
+ATTN = struct.Struct("<10Q4f8I128x")  # AttnDesc (csrc/attention.cuh)
 SSD = struct.Struct("<12Q4I144x")  # SsDesc (csrc/spec_sample.cuh)
 DRAFT = struct.Struct("<18Q4f8IQ56x")  # DraftDesc (csrc/draft.cuh)
 BOOK = struct.Struct("<15Q4I120x")  # BookDesc (csrc/step.cuh)
@@ -120,21 +122,28 @@ class Schedule:
     ATT_ROWS = 48  # query rows per KV head: 6 query heads x NT tokens (csrc ATT_ROWS)
     ATT_QKV = 14336  # the qkv projection's outputs: queries and their gates, keys, values (csrc ATT_QKV)
     ATT_OUT = 6144  # the attention's output, o_proj's K (csrc ATT_OUT)
-    ATT_KV_ROW_BYTES = 512  # a token's k | v of a KV head in the FP8 cache
+    ATT_KV_ROW_ELEMS = 512  # a token's k | v of a KV head in the cache: e4m3 bytes or bf16 values
     ATT_TILE = 64  # keys per tile: the cache tensor map's box rows (csrc ATT_TILE)
     ROTARY_DIM = 64  # cos_sin's columns: cos then sin of the rotary dims
     ATT_COMBINE_ITEMS = 96  # the combine's items: (query head, quarter of its dims)
     MROPE_SECTIONS = (11, 11, 10)  # M-RoPE's (t, h, w) sections: AttnDesc sec1 and sec2 take h and w
-    KB_TOKENS = 16  # tokens per kernel block of the cache (AttnDesc kb_tokens)
+    KB_TOKENS = 16  # tokens per kernel block of the FP8 cache (AttnDesc kb_tokens)
+    PACE_LONG_STAGES = 128  # the pacer's relative rule: the ops whose every instruction holds this many stages
+    # the tensor maps' tables: the maps, each map's weights' base MAX_TMAPS x TMAP_BYTES past it and the pacer's own map
+    # twice that far (csrc megakernel.cuh PACE_WPTR_OFF)
+    MAP_TABLES = 3
+    SILU_SLOTS = 2  # a split pair's later parts' sums, slot-major: its second part's, a third part's (OpDesc::spart)
+    INSTR_OP, INSTR_DESC, INSTR_R0, INSTR_R1, INSTR_PR1 = 0, 1, 4, 5, 9  # Instr's fields in INSTR's order
 
     def __init__(self, nsm: int, device: torch.device) -> None:
         self.nsm, self.device = nsm, device
+        self.extension = Rtx5090Nvfp4Fp8KvExtension.loaded()  # the megakernel's build the programs are for
         self.logits_ops = 0  # the EPI_LOGITS ops with split tiles so far: their tag bases
         self.descs: list[bytes] = []
         self.sm_instrs: list[list[bytes]] = [[] for _ in range(nsm)]
         self.ctr_count: list[int] = []
         self.keep: list = []
-        self.tmaps = torch.zeros(self.MAX_TMAPS * TMAP_BYTES, dtype=torch.uint8, device=device)
+        self.tmaps = torch.zeros(self.MAP_TABLES * self.MAX_TMAPS * TMAP_BYTES, dtype=torch.uint8, device=device)
         self.n_tmaps = 0
         self.op_info: list[dict] = []  # per GEMV desc: its published sums of squares (ssq_of)
         # scratch shared by ops that never run at once (the step is a chain): the counted sums (each word back to zero
@@ -397,7 +406,7 @@ class Schedule:
         if dflags & DF.CONV:
             assert pro == Pro.NORM_Q and coef is not None and base is not None
         if is_paired:  # (the split pairs' partials: one pool, the paired ops run one after another; the flags per op)
-            spart = self.pooled("spart", mtiles * TILE * 2 * NT, torch.float32)
+            spart = self.pooled("spart", self.SILU_SLOTS * mtiles * TILE * 2 * NT, torch.float32)
             sflag = torch.zeros(mtiles, dtype=torch.int32, device=self.device)
         tag_base = 0  # OpDesc::pool_len of EPI_LOGITS: its tags' base
         if is_logits and int(parts.max()) > 1:  # (a split tile's later part's tagged sums, in its instruction's slot)
@@ -498,25 +507,30 @@ class Schedule:
         s_in: float,
         n_splits: int,
         dep: int,
+        kb_tokens: int = KB_TOKENS,
+        book_ctr: int = NO_CTR,
     ) -> int:
-        """A full-attention layer's core: OP_ATTN_PREP (an item per KV head and token), OP_ATTN (n_splits items per KV
-        head), OP_ATTN_COMBINE (publishing o_proj's FP8 operand into act), returning the combine's counter."""
-        rows = kv.numel() // (self.ATT_HKV * self.ATT_KV_ROW_BYTES)
-        assert (
-            kv.dtype == torch.uint8 and kv.is_contiguous() and rows * self.ATT_HKV * self.ATT_KV_ROW_BYTES == kv.numel()
-        )
+        """A full-attention layer's core over its cache's bytes kv ([rows][4 heads][k | v], e4m3 or bf16 as the build
+        reads them; kb_tokens: the cache's kernel block): OP_ATTN_PREP (an item per KV head and token), OP_ATTN (n_splits
+        items per KV head), OP_ATTN_COMBINE (publishing o_proj's FP8 operand into act), returning the combine's counter.
+        book_ctr: OP_BOOK's counter, which the pacer waits for before it walks an item's KV."""
+        row_bytes = self.ATT_KV_ROW_ELEMS * self.extension.kv_element_bytes()
+        rows = kv.numel() // (self.ATT_HKV * row_bytes)
+        assert kv.dtype == torch.uint8 and kv.is_contiguous() and rows * self.ATT_HKV * row_bytes == kv.numel()
+        assert block_tokens % kb_tokens == 0, (block_tokens, kb_tokens)
         assert qkv.dtype == torch.bfloat16 and qkv.shape == (NT, self.ATT_QKV)
         assert cos_sin.dtype == torch.bfloat16 and cos_sin.shape[1] == self.ROTARY_DIM
         # act: o_proj's FP8 operand [K chunks of 128 values][NT][128 bytes]
         assert act.dtype == torch.uint8 and act.numel() == self.ATT_OUT // 128 * NT * 128
 
-        tensor_map = torch.ops.pear_deploy_rtx_blackwell_nvfp4.make_tmap3d(
-            kv.data_ptr(), rows, self.ATT_HKV, self.ATT_KV_ROW_BYTES, self.ATT_TILE
+        tensor_map = Rtx5090Nvfp4Fp8KvExtension.ops().make_tmap3d(
+            kv.data_ptr(), rows, self.ATT_HKV, row_bytes, self.ATT_TILE
         )
         i = self.n_tmaps
         self.n_tmaps += 1
         self.tmaps[i * TMAP_BYTES : (i + 1) * TMAP_BYTES].copy_(tensor_map)
-        q = self.pooled("attn_q", self.ATT_HKV * self.ATT_ROWS * self.ATT_D, torch.float16).view(
+        # (the FP8 cache's builds: Q in f16, the bf16 values, for the f16 mma with the e4m3 keys)
+        q = self.pooled("attn_q", self.ATT_HKV * self.ATT_ROWS * self.ATT_D, self.extension.QUERY_DTYPE).view(
             self.ATT_HKV, self.ATT_ROWS, self.ATT_D
         )
         po = self.pooled("attn_po", self.ATT_HKV * n_splits * self.ATT_ROWS * self.ATT_D, torch.float32).view(
@@ -534,7 +548,7 @@ class Schedule:
             kv.data_ptr(), self.tmaps.data_ptr() + i * TMAP_BYTES, qkv.data_ptr(), q_norm_w.data_ptr(),
             k_norm_w.data_ptr(), cos_sin.data_ptr(), q.data_ptr(), po.data_ptr(), ml.data_ptr(), act.data_ptr(),
             scale * self.LOG2E, eps, s_in, 0.0, n_splits, block_tokens, group, prep_ctr, self.MROPE_SECTIONS[1],
-            self.MROPE_SECTIONS[2], self.KB_TOKENS,
+            self.MROPE_SECTIONS[2], kb_tokens, book_ctr,
         )  # fmt: skip
         self.descs.append(desc)
         desc_index = len(self.descs) - 1
@@ -655,6 +669,8 @@ class Schedule:
     # ---- finalize
     def finalize(self) -> dict:
         """The device tensors: instructions (per-SM lists concatenated), offsets, descriptors, counters."""
+        self.mark_long_ops()
+
         instrs, offsets = [], [0]
         for instructions in self.sm_instrs:
             instrs += instructions
@@ -672,6 +688,26 @@ class Schedule:
         self.keep += list(tensors.values())
 
         return tensors
+
+    def mark_long_ops(self) -> None:
+        """The pacer's relative rule (csrc megakernel.cuh PACE_RELL_D): each GEMV op whose instructions all hold at least
+        PACE_LONG_STAGES stages (the LM heads) gets a progress counter of its stages, which the pacers add to a stage
+        issued; its instructions carry 1 + the counter in Instr::pr1."""
+        ops: dict[int, list] = {}
+        for sm, instructions in enumerate(self.sm_instrs):
+            for index, instruction in enumerate(instructions):
+                fields = INSTR.unpack(instruction)
+                if fields[self.INSTR_OP] == Op.GEMV:
+                    ops.setdefault(fields[self.INSTR_DESC], []).append((sm, index, fields))
+        for instructions in ops.values():
+            stages = [fields[self.INSTR_R1] - fields[self.INSTR_R0] for _, _, fields in instructions]
+            if min(stages) < self.PACE_LONG_STAGES:
+                continue
+
+            counter = self.new_counter(sum(stages))
+            for sm, index, fields in instructions:
+                assert fields[self.INSTR_PR1] == 0, "Instr::pr1 in use"
+                self.sm_instrs[sm][index] = INSTR.pack(*fields[: self.INSTR_PR1], counter + 1)
 
     # ---- a GEMV's stages over the SMs
     @staticmethod
@@ -720,23 +756,60 @@ class Schedule:
                 n = max(1, end_sm - first_sm)
                 sm_ids = [(first_sm + i) % self.nsm for i in range(n)]
             start = band * per_band
-            # (a paired op's pair must fall in at most two instructions: equal counts, its split's invariant)
-            for sm, count in zip(
-                sm_ids, self.weighted(per_band, sm_ids, is_equal_split=is_paired, extra_stages=extra_stages)
-            ):
+            # (a paired op's pair must fall in at most two instructions: paired_counts)
+            if is_paired:
+                counts = self.paired_counts(per_band, spu, len(sm_ids))
+            else:
+                counts = self.weighted(per_band, sm_ids, extra_stages=extra_stages)
+            for sm, count in zip(sm_ids, counts):
                 if count:
                     ranges.append((sm, start, start + count))
                 start += count
 
         return ranges
 
-    def weighted(self, total: int, sms: list, is_equal_split: bool = False, extra_stages: dict | None = None) -> list:
-        """total stages over the SMs: the counts that minimize the largest count plus extra stages (is_equal_split:
-        total * (i + 1) // n - total * i // n, ignoring extra_stages)."""
-        n = len(sms)
-        if is_equal_split:
-            return [total * (i + 1) // n - total * i // n for i in range(n)]
+    @staticmethod
+    def paired_counts(total: int, spu: int, n: int) -> list:
+        """Stage counts of n SMs taking consecutive ranges of total stages (units of spu stages), every unit in at most
+        two parts (EPI_SILU combines a tile's two partials), the largest count as small as that allows; zeros for the
+        SMs left over."""
 
+        def greedy(limit: int) -> list | None:
+            # each SM takes up to limit stages; one that starts inside a unit finishes it; it ends on a unit boundary
+            # or where the rest of that unit fits the next SM's limit
+            counts, pos = [], 0
+            while pos < total:
+                if len(counts) == n:
+                    return None
+
+                first_end = min(total, (pos // spu + 1) * spu if pos % spu else pos + 1)
+                last_end = min(total, pos + limit)
+                end = next(
+                    (
+                        e
+                        for e in range(last_end, first_end - 1, -1)
+                        if e == total or e % spu == 0 or spu - e % spu <= limit
+                    ),
+                    None,
+                )
+                if end is None:
+                    return None
+
+                counts.append(end - pos)
+                pos = end
+
+            return counts + [0] * (n - len(counts))
+
+        for limit in range(max(1, -(-total // n)), total + 1):
+            counts = greedy(limit)
+            if counts is not None:
+                return counts
+
+        raise AssertionError("paired_counts: no split")
+
+    def weighted(self, total: int, sms: list, extra_stages: dict | None = None) -> list:
+        """total stages over the SMs: the counts that minimize the largest count plus extra stages."""
+        n = len(sms)
         extras = [(extra_stages or {}).get(sm, 0) for sm in sms]
         level = (total + sum(extras)) / n  # (the water level: count_i + extra_i = level)
         counts = [max(0, int(level - extras[i])) for i in range(n)]
@@ -779,11 +852,20 @@ class Schedule:
             and row_bytes % self.TMA_ALIGN == 0
         )
 
-        tensor_map = torch.ops.pear_deploy_rtx_blackwell_nvfp4.make_tmap(w.data_ptr(), rows, row_bytes, TILE)
+        tensor_map = Rtx5090Nvfp4Fp8KvExtension.ops().make_tmap(w.data_ptr(), rows, row_bytes, TILE)
         i = self.n_tmaps
         self.n_tmaps += 1
         assert i < self.MAX_TMAPS
         self.tmaps[i * TMAP_BYTES : (i + 1) * TMAP_BYTES].copy_(tensor_map)
+        # the pacer's: the weights' base, its own map (its box rows, L2 promotion)
+        base = (self.MAX_TMAPS + i) * TMAP_BYTES
+        self.tmaps[base : base + 8].copy_(torch.tensor([w.data_ptr()], dtype=torch.int64).view(torch.uint8))
+        _, split, is_promoted = Rtx5090Nvfp4Fp8KvExtension.ops().pace_config()[:3]
+        pacer_map = Rtx5090Nvfp4Fp8KvExtension.ops().make_tmap_p(
+            w.data_ptr(), rows, row_bytes, TILE // split, bool(is_promoted)
+        )
+        base = (2 * self.MAX_TMAPS + i) * TMAP_BYTES
+        self.tmaps[base : base + TMAP_BYTES].copy_(pacer_map)
         self.keep.append(w)
 
         return self.tmaps.data_ptr() + i * TMAP_BYTES

@@ -38,8 +38,46 @@ constexpr int NACC = 1;
 constexpr int STG_BYTES = 32768;                  // the prologue's staging buffer (the GDN core's state rows, ...)
 constexpr int RED_FLOATS = (NPRO / 32) * NT * 2;  // prologue reductions
 constexpr int BAR_BYTES = ((NSTAGE > 2 ? 160 : 144) + 8 * (BG - 1) + 15) / 16 * 16;  // the mbarriers
+// The pacer: warp 7, idle otherwise, paces this SM's GEMV weight stages (and the attention items' KV tiles) into L2
+// ahead of the producer: per stage part the box's L2 prefetch (with the NVFP4 scale atoms') and a 128-byte probe copy
+// of the box's last row, at most PACE_LEAD stages past the producer's loads; the producer loads its n-th stage once n
+// probes landed, so that the consumers' loads are L2 hits and the DRAM queue is the pacers' probes. Its shared memory:
+// the probes' 128 bytes, their mbarriers and two words (landed, loaded). Its constants below were tuned on the RTX
+// PRO 6000; on the RTX 5090 a sweep of each found them at their best too, but not its steady stream's probes (below)
+constexpr uint32_t PACE_LEAD = 20;  // stages the pacer runs ahead of the producer at most
+// one probe in flight, but PACE_TAIL (its slots) while it issues stages of an op whose done counter shows PACE_TAILF
+// eighths of its instructions finished GPU-wide: the op's late SMs take back DRAM share in its tail (the count is read
+// with a relaxed load after each probe and used at the next)
+constexpr uint32_t PACE_TAIL = 3, PACE_TAILF = 2;
+// the relative rule inside long instructions (the GEMV ops whose instructions hold >= RELL_MIN stages, the LM heads;
+// schedule.py marks them: Instr::pr1 = 1 + a counter of the op, count G = the op's stages): PACE_TAIL probes in flight
+// while (j + D) x G < g x (r1 - r0), j its stages issued, g the op's stages issued GPU-wide this launch (one relaxed
+// red.add a stage, read relaxed after each probe, used at the next)
+constexpr uint32_t PACE_RELL_D = 2;
+// a stage's probe issued with a second one in flight while the producer's loaded stages are within PACE_GATE2 of the
+// landed ones (it waits at the gate: the stream is pacer-bound), one otherwise; not in the relative rule's long
+// instructions; three for the FP8 weights' rows (measured on the RTX 5090: 0.03 to 0.04 ms a step under two)
+constexpr uint32_t PACE_GATE2 = 1;
+constexpr uint32_t PACE_PS = PACE_TAIL;  // the pacer's probes in flight at most (its slots: 128 bytes and an mbarrier)
+// a stage paced in PACE_SPLIT parts of TILE / PACE_SPLIT rows, a probe each (the pacer's own tensor map, schedule.py:
+// box rows TILE / PACE_SPLIT, with the 256-byte L2 promotion)
+constexpr uint32_t PACE_SPLIT = 2, PACE_ROWS = TILE / PACE_SPLIT;
+constexpr bool PACE_PROMO = true;
+static_assert(PACE_LEAD >= 1 && PACE_PS >= 2 && PACE_PS <= 4 && PACE_TAILF >= 1 && PACE_TAILF <= 8,
+              "the pacer's probes");
+static_assert(PACE_SPLIT == 2, "the attention items' KV: a probe per box of a stage");
+constexpr int PACE_BYTES = ((128 + 8) * PACE_PS + 8 + 15) / 16 * 16;
+// a weight's base past its tensor map (schedule.py MAX_TMAPS x TMAP_BYTES), the pacer's map twice that far
+constexpr uint64_t PACE_WPTR_OFF = 1024 * 128;
+// the attention items' KV in the pacer's stream too, gated as the GEMV stages (an item's ring stage: two 64-row boxes,
+// a probe each), the lead counting the producer's KV stages; the pacer waits once for OP_BOOK's counter
+// (AttnDesc::book_ctr: the step's positions) before its first item. An item's KV gets PACE_TAIL probes in flight once
+// PACE_KV_TAILF eighths of the attention op's items are done GPU-wide
+constexpr uint32_t PACE_KV_TAILF = 4;
+static_assert(PACE_KV_TAILF >= 1 && PACE_KV_TAILF <= 8, "the items' tail");
 constexpr int SMEM_BYTES =
-    NSTAGE * STAGE_BYTES + NB * B_SLOT_BYTES + NACC * ACC_SLOT_BYTES + STG_BYTES + RED_FLOATS * 4 + BAR_BYTES;
+    NSTAGE * STAGE_BYTES + NB * B_SLOT_BYTES + NACC * ACC_SLOT_BYTES + STG_BYTES + RED_FLOATS * 4 + BAR_BYTES +
+    PACE_BYTES;
 constexpr int SMEM_ALIGN = 1024;  // the dynamic shared memory's base, aligned up to this (the SW128 tiles)
 constexpr int SMEM_OPTIN_BYTES = 101376;  // a CTA's shared memory at most (the 99 KB opt-in)
 constexpr int STATIC_SMEM_EXTRA = 64;     // the static shared words besides rec_sh, at most
@@ -80,6 +118,8 @@ enum Op : uint16_t {
   OP_QPUB = 24
 };
 constexpr uint32_t AUX_QPUB_DONE = 1u << 28;  // (Instr::aux of a GEMV: its NORM_Q slice published by an OP_QPUB)
+// (Instr::aux of an EPI_SILU GEMV: its first segment is its pair's third part)
+constexpr uint32_t AUX_SILU_P2 = 1u << 29;
 constexpr uint32_t SS_AUX_A0 = 1u, SS_AUX_NO_A0 = 2u;  // (Instr::aux of OP_SS_A: A0 alone; A after such an instruction)
 enum Kind : uint32_t { KIND_NVFP4 = 0, KIND_FP8 = 1, KIND_BF16 = 2 };
 // PRO_NORM_X: the RMSNorm of x from its producer's published sums of squares (ssq_in), reading only the instruction's
@@ -128,9 +168,10 @@ struct OpDesc {        // 256 bytes (schedule.py DESC)
   uint64_t out;        // EPI_RED: bf16 output [NT][n_out]; EPI_LOGITS: bf16 logits [NT][n_out]; EPI_SILU: the published
                        // operand of the consumer (codes [n_out / 256][NT][128], then scales [n_out / 256][NT][16])
   uint64_t parts;      // ACC_CNT: parts per M tile (u8 [mtiles])
-  uint64_t spart;      // EPI_SILU: a split pair's later part's sums [npairs][TILE][ACC_COLS] fp32; EPI_LOGITS: a split
+  uint64_t spart;      // EPI_SILU: a split pair's later parts' sums [slots][npairs][TILE][ACC_COLS] fp32 (2 slots:
+                       // a pair in up to three parts); EPI_LOGITS: a split
                        // tile's later part's tagged sums [n_inst][TILE][NT] u64 (tag pool_len + launch parity)
-  uint64_t sflag;      // EPI_SILU: per pair, the later part's release (u32, epoch-based)
+  uint64_t sflag;      // EPI_SILU: per pair, the later parts' releases (u32: one a later part a launch)
   uint64_t rec;        // the step record (int32 words)
   uint64_t ssq;        // EPI_RED with xr: this op's x sums of squares [2 parities][mtiles][NT] u64 (x^2 * 2^SSQ_BITS)
   uint64_t ssq_in;     // PRO_NORM_X / Q: the producer's ssq (its copy epoch & 1)
@@ -193,8 +234,17 @@ __device__ __forceinline__ uint64_t gtimer() {
 struct StageAt {
   uint32_t row0, kc, half, unit, tile;
 };
+// the rows of an owned op's tile: 0, no op is owned. The owned paths below (stage_at's branch, kernel.cuh's
+// produce_gemv_own and the residuals' late loads) never run; without them the compiler orders the fused kernel's
+// registers differently
+__device__ __forceinline__ uint32_t own_rows(const OpDesc&) { return 0u; }
 __device__ __forceinline__ StageAt stage_at(const OpDesc& d, uint32_t st) {
   StageAt a;
+  if (const uint32_t R = own_rows(d)) {  // (never: own_rows)
+    const uint32_t C = TILE / R, spt = d.spm / C;
+    a.unit = a.tile = st / spt, a.kc = (st - a.tile * spt) * C, a.half = 0, a.row0 = a.tile * R;
+    return a;
+  }
   if (d.paired) {
     const uint32_t pair_stages = 2 * d.spm, p = st / pair_stages, q = st - p * pair_stages;
     a.unit = a.tile = p, a.kc = q >> 1, a.half = q & 1, a.row0 = (q & 1) * d.n_out + p * TILE;

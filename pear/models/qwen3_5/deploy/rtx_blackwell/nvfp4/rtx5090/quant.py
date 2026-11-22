@@ -3,6 +3,8 @@ from dataclasses import dataclass
 
 import torch
 
+from pear.models.qwen3_5.deploy.rtx_blackwell.nvfp4.rtx5090.extension import Rtx5090Nvfp4Fp8KvExtension
+
 E2M1_MAX, E4M3_MAX = 6.0, 448.0  # the largest e2m1 and e4m3 magnitudes
 BLOCK = 16  # weights per e4m3 scale
 ATOM_ROWS, ATOM_BLOCKS = 128, 4  # vLLM's swizzled scale atom: 128 rows x 4 blocks (512 bytes, [32][4][4])
@@ -61,7 +63,7 @@ class Fp4Weight:
         chunk_rows = max(ATOM_ROWS, self.DEQUANT_ELEMS // K // ATOM_ROWS * ATOM_ROWS)
         if rows <= chunk_rows:
             return torch.nn.functional.linear(
-                x, torch.ops.pear_deploy_rtx_blackwell_nvfp4.nvfp4_dequant(self.codes, self.scales, self.gs), bias
+                x, Rtx5090Nvfp4Fp8KvExtension.ops().nvfp4_dequant(self.codes, self.scales, self.gs), bias
             )
 
         # (each chunk of chunk_rows rows holds whole scale atoms)
@@ -69,7 +71,7 @@ class Fp4Weight:
         chunk_outputs = []
         for row_start in range(0, rows, chunk_rows):
             row_end = min(rows, row_start + chunk_rows)
-            chunk_weight = torch.ops.pear_deploy_rtx_blackwell_nvfp4.nvfp4_dequant(
+            chunk_weight = Rtx5090Nvfp4Fp8KvExtension.ops().nvfp4_dequant(
                 self.codes[row_start:row_end],
                 self.scales[row_start * scale_bytes_per_row : row_end * scale_bytes_per_row],
                 self.gs,

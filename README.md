@@ -48,6 +48,7 @@ PEAR deploys with:
 
 ## News
 
+- [2026/11] We optimized the RTX 5090's decode megakernel. With the DFlash2 checkpoint, the NVFP4 model now decodes at **291 tokens/s** on one RTX 5090, 12% faster.
 - [2026/11] The model server now runs on one [RTX PRO 6000](examples/models/qwen3_8_27b_pear/deploy/README.md#hardware), with the model's full 260k-token context. With the DFlash2 checkpoint, the NVFP4 model decodes at **264 tokens/s** on a bf16 KV cache and **276 tokens/s** on an FP8 KV cache.
 - [2026/11] PEAR now trains with [MTP speculative decoding](examples/models/qwen3_8_27b_pear/train/README.md#variables) by default, which makes **end-to-end training ~40% faster**.
 - [2026/11] We released a [DFlash2 checkpoint](https://huggingface.co/mit-han-lab/Qwen3.8-27B-PEAR-DFlash2) for Qwen3.8-27B-PEAR. With it, the NVFP4 model decodes at **921 tokens/s** on one GB300 and **262 tokens/s** on one RTX 5090.

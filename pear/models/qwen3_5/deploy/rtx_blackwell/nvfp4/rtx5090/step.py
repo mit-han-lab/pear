@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+from pear.models.qwen3_5.deploy.rtx_blackwell.nvfp4.rtx5090.extension import Rtx5090Nvfp4Fp8KvExtension
 from pear.models.qwen3_5.deploy.rtx_blackwell.nvfp4.rtx5090.schedule import (
     INSTR,
     K_NORM,
@@ -138,8 +139,18 @@ class AttentionCore:
     eps: float
     cos_sin: torch.Tensor  # bf16 [positions][64]
     scale: float
-    kv_cache: torch.Tensor  # the FP8 cache's bytes: [rows][4 heads][k 256 | v 256]
+    kv_cache: torch.Tensor  # vLLM's cache of the layer: (kernel blocks, 4 heads, block tokens, k 256 | v 256)
     group: int
+    kb_tokens: int  # the group's kernel block (the block table's ids): 16 tokens (FlashInfer), or the manager block
+
+    def kv_bytes(self) -> torch.Tensor:
+        """The cache's bytes [rows][4 heads][k | v] in its NHD memory order ([kernel blocks][tokens][heads]): an FP8
+        e4m3 cache (FlashInfer's) or a bf16 one (FLASH_ATTN's), as the megakernel's build reads it."""
+        assert self.kv_cache.shape[2] == self.kb_tokens, (tuple(self.kv_cache.shape), self.kb_tokens)
+
+        return Rtx5090Nvfp4Fp8KvExtension.loaded().kv_cache_bytes(
+            self.kv_cache, Schedule.ATT_HKV, Schedule.ATT_KV_ROW_ELEMS
+        )
 
 
 @dataclass
@@ -198,6 +209,7 @@ class ModelView:
                 assert rotary.rotary_dim == ROTARY_DIM and rotary.is_neox_style
                 name = attention.attn.layer_name
                 kv_cache = context[name].kv_cache
+                Rtx5090Nvfp4Fp8KvExtension.loaded().check_kv_scales(attention.attn)
                 core = AttentionCore(
                     qkv=Fp8Linear.from_vllm(attention.qkv_proj),
                     o_proj=Fp8Linear.from_vllm(attention.o_proj),
@@ -208,6 +220,7 @@ class ModelView:
                     scale=attention.scaling,
                     kv_cache=kv_cache,
                     group=group_of[name],
+                    kb_tokens=int(runner.block_tables.kernel_block_sizes[group_of[name]]),
                 )
             else:
                 gdn = layer.linear_attn
@@ -308,7 +321,7 @@ class DecodeStep:
     # bf16(mlp + h), FP8 and NVFP4 inputs quantized from the normed values (NVFP4 of their bf16), the cores as vLLM's
     # spec-decode kernels
 
-    ATT_SPLITS = 42  # splits per KV head: 4 x 42 items, one round on the SMs
+    ATT_MAX_SPLITS = 48  # splits per KV head at most (csrc ATT_MAX_SPLITS)
     EMBED_PARTS = 8  # the embedding's instructions per token row (add_embed's parts)
     NORM_PRO = Pro.NORM_Q  # the RMSNorm prologues (PRO_NORM_X: every SM normalizes its chunks itself)
     BA_EXTRA_STAGES = 2  # in_proj_ba's SMs take this many in_proj_qkvz stages fewer, beyond ba's own
@@ -413,19 +426,8 @@ class DecodeStep:
                 # o_proj's FP8 operand: K chunks of 128 values, each NT rows of 128 bytes
                 act = zeros(core.o_proj.weight.shape[1] // 128 * NT * 128, dtype=torch.uint8)
                 attn_group = self.attn_groups.index(core.group)
-                kv_cache = core.kv_cache
-                assert kv_cache.dtype in (torch.float8_e4m3fn, torch.uint8) and kv_cache.element_size() == 1
-                # FlashInfer's NHD cache: logical [blocks][4 heads][block tokens][k 256 | v 256], in memory
-                # [blocks][tokens][heads]
-                kv_bytes = kv_cache.view(torch.uint8).permute(0, 2, 1, 3)
-                assert (
-                    kv_bytes.shape[2:] == (Schedule.ATT_HKV, Schedule.ATT_KV_ROW_BYTES) and kv_bytes.is_contiguous()
-                ), (
-                    tuple(kv_cache.shape),
-                    kv_cache.stride(),
-                )
                 ctr = schedule.add_attention(
-                    kv=kv_bytes.view(-1),
+                    kv=core.kv_bytes(),
                     qkv=qkv_out,
                     q_norm_w=core.q_norm,
                     k_norm_w=core.k_norm,
@@ -436,8 +438,11 @@ class DecodeStep:
                     scale=core.scale,
                     eps=core.eps,
                     s_in=core.o_proj.input_scale,
-                    n_splits=self.ATT_SPLITS,
+                    # 4 x splits items: one round on the SMs
+                    n_splits=min(self.ATT_MAX_SPLITS, self.num_sms // Schedule.ATT_HKV),
                     dep=ctr,
+                    kb_tokens=core.kb_tokens,
+                    book_ctr=book_ctr,
                 )
                 o_out = zeros(NT, K_NORM)
                 ctr, o_desc = schedule.add_gemv(
@@ -765,9 +770,7 @@ class DecodeStep:
             tensors = self.fused_tensors
 
         run_op = (
-            torch.ops.pear_deploy_rtx_blackwell_nvfp4.run
-            if draft_words is None
-            else torch.ops.pear_deploy_rtx_blackwell_nvfp4.run_fused
+            Rtx5090Nvfp4Fp8KvExtension.ops().run if draft_words is None else Rtx5090Nvfp4Fp8KvExtension.ops().run_fused
         )
         run_op(
             tensors["instrs"],

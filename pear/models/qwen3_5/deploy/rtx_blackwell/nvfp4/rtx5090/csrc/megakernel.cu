@@ -21,7 +21,7 @@ constexpr uint8_t E2M1_MAG_MASK = 7;  // an e2m1 code's magnitude bits
 constexpr uint8_t E2M1_SIGN = 8;  // the low code's sign bit
 constexpr uint8_t E2M1_SIGN_HI = 128;  // the high code's sign bit
 constexpr int DEQUANT_THREADS = 256;
-constexpr int64_t DEQUANT_MAX_BLOCKS = 170 * 16;  // 16 CTAs on each of the RTX 5090's 170 SMs
+constexpr int64_t DEQUANT_MAX_BLOCKS = 170 * 16;  // the dequantization's CTAs at most (a grid-stride loop)
 constexpr uint32_t CLOCK_POLLS_MASK = 255u;  // wait_flag reads the clock once per 256 polls
 
 PFN_cuTensorMapEncodeTiled_v12000 encode_fn() {
@@ -36,20 +36,28 @@ PFN_cuTensorMapEncodeTiled_v12000 encode_fn() {
   return fn;
 }
 
-// a CUtensorMap (128 bytes) over a uint8 matrix [rows][row_bytes] at addr: box [box_rows][128 B], SWIZZLE_128B
-torch::Tensor make_tmap(int64_t addr, int64_t rows, int64_t row_bytes, int64_t box_rows) {
+// a CUtensorMap (128 bytes) over a uint8 matrix [rows][row_bytes] at addr: box [box_rows][128 B], SWIZZLE_128B, L2
+// promotion 256 B (promo256) or none
+torch::Tensor tmap2d(int64_t addr, int64_t rows, int64_t row_bytes, int64_t box_rows, bool promo256) {
   CUtensorMap m;
   cuuint64_t dims[2] = {(cuuint64_t)row_bytes, (cuuint64_t)rows};
   cuuint64_t strides[1] = {(cuuint64_t)row_bytes};
   cuuint32_t box[2] = {BOX_BYTES, (cuuint32_t)box_rows}, es[2] = {1, 1};
   CUresult r = encode_fn()(&m, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, reinterpret_cast<void*>(addr), dims, strides, box, es,
                            CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
-                           CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+                           promo256 ? CU_TENSOR_MAP_L2_PROMOTION_L2_256B : CU_TENSOR_MAP_L2_PROMOTION_NONE,
                            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TORCH_CHECK(r == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed: ", (int)r);
   auto out = torch::empty({TMAP_BYTES}, torch::dtype(torch::kUInt8));
   std::memcpy(out.data_ptr(), &m, TMAP_BYTES);
   return out;
+}
+torch::Tensor make_tmap(int64_t addr, int64_t rows, int64_t row_bytes, int64_t box_rows) {
+  return tmap2d(addr, rows, row_bytes, box_rows, true);
+}
+// the pacer's map (megakernel.cuh PACE_*): its box rows and L2 promotion of its own
+torch::Tensor make_tmap_p(int64_t addr, int64_t rows, int64_t row_bytes, int64_t box_rows, bool promo256) {
+  return tmap2d(addr, rows, row_bytes, box_rows, promo256);
 }
 
 // a CUtensorMap over a KV cache viewed as uint8 [rows][heads][row_bytes] (rows: tokens of every kernel block): box
@@ -167,16 +175,27 @@ std::vector<int64_t> sizes() {
   return {mk::SMEM_BYTES, (int64_t)sizeof(mk::Instr), (int64_t)sizeof(mk::OpDesc), mk::B_CHUNKS, mk::NSTAGE};
 }
 
+// the library's pacer (megakernel.cuh PACE_*): its lead, its parts a stage, its map's L2 promotion, the relative rule's
+// D, and whether the launch's tail ops read ahead (the FP8 KV cache's build): schedule.py and draft.py build the
+// programs for the library's own configuration
+std::vector<int64_t> pace_config() {
+  constexpr int64_t TAIL_EARLY = 1;  // (draft.py puts d.select on an SM without a top-k item)
+  return {(int64_t)mk::PACE_LEAD, (int64_t)mk::PACE_SPLIT, (int64_t)mk::PACE_PROMO, (int64_t)mk::PACE_RELL_D,
+          TAIL_EARLY};
+}
+
 }  // namespace
 
 TORCH_LIBRARY(pear_deploy_rtx_blackwell_nvfp4, m) {
   m.def("make_tmap", &make_tmap);
+  m.def("make_tmap_p", &make_tmap_p);
   m.def("make_tmap3d", &make_tmap3d);
   m.def("run", &run);
   m.def("run_draft", &run_draft);
   m.def("run_fused", &run_fused);
   m.def("wait_flag", &wait_flag);
   m.def("sizes", &sizes);
+  m.def("pace_config", &pace_config);
   // (a schema and a CUDA kernel, not a CompositeImplicitAutograd function: torch.compile's fake for it registers)
   m.def("nvfp4_dequant(Tensor codes, Tensor scales, float gs) -> Tensor");
 }
