@@ -15,6 +15,9 @@ class BundleCheck {
     const rebuilt = mkdtempSync(path.join(tmpdir(), 'pear-station-bundle-'));
     try {
       await build({root: this.root, logLevel: 'warn', build: {outDir: rebuilt, emptyOutDir: true}});
+      // the trace template, built into the same folder after the console's page
+      const configFile = path.join(this.root, 'vite.trace.config.ts');
+      await build({root: this.root, configFile, logLevel: 'warn', build: {outDir: rebuilt, emptyOutDir: false}});
       const differences = this.differences(rebuilt);
       for (const difference of differences) console.error(difference);
       if (differences.length)

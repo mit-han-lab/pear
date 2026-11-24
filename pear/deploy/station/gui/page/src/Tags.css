@@ -71,13 +71,8 @@ button.tag-chip.selected {
   color: var(--text-faint);
 }
 .task-annotations {
-  margin: -14px 0 22px 50px;
-  padding: 9px 12px;
-  border: 1px solid var(--border-accent);
-  border-radius: 8px;
-  background: var(--surface-subtle);
   display: grid;
-  gap: 7px;
+  gap: 3px;
 }
 .annotation-error {
   margin: 0;
@@ -120,24 +115,12 @@ button.tag-chip.selected {
   padding: 1px 7px;
   color: hsl(var(--tag-hue) 45% 27%);
 }
-@media (max-width: 760px) {
-  .task-annotations {
-    margin-left: 20px;
-  }
-}
 .tags-scope {
   font-size: 10px;
   font-weight: 600;
   color: var(--text-muted);
   margin-right: 2px;
   white-space: nowrap;
-}
-.task-annotations.compact {
-  margin: 0;
-  padding: 0;
-  border: 0;
-  background: transparent;
-  gap: 3px;
 }
 .tag-input {
   position: relative;

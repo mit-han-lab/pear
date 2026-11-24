@@ -13,6 +13,7 @@ from pear.deploy.station.gui.console.console import Console
 from pear.deploy.station.gui.console.lease import ControlLease
 from pear.deploy.station.gui.console.phase import Phase
 from pear.deploy.station.gui.console.watchdog import Watchdog
+from pear.deploy.station.records.task_events import TaskEvents
 from recorded_task import RecordingWaits
 from stand_in_robots import StandInRobots
 from waiting import Waiting
@@ -300,7 +301,6 @@ def test_controller_pause_resume_toggle_and_no_motion_segment(enabled_console, m
         first = c.recordings.active_segment
         label = c.models_config.models[ConsoleRig.MODEL].label
         assert c.task_run.task["model_label"] == label
-        assert first.snapshot()["model_label"] == label
         saved_task = json.loads((c.root / c.task_run.task["id"] / "task.json").read_text())
         assert saved_task["model_label"] == label
         with pytest.raises(ValueError, match="pause"):
@@ -309,8 +309,7 @@ def test_controller_pause_resume_toggle_and_no_motion_segment(enabled_console, m
         Waiting.until(lambda: not c.is_busy, ConsoleRig.WAIT_S, ConsoleRig.POLL_S)
         RecordingWaits.await_finished(first)
         assert first.snapshot()["status"] == "saved", first.snapshot()
-        assert first.snapshot()["no_motion"]
-        assert not (first.directory / "motion.mp4").exists()
+        assert first.snapshot()["motion_intervals"] == []
         c.commands.run("resume", None)
         Waiting.until(lambda: c.task_run.total_steps >= 1, ConsoleRig.WAIT_S, ConsoleRig.POLL_S)
         second = c.recordings.active_segment
@@ -319,7 +318,7 @@ def test_controller_pause_resume_toggle_and_no_motion_segment(enabled_console, m
         RecordingWaits.await_finished(second)
         assert first.manifest["id"] == "001" and second.manifest["id"] == "002"
         assert second.snapshot()["status"] == "saved", second.snapshot()
-        assert second.snapshot()["motion"] == "motion.mp4"
+        assert second.snapshot()["motion_intervals"]
         assert len(c.recordings.manifests_of_task(c.task_run.task["id"])) == 2
         c.commands.run("recording", {"enabled": False})
         c.commands.run("resume", None)
@@ -408,10 +407,12 @@ def test_demo_task_runs_in_the_model_format(console):
     task = json.loads((root / "task.json").read_text())
     session = json.loads((root / "session.json").read_text())
     assert "action_format" not in task and session["action_format"] == "single_arm_pose"
-    observations = sorted(root.glob("*-observation.json"))
-    shown = json.loads(json.loads(observations[0].read_text())["text"].splitlines()[0])
+    observations = [
+        event["data"] for event in TaskEvents(root / "events.jsonl").read() if event["type"] == "observation"
+    ]
+    shown = json.loads(observations[0]["text"].splitlines()[0])
     assert list(shown) == ["arm", "gripper"] and list(shown["arm"]) == ["x", "y", "z", "pitch", "roll"]
-    assert list(json.loads(observations[0].read_text())["images"]) == ["wrist"]
+    assert list(observations[0]["images"]) == ["wrist"]
 
 
 @pytest.mark.parametrize("robot_name", ["so101"])

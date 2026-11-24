@@ -72,13 +72,6 @@
   color: var(--recording-note-text);
   margin: 8px 0 0;
 }
-.recording-files a.recording-source {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  text-decoration: none;
-  font-size: 12px;
-}
 .recording-player {
   position: relative;
   margin-top: 12px;

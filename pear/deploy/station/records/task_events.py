@@ -4,6 +4,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from pear.deploy.station.agent_loop.clients.schemas import ModelEvent
+from pear.deploy.station.agent_loop.schemas import TurnEvent
 from pear.utils.file_utils import append_line
 
 
@@ -19,10 +21,14 @@ class TaskEventKind(StrEnum):
     CAPACITY = "capacity"
     EXECUTION = "execution"  # what the action did: its result
     TURN_END = "turn_end"  # the turn ended without a result: the phase it ended in
+    # the reasoning and the answer a turn's model streamed before the turn ended without its answer
+    MODEL_TEXT = "model_text"
 
 
 class TaskEvents:
     """A task's event file: one event on each line, in the order the events happened."""
+
+    STREAMED_KINDS = (ModelEvent.REASONING_DELTA, ModelEvent.ANSWER_DELTA)  # the text a model streams, piece by piece
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -56,3 +62,15 @@ class TaskEvents:
                 event = {**event, "data": {**turn_fields[attempt_id], **data}}
 
             yield event
+
+    def read_shown(self) -> list[dict[str, Any]]:
+        """Returns the numbered events a page shows: the text a model streamed, which the file of an older task
+        keeps, is left out of each turn the model answered, whose answer holds all of it."""
+        events = list(self.read_numbered())
+        answered_ids = {event["data"].get("attempt") for event in events if event["type"] == TurnEvent.MODEL_OUTPUT}
+
+        return [
+            event
+            for event in events
+            if event["type"] not in self.STREAMED_KINDS or event["data"].get("attempt") not in answered_ids
+        ]

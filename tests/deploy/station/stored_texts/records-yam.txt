@@ -1,36 +1,4 @@
 {
- "<hex>/<turn>-head.jpg": ".jpg",
- "<hex>/<turn>-left_wrist.jpg": ".jpg",
- "<hex>/<turn>-observation.json": [
-  "captured_monotonic_s",
-  "image_uuids",
-  "images",
-  "observation_id",
-  "previous_result",
-  "state",
-  "text",
-  "turn_id"
- ],
- "<hex>/<turn>-output.json": [
-  "answer",
-  "reasoning",
-  "reasoning_kind",
-  "usage"
- ],
- "<hex>/<turn>-result.json": [
-  "dispatched",
-  "error",
-  "gripper_outcome",
-  "gripper_outcomes",
-  "measured_position",
-  "measured_state",
-  "reached",
-  "settled",
-  "status",
-  "tracking_error",
-  "turn_id"
- ],
- "<hex>/<turn>-right_wrist.jpg": ".jpg",
  "<hex>/events.jsonl": {
   "action": {
    "data": [
@@ -54,27 +22,10 @@
     "type"
    ]
   },
-  "answer_delta": {
-   "data": [
-    "attempt",
-    "episode_id",
-    "phase",
-    "started_at",
-    "text",
-    "turn_number"
-   ],
-   "event": [
-    "data",
-    "id",
-    "monotonic_s",
-    "task_id",
-    "time",
-    "type"
-   ]
-  },
   "execution": {
    "data": [
     "attempt",
+    "dispatched",
     "episode_id",
     "error",
     "gripper_outcome",
@@ -123,7 +74,6 @@
    "data": [
     "attempt",
     "captured_monotonic_s",
-    "details_url",
     "episode_id",
     "image_uuids",
     "images",
@@ -151,26 +101,6 @@
     "episode_id",
     "phase",
     "started_at",
-    "turn_number"
-   ],
-   "event": [
-    "data",
-    "id",
-    "monotonic_s",
-    "task_id",
-    "time",
-    "type"
-   ]
-  },
-  "reasoning_delta": {
-   "data": [
-    "attempt",
-    "episode_id",
-    "phase",
-    "reasoning_kind",
-    "simulated",
-    "started_at",
-    "text",
     "turn_number"
    ],
    "event": [
@@ -259,6 +189,15 @@
   "model",
   "model_label"
  ],
+ "<hex>/turns/001-head.jpg": ".jpg",
+ "<hex>/turns/001-left_wrist.jpg": ".jpg",
+ "<hex>/turns/001-right_wrist.jpg": ".jpg",
+ "<hex>/turns/002-head.jpg": ".jpg",
+ "<hex>/turns/002-left_wrist.jpg": ".jpg",
+ "<hex>/turns/002-right_wrist.jpg": ".jpg",
+ "<hex>/turns/003-head.jpg": ".jpg",
+ "<hex>/turns/003-left_wrist.jpg": ".jpg",
+ "<hex>/turns/003-right_wrist.jpg": ".jpg",
  "home-<count>.json": [
   "after",
   "before",

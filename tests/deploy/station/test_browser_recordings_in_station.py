@@ -53,9 +53,15 @@ def test_record_a_task_play_styled_videos_resume_into_a_new_segment_and_disable_
     expect(recordings.get_by_role("link", name="Download motion only segment 1")).to_have_attribute(
         "href", re.compile(r"/001/styled/motion\.mp4\?download=1$")
     )
-    expect(recordings.get_by_role("link", name="Download source files segment 1")).to_have_attribute(
-        "href", re.compile(r"/001/source\.zip$")
+    # the paused task's downloads stand in the conversation's heading: its trace, and everything in one archive
+    task_download = r"/api/history/[0-9a-f]{32}/"
+    expect(page.get_by_role("link", name="Trace", exact=True)).to_have_attribute(
+        "href", re.compile(task_download + "trace$")
     )
+    expect(page.get_by_role("link", name="Export", exact=True)).to_have_attribute(
+        "href", re.compile(task_download + "export$")
+    )
+    expect(recordings.get_by_role("link", name=re.compile("source files"))).to_have_count(0)
     page.screenshot(path=tmp_path / "recordings-saved.png", full_page=True)
 
     page.get_by_role("button", name="Resume task", exact=True).click()

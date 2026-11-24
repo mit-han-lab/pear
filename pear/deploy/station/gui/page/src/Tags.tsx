@@ -1,7 +1,7 @@
 import React, {useEffect, useId, useRef, useState} from 'react';
 import {ChevronDown, GripVertical, Tag, X} from 'lucide-react';
 import {Api} from './api';
-import type {Annotation, TagCount} from './protocol';
+import type {Annotation, TagCount, Task} from './protocol';
 import './Tags.css';
 
 const MAX_TAGS = 20,
@@ -70,6 +70,7 @@ export function TagEditor({
   label,
   scope,
   menuAbove,
+  autoFocus,
 }: {
   tags: string[];
   suggestions: TagCount[];
@@ -78,6 +79,7 @@ export function TagEditor({
   label: string;
   scope?: string;
   menuAbove?: boolean;
+  autoFocus?: boolean; // whether its input takes the focus once it shows
 }) {
   const [text, setText] = useState(''),
     [open, setOpen] = useState(false),
@@ -156,6 +158,7 @@ export function TagEditor({
         <span className="tag-input">
           <input
             ref={input}
+            autoFocus={autoFocus}
             aria-label={label}
             role="combobox"
             aria-autocomplete="list"
@@ -237,12 +240,14 @@ export function TaskAnnotations({
   taskId,
   suggestions,
   onSaved,
-  compact,
+  menuAbove,
+  autoFocus,
 }: {
   taskId: string;
   suggestions: TagCount[];
   onSaved: (taskId: string, value: Annotation) => void;
-  compact?: boolean;
+  menuAbove?: boolean;
+  autoFocus?: boolean; // whether the editor takes the focus once the task's tags have loaded
 }) {
   const [value, setValue] = useState<Annotation | null>(null),
     [error, setError] = useState(''),
@@ -286,27 +291,72 @@ export function TaskAnnotations({
     queue.current = done;
   }
   // A failed load is secondary information, not an alert competing with robot errors.
-  const className = `task-annotations ${compact ? 'compact' : ''}`;
   if (!value)
     return unavailable ? (
-      <div className={className}>
+      <div className="task-annotations">
         <span className="tag-empty">Tags unavailable</span>
       </div>
     ) : null;
   return (
-    <div className={className} aria-label="Task tags">
+    <div className="task-annotations" aria-label="Task tags">
       <TagEditor
         tags={value.tags}
         suggestions={suggestions}
         label="Add a tag to this task"
-        scope={compact ? 'This task' : undefined}
-        menuAbove={compact}
+        scope="This task"
+        menuAbove={menuAbove}
+        autoFocus={autoFocus}
         onChange={(tags) => save({tags})}
       />
       {error && (
         <p className="annotation-error" role="alert">
           {error}
         </p>
+      )}
+    </div>
+  );
+}
+
+/** A past task's tags behind a button in its heading: the button counts them, its panel below edits them. */
+export function TaskTagsButton({
+  task,
+  suggestions,
+  onSaved,
+}: {
+  task: Task;
+  suggestions: TagCount[];
+  onSaved: (taskId: string, value: Annotation) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const button = useRef<HTMLButtonElement>(null);
+  useEffect(() => setOpen(false), [task.id]);
+  return (
+    <div
+      className="heading-tags"
+      onBlur={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget)) setOpen(false);
+      }}
+      onKeyDown={(e) => {
+        if (e.key !== 'Escape' || !open) return;
+        setOpen(false);
+        button.current?.focus();
+      }}
+    >
+      <button
+        ref={button}
+        type="button"
+        className="heading-action"
+        aria-expanded={open}
+        aria-haspopup="dialog"
+        onClick={() => setOpen(!open)}
+      >
+        <Tag size={15} aria-hidden />
+        Tags · {task.tags?.length ?? 0}
+      </button>
+      {open && (
+        <div className="tags-popover below" role="dialog" aria-label="Task tags" tabIndex={-1}>
+          <TaskAnnotations autoFocus taskId={task.id} suggestions={suggestions} onSaved={onSaved} />
+        </div>
       )}
     </div>
   );

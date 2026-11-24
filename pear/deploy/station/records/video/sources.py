@@ -27,10 +27,20 @@ class SourceClip:
 
 
 class SourceFrames:
-    """One clip's camera videos decoded in step, each at the size it is shown: its pictures, frame by frame."""
+    """One clip's camera videos decoded in step from one of its frames on, each at the size it is shown: its pictures,
+    frame by frame, all of them or those a filter script keeps."""
 
-    def __init__(self, clip: SourceClip, sizes: dict[str, tuple[int, int]], executable: str, log: IO[str]) -> None:
-        self.frame_count = round(clip.duration_s * FRAME_RATE)
+    def __init__(
+        self,
+        clip: SourceClip,
+        sizes: dict[str, tuple[int, int]],
+        executable: str,
+        log: IO[str],
+        frame_count: int,
+        first_frame: int,
+        filter_script: Path | None,
+    ) -> None:
+        self.frame_count = frame_count  # of the pictures yielded
         self.sizes = sizes  # camera role -> (width, height) of its pictures
         self.decoders: dict[str, subprocess.Popen] = {}
         # a camera without a video has no picture; a video a few frames short keeps its last one
@@ -38,7 +48,7 @@ class SourceFrames:
 
         try:
             for role, path in clip.files.items():
-                self.decoders[role] = FFmpeg.raw_decoder(executable, path, sizes[role], log)
+                self.decoders[role] = FFmpeg.raw_decoder(executable, path, sizes[role], log, first_frame, filter_script)
         except BaseException:
             self.close()
             raise

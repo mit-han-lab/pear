@@ -1,0 +1,103 @@
+/* A task's trace page: the record at the top, then the conversation as the console shows it. */
+body {
+  background: var(--page);
+}
+.trace-page {
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 40px 16px 64px;
+}
+.trace-header {
+  margin-bottom: 28px;
+}
+.trace-eyebrow {
+  color: var(--text-quiet);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.trace-header h1 {
+  margin: 8px 0 16px;
+  color: var(--ink);
+  font-size: 26px;
+  line-height: 1.3;
+}
+.trace-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 22px;
+  margin: 0 0 12px;
+  font-size: 13px;
+}
+.trace-meta div {
+  display: flex;
+  gap: 6px;
+}
+.trace-meta dt {
+  color: var(--text-muted);
+}
+.trace-meta dd {
+  margin: 0;
+  color: var(--text-body);
+  font-weight: 600;
+}
+.trace-summary {
+  margin: 0 0 16px;
+  color: var(--text-secondary);
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+.trace-summary b {
+  color: var(--ink);
+}
+.trace-toolbar {
+  display: flex;
+  gap: 8px;
+}
+.trace-toolbar button {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text-body);
+  font-size: 12px;
+  font-weight: 600;
+}
+.trace-toolbar button:hover {
+  background: var(--surface-hover);
+}
+.trace-system {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+}
+.trace-system summary {
+  padding: 10px 14px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.trace-system pre {
+  margin: 0;
+  padding: 0 14px 14px;
+  color: var(--text-code);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.trace-images {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+.trace-images img {
+  width: 120px;
+  border-radius: 10px;
+}

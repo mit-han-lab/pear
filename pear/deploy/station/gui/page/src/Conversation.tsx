@@ -1,19 +1,18 @@
 import {useEffect, useRef, useState} from 'react';
-import {Activity, ArrowRight, Bot, Eye, Plus} from 'lucide-react';
+import {Activity, ArrowRight, Bot, Download, Eye, FileText, Plus} from 'lucide-react';
 import {Api} from './api';
-import {HistoryFilter, TaskAnnotations} from './Tags';
-import {HistoryFooter, HistoryList, type History} from './History';
+import {HistoryFilter, TaskTagsButton} from './Tags';
+import {HistoryList, type History} from './History';
 import {Recordings} from './Recordings';
 import {SavedImages} from './TaskImages';
 import {ENDED_PHASES, TurnCard} from './TurnCard';
 import type {Annotation, ServerState, StreamEvent, TagCount, Task} from './protocol';
-import type {Turn} from './turns';
+import {Turns, type Turn} from './turns';
 import './Conversation.css';
 
 const FOLLOW_DISTANCE_PX = 90; // closer than this to the bottom keeps the view following new output
 const MAX_TURNS_SHOWN = 200;
 const MAX_NOTICES_SHOWN = 8;
-const NOTICE_TYPES = ['session', 'notice', 'interrupted'];
 
 type ConversationProps = {
   isHistory: boolean;
@@ -46,7 +45,11 @@ export function Conversation(props: ConversationProps) {
       ? lastTurn
       : undefined;
   const liveTaskId = isHistory ? undefined : activeTask?.id;
-  const notices = activeEvents.filter((e) => NOTICE_TYPES.includes(e.type) && !e.data.attempt);
+  const notices = activeEvents.filter((e) => Turns.NOTICE_TYPES.includes(e.type) && !e.data.attempt);
+  // a past task, or the workspace's task once it no longer runs, can be downloaded
+  const downloadTask = isHistory ? history.opened : !busy ? task : null;
+  // the task's tags under its instruction: a past task's as the history has them, the live task's as last read
+  const shownTags = isHistory ? activeTask?.tags : savedTags?.taskId === liveTaskId ? savedTags?.tags : undefined;
   const progress = [lastTurn?.number && `Turn ${lastTurn.number}`, busy ? 'Running' : state?.phase]
     .filter(Boolean)
     .join(' · ');
@@ -84,12 +87,37 @@ export function Conversation(props: ConversationProps) {
             </span>
           )}
         </div>
-        {!isHistory && (
-          <button className="new-task" onClick={props.onClear} disabled={!props.mine || !task || !!props.pending}>
-            <Plus size={15} strokeWidth={2.2} />
-            New task
-          </button>
-        )}
+        <div className="conversation-actions">
+          {isHistory && history.opened && (
+            <TaskTagsButton task={history.opened} suggestions={tagCounts} onSaved={history.saveAnnotations} />
+          )}
+          {downloadTask && (
+            <>
+              <a
+                className="heading-action"
+                href={`/api/history/${downloadTask.id}/trace`}
+                title="The conversation as one HTML page to share"
+              >
+                <FileText size={15} />
+                Trace
+              </a>
+              <a
+                className="heading-action"
+                href={`/api/history/${downloadTask.id}/export`}
+                title="Everything the task recorded, with its videos and trace, as one zip file"
+              >
+                <Download size={15} />
+                Export
+              </a>
+            </>
+          )}
+          {!isHistory && (
+            <button className="new-task" onClick={props.onClear} disabled={!props.mine || !task || !!props.pending}>
+              <Plus size={15} strokeWidth={2.2} />
+              New task
+            </button>
+          )}
+        </div>
       </div>
       {isHistory && !history.opened && (
         <HistoryFilter
@@ -110,17 +138,14 @@ export function Conversation(props: ConversationProps) {
             <div className="user-turn">
               <div className="user-bubble">{activeTask.instruction}</div>
               <SavedImages images={activeTask.images} onPreview={props.onPreview} />
-              {savedTags?.taskId === liveTaskId && !!savedTags?.tags.length && (
+              {!!shownTags?.length && (
                 <div className="user-tags">
-                  {savedTags.tags.map((tag) => (
+                  {shownTags.map((tag) => (
                     <span key={tag}>{tag}</span>
                   ))}
                 </div>
               )}
             </div>
-            {isHistory && (
-              <TaskAnnotations taskId={activeTask.id} suggestions={tagCounts} onSaved={history.saveAnnotations} />
-            )}
             {notices.slice(-MAX_NOTICES_SHOWN).map((e) => (
               <p className="chat-notice" key={e.id}>
                 {e.data.message}
@@ -148,7 +173,6 @@ export function Conversation(props: ConversationProps) {
               </div>
             )}
             <Recordings taskId={activeTask.id} />
-            {isHistory && history.opened && <HistoryFooter history={history} task={history.opened} />}
           </div>
         )}
       </div>

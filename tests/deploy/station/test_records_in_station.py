@@ -25,7 +25,6 @@ from pear.deploy.station.gui.server.service_identity import ServiceIdentity
 from pear.deploy.station.records.annotations import Annotations
 from pear.deploy.station.records.context_usage import ContextUsage
 from pear.deploy.station.records.image_uploads import ImageUploads
-from pear.deploy.station.records.recording.captions import Captions
 from pear.deploy.station.records.task_events import TaskEvents
 from pear.deploy.station.records.task_files import TaskFiles
 from recorded_task import RecordedTask
@@ -261,23 +260,24 @@ def test_a_task_is_found_only_by_an_id_of_its_form_with_a_folder(tmp_path):
         assert TaskFiles.find(tmp_path, wrong_id) is None, wrong_id
 
 
-@pytest.mark.parametrize("robot", RecordedTask.stored_robots())
-def test_every_file_of_a_stored_task_folder_has_the_name_task_files_gives_it(robot):
-    [directory] = [path for path in (RecordedTask.STORED_TASKS / robot).iterdir() if path.is_dir()]
-    files = TaskFiles.find(directory.parent, directory.name)
-    attempt_ids = {
-        event["data"]["attempt"] for event in TaskEvents(files.events_path).read() if "attempt" in event["data"]
-    }
-    turn_records = (TaskFiles.OBSERVATION_RECORD, TaskFiles.OUTPUT_RECORD, TaskFiles.RESULT_RECORD)
+def test_a_page_reads_the_streamed_text_only_of_a_turn_the_model_never_answered(tmp_path):
+    path = tmp_path / "events.jsonl"
+    rows = [
+        {"id": 1, "type": "turn_started", "data": {"attempt": "one", "turn_number": 1}},
+        {"id": 2, "type": "reasoning_delta", "data": {"attempt": "one", "text": "Look"}},
+        {"id": 3, "type": "answer_delta", "data": {"attempt": "one", "text": "Move"}},
+        {"id": 4, "type": "model_output", "data": {"attempt": "one", "reasoning": "Look", "answer": "Move"}},
+        {"id": 5, "type": "turn_started", "data": {"attempt": "two", "turn_number": 2}},
+        {"id": 6, "type": "reasoning_delta", "data": {"attempt": "two", "text": "Half a thought"}},
+        {"id": 7, "type": "turn_end", "data": {"attempt": "two", "phase": "Interrupted"}},
+    ]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
 
-    names = {
-        files.task_path.name,
-        files.events_path.name,
-        files.session_path.name,
-        *(files.turn_record_path(attempt_id, record).name for attempt_id in attempt_ids for record in turn_records),
-    }
+    shown = TaskEvents(path).read_shown()
 
-    assert {path.name for path in directory.iterdir()} <= names
+    # an older task's file keeps every piece of streamed text: its answer holds the answered turn's
+    assert [event["id"] for event in shown] == [1, 4, 5, 6, 7]
+    assert all(event["data"]["turn_number"] for event in shown)
 
 
 def test_context_is_latest_full_length_not_sum_of_requests_and_survives_new_turn():
@@ -285,27 +285,25 @@ def test_context_is_latest_full_length_not_sum_of_requests_and_survives_new_turn
     usage.on_event("task", {"id": "task-one"})
     usage.on_event("turn_started", {"turn_number": 1, "attempt": "one", "episode_id": "e"})
     report = {"attempt": "one", "input": 51696, "output": 187}
-    first, _ = usage.on_event("usage", report)
+    first = usage.on_event("usage", report)
     assert first["tokens"] == 51883
     report["input"] = 999
     assert first["input"] == 51696
 
     usage.on_event("turn_started", {"turn_number": 2, "attempt": "two", "episode_id": "e"})
     assert usage.latest_context is first
-    assert usage.turn_usage is None
     usage.on_event("observation", {"attempt": "two", "request_id": "request-two"})
     usage.on_event("capacity", {"attempt": "two", "input": 53000, "context_limit": 100000})
     assert usage.latest_context["tokens"] == 53000 and usage.latest_context["output"] is None
     usage.on_event("usage", {"attempt": "two", "input": 53000, "output": 200})
     assert usage.latest_context["tokens"] == 53200
-    assert usage.turn_usage["tokens"] == 53200
 
     # A repeated report replaces the snapshot, and compaction can reduce its size.
     usage.on_event("usage", {"attempt": "two", "input": 40000, "output": 200})
     assert usage.latest_context["tokens"] == 40200
     assert first["tokens"] == 51883
     # the next task starts without it
-    assert usage.on_event("task", {"id": "task-two"}) == (None, None)
+    assert usage.on_event("task", {"id": "task-two"}) is None
 
 
 def test_stale_reports_and_invalid_numbers_are_ignored():
@@ -345,9 +343,7 @@ def test_context_resets_for_new_history(kind, data):
     usage.on_event("turn_started", {"turn_number": 1, "attempt": "one", "episode_id": "old"})
     usage.on_event("usage", {"attempt": "one", "input": 100, "output": 20})
 
-    assert usage.on_event(kind, data) == (None, None)
-    assert Captions.context({"phase": "Thinking", "context_usage": usage.latest_context}) == "Context Usage: Pending"
-    assert Captions.context({"phase": "Executing", "context_usage": None}) == "Context Usage: Not provided"
+    assert usage.on_event(kind, data) is None
 
 
 def test_pause_resume_retains_latest_context_usage():
@@ -361,7 +357,7 @@ def test_pause_resume_retains_latest_context_usage():
     assert usage.latest_context == before
 
 
-def test_a_report_with_its_own_context_keeps_the_call_cost_apart():
+def test_a_report_with_its_own_context_counts_that_context():
     state = ContextUsage()
     state.on_event("turn_started", {"attempt": "a", "turn_number": 1})
     data = {
@@ -375,24 +371,15 @@ def test_a_report_with_its_own_context_keeps_the_call_cost_apart():
 
     state.on_event("usage", data)
 
-    assert state.turn_usage["tokens"] == 31635
-    assert state.latest_context["tokens"] == 3825
-    packet = {
-        "turn_number": 1,
-        "inference_usage": state.turn_usage,
-        "context_usage": state.latest_context,
-        "phase": "Paused",
-    }
-    assert "29,137" in Captions.inference(packet)
-    assert "3,825 / 260,096" in Captions.context(packet)
+    # the request's own tokens are not the context's
+    assert state.latest_context["tokens"] == 3825 and state.latest_context["context_limit"] == 260096
+    assert state.latest_context["request_context"] is True
+    assert state.latest_context["compaction"] == {"status": "completed", "count": 1}
 
     data["context"] = {"input": None, "context_limit": 260096, "status": "pending"}
     data["output"], data["partial"] = None, True
     state.on_event("usage", data)
-    packet.update(inference_usage=state.turn_usage, context_usage=state.latest_context)
-    assert "Pending" in Captions.context(packet)
-    assert "at least 29,137" in Captions.inference(packet)
-    assert "Not provided" in Captions.inference(packet)
+    assert state.latest_context["tokens"] is None
 
 
 class PageService:
@@ -618,7 +605,11 @@ def test_history_lists_every_task_with_annotations_and_edits_keep_order(console,
             ]
             archive = await (await client.get(f"/api/history/{ids[0]}/export")).read()
             with zipfile.ZipFile(io.BytesIO(archive)) as files:
-                assert json.loads(files.read(TaskFiles.ANNOTATIONS_NAME))["tags"] == ["Kp400", "摩擦 补偿"]
+                [folder] = {name.split("/")[0] for name in files.namelist()}
+                assert json.loads(files.read(f"{folder}/{TaskFiles.ANNOTATIONS_NAME}"))["tags"] == [
+                    "Kp400",
+                    "摩擦 补偿",
+                ]
 
     asyncio.run(scenario())
 
@@ -697,7 +688,10 @@ def test_upload_start_history_and_export(enabled_console, page_app):
             assert rows[0]["images"] == task["images"]
             archive = await (await client.get(f"/api/history/{task['id']}/export")).read()
             with zipfile.ZipFile(io.BytesIO(archive)) as z:
-                assert task["images"][0]["file"] in z.namelist()
+                [folder] = {name.split("/")[0] for name in z.namelist()}
+                assert f"{folder}/{task['images'][0]['file']}" in z.namelist()
+                # the trace page shows the task's image too
+                assert "data:image/jpeg;base64," in z.read(f"{folder}/trace.html").decode()
             assert (await client.post(url, data=form(Pictures.make()))).status == 409
 
     asyncio.run(run())
@@ -780,11 +774,12 @@ def test_a_model_without_effort_records_no_effort(enabled_console):
 
 
 @pytest.mark.parametrize("robot_name", ["yam"])
-def test_legacy_pagination_keeps_numbers_and_export_keeps_original_records(console, page_app):
+def test_a_legacy_task_s_events_keep_their_numbers_and_its_export_keeps_its_records(console, page_app):
     controller = console
     task_id = uuid.uuid4().hex
     root = controller.root / task_id
     root.mkdir()
+    (root / "task.json").write_text(json.dumps({"id": task_id, "instruction": "Hold.", "created": 1000, "model": "m"}))
     rows = []
     for number in range(260):
         for kind in ("observation", "action", "execution"):
@@ -812,25 +807,17 @@ def test_legacy_pagination_keeps_numbers_and_export_keeps_original_records(conso
         await client.start_server()
         try:
             await client.post("/api/auth", json={"token": PageService.TOKEN})
-            collected = []
-            after = 0
-            while True:
-                page = await (await client.get(f"/api/history/{task_id}/events?after={after}")).json()
-                if not page:
-                    break
-                collected.extend(page)
-                after = page[-1]["id"]
-            numbers = [e["data"]["turn_number"] for e in collected if e["type"] == "observation"]
+            # every event in one answer, each turn with its number
+            events = await (await client.get(f"/api/history/{task_id}/events")).json()
+            assert [e["id"] for e in events] == list(range(1, len(rows) + 1))
+            numbers = [e["data"]["turn_number"] for e in events if e["type"] == "observation"]
             assert numbers == list(range(1, 261))
-            everything = await (await client.get(f"/api/history/{task_id}/events?all=1")).json()
-            assert everything == collected and len(everything) == len(rows)
-            tail = await (await client.get(f"/api/history/{task_id}/events?after=100&all=1")).json()
-            assert [e["id"] for e in tail] == list(range(101, len(rows) + 1))
             archive = await (await client.get(f"/api/history/{task_id}/export")).read()
             with zipfile.ZipFile(io.BytesIO(archive)) as zip:
-                assert zip.read("events.jsonl") == journal
+                [folder] = {name.split("/")[0] for name in zip.namelist()}
+                assert zip.read(f"{folder}/events.jsonl") == journal
                 for name, value in originals.items():
-                    assert zip.read(name) == value
+                    assert zip.read(f"{folder}/{name}") == value
             assert (root / "events.jsonl").read_bytes() == journal
         finally:
             await client.close()

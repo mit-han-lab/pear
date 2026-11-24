@@ -129,7 +129,14 @@ def test_full_browser_task_pause_clear_home_stop_and_history_flow(
     expect(page.locator(".history-list button").first).to_be_visible()
     page.locator(".history-list button").first.click()
     expect(page.locator(".user-bubble")).to_have_text("Lift both arms slightly, then return. Repeat until I pause.")
-    expect(page.get_by_role("link", name="Export task")).to_be_visible()
+    # a past task's downloads and its tags stand in its heading; the tags edit in a panel that closes as the focus
+    # leaves it
+    expect(page.get_by_role("link", name="Export", exact=True)).to_have_attribute("href", re.compile(r"/export$"))
+    expect(page.get_by_role("link", name="Trace", exact=True)).to_have_attribute("href", re.compile(r"/trace$"))
+    page.get_by_role("button", name=re.compile(r"^Tags · \d+$")).click()
+    expect(page.get_by_role("combobox", name="Add a tag to this task")).to_be_focused()
+    page.locator(".conversation-heading h2").click()
+    expect(page.get_by_role("dialog", name="Task tags")).to_have_count(0)
     assert page_errors == []
 
 

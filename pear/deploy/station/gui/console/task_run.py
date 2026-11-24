@@ -1,10 +1,8 @@
 import threading
 import time
-from dataclasses import asdict
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from uuid import uuid4
 
 from pear.deploy.station.agent_loop.agent_loop import StationAgentLoop, Turn
 from pear.deploy.station.agent_loop.clients.client import ContextLimit, ModelClient
@@ -22,6 +20,7 @@ if TYPE_CHECKING:  # an annotation only: its module imports this one
     from pear.deploy.station.gui.console.console import Console
 
 RECORD_URL = "/api/records/{task_id}/{name}"  # where the page's service serves a file of a task's folder
+TURN_IMAGE_URL = "/api/records/{task_id}/turns/{name}"  # where it serves a camera frame a turn showed the model
 
 
 class TaskRun:
@@ -31,7 +30,6 @@ class TaskRun:
     UNREACHABLE_RETRIES = 5  # consecutive pre-dispatch IK rejections retried with a fresh observation before pausing
     # shown when an unreachable action is asked for again
     RETRY_NOTICE = "IK rejected before motion. Requesting a fresh action ({retry}/{retries})."
-    ATTEMPT_ID_CHARS = 12  # hex characters of an attempt id, unique within a task
     STATISTICS_EVENTS = (ModelEvent.USAGE, ModelEvent.PERFORMANCE)  # events whose final value outlives a cancelled turn
     # a result's status -> the phase its turn ends in
     OUTCOME_PHASES = {
@@ -55,6 +53,9 @@ class TaskRun:
         self.active_turn: dict[str, Any] | None = None  # what the page shows of that turn
         self.resume_pending = False  # whether an action did not complete, so the next run reports what happened
         self.inference_started_at: float | None = None  # wall time at which the model began on the latest turn
+        # the reasoning and the answer the active turn's model streamed: what the turn's events keep of them when it
+        # ends before the model's answer, which holds them all
+        self.streamed_text: dict[str, str] = {}
 
     @property
     def files(self) -> TaskFiles:
@@ -124,7 +125,7 @@ class TaskRun:
             self.model_client,
             action_format=console.action_format,
             timeout_s=console.models_config.models[console.model].timeout_s,
-            directory=directory,
+            directory=self.files.turns_directory,
             reference_images=tuple(
                 ReferenceImage(directory / image["file"], image["id"]) for image in self.task.get("images", [])
             ),
@@ -167,18 +168,23 @@ class TaskRun:
                 self.inference_started_at = time.time()
             if self.active_turn:
                 self.active_turn["phase"] = phase.value
+        elif kind in (ModelEvent.REASONING_DELTA, ModelEvent.ANSWER_DELTA):
+            # shown as it streams, and kept by the answer or by the end of a turn that never got one
+            part = "reasoning" if kind == ModelEvent.REASONING_DELTA else "answer"
+            self.streamed_text[part] = self.streamed_text.get(part, "") + data.get("text", "")
+            if data.get("reasoning_kind"):
+                self.streamed_text["reasoning_kind"] = data["reasoning_kind"]
+            console.emit(kind, {**data, "attempt": attempt_id}, is_saved=False)
+            return
         elif kind == TurnEvent.OBSERVATION:
             task_id = self.task["id"]
-            observation_path = self.files.turn_record_path(attempt_id, TaskFiles.OBSERVATION_RECORD)
-            TaskFiles.write_json(observation_path, data)
-            details_url = RECORD_URL.format(task_id=task_id, name=observation_path.name)
             image_urls = {
-                camera_name: RECORD_URL.format(task_id=task_id, name=Path(path).name)
+                camera_name: TURN_IMAGE_URL.format(task_id=task_id, name=Path(path).name)
                 for camera_name, path in data["images"].items()
             }
-            data = {**data, "details_url": details_url, "images": image_urls}
+            data = {**data, "images": image_urls}
         elif kind == TurnEvent.MODEL_OUTPUT:
-            TaskFiles.write_json(self.files.turn_record_path(attempt_id, TaskFiles.OUTPUT_RECORD), data)
+            self.streamed_text = {}
         console.emit(kind, {**data, "attempt": attempt_id})
 
     def close_session(self) -> None:
@@ -212,11 +218,12 @@ class TaskRun:
     def _start_turn(self) -> str:
         """Opens the next turn under a new attempt id, which the turn's events carry, and returns the id."""
         console = self.console
-        attempt_id = uuid4().hex[: self.ATTEMPT_ID_CHARS]
+        self.turn_number += 1
+        attempt_id = TaskFiles.turn_id(self.turn_number)
         self.active_attempt_id = attempt_id
         console.performance = None
         self.inference_started_at = None
-        self.turn_number += 1
+        self.streamed_text = {}
 
         self.active_turn = {
             "attempt": attempt_id,
@@ -230,20 +237,14 @@ class TaskRun:
         return attempt_id
 
     def _save_execution_result(self, result: MotionResult) -> None:
-        """Records what the active turn's action did, beside the model's output that asked for it."""
-        attempt_id = self.active_attempt_id
-        last_turn = self.session.last_turn
-        if last_turn.model_output:
-            output_path = self.files.turn_record_path(attempt_id, TaskFiles.OUTPUT_RECORD)
-            TaskFiles.write_json(output_path, asdict(last_turn.model_output))
-
-        result_record = result.to_record()
-        result_path = self.files.turn_record_path(attempt_id, TaskFiles.RESULT_RECORD)
-        TaskFiles.write_json(
-            result_path, {"turn_id": attempt_id, "dispatched": last_turn.is_dispatched, **result_record}
-        )
+        """Records what the active turn's action did, and whether it went to the robot."""
         self.active_turn["phase"] = self.OUTCOME_PHASES[result.status].value
-        self.console.emit(TaskEventKind.EXECUTION, {"attempt": attempt_id, **result_record})
+        execution = {
+            "attempt": self.active_attempt_id,
+            "dispatched": self.session.last_turn.is_dispatched,
+            **result.to_record(),
+        }
+        self.console.emit(TaskEventKind.EXECUTION, execution)
 
     def _reconcile_fault(self, error: Exception, turn_before_step: Turn | None) -> Exception:
         """Records a robot fault that ended an unfinished turn; the fault replaces ``error`` as the turn's failure,
@@ -282,6 +283,8 @@ class TaskRun:
     def _end_turn(self, failure: Exception, is_unfinished: bool) -> None:
         """Closes the active turn after ``failure`` ended the run."""
         console = self.console
+        if is_unfinished and self.streamed_text:
+            console.emit(TaskEventKind.MODEL_TEXT, {"attempt": self.active_attempt_id, **self.streamed_text})
         if isinstance(failure, OperatorPaused):
             if is_unfinished and self.active_turn:
                 self.active_turn["phase"] = Phase.INTERRUPTED.value
@@ -319,9 +322,10 @@ class TaskRun:
     @staticmethod
     def _is_unreachable(result: MotionResult) -> bool:
         """Whether offline IK rejected the action before any motion."""
+        # whether the hold read settled at that moment does not matter: nothing moved, and the next action waits for a
+        # settled hold before it is planned
         return bool(
             result.status == MotionStatus.REJECTED
-            and result.is_settled
             and result.error
             and result.error.get("code") == UnreachablePoseError.__name__
         )

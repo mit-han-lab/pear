@@ -205,7 +205,7 @@ export function Composer(props: ComposerProps) {
                   menuAbove
                 />
                 {task && (
-                  <TaskAnnotations compact taskId={task.id} suggestions={tagCounts} onSaved={props.onAnnotationsSaved} />
+                  <TaskAnnotations menuAbove taskId={task.id} suggestions={tagCounts} onSaved={props.onAnnotationsSaved} />
                 )}
               </div>
             )}

@@ -5,7 +5,6 @@ from typing import Any
 
 from pear.deploy.station.control.cameras import CameraSource
 from pear.deploy.station.control.schemas import Camera
-from pear.deploy.station.records.context_usage import ContextUsage
 from pear.deploy.station.records.recording.encode_worker import FINISHED_STATUSES, SegmentStatus
 from pear.deploy.station.records.recording.segment import Segment
 from pear.deploy.station.records.task_files import TaskFiles
@@ -21,17 +20,14 @@ class Recordings:
     def __init__(self, root: Path, cameras: tuple[Camera, ...]) -> None:
         self.root = root  # the folder of the tasks' folders
         self.cameras = tuple(cameras)
-        self.source_file_names = TaskFiles.source_file_names(self.cameras)  # by camera role, of a camera's own video
         self.is_enabled = True  # whether a task that starts or resumes is recorded
         self.active_segment: Segment | None = None  # the segment that is recording
         self.live_segments: list[Segment] = []  # the segments of this service that were not found finished yet
-        self.usage_tracker = ContextUsage()
 
     def start(
         self, task: dict[str, Any], camera_feed: CameraSource, robot_status_reader: Callable[[], dict[str, Any]]
     ) -> None:
         """Starts the next segment of ``task``, unless recording is off."""
-        latest_context = self.usage_tracker.context_for_task(task["id"])
         if not self.is_enabled:
             return
 
@@ -44,14 +40,7 @@ class Recordings:
         files = TaskFiles(self.root / task["id"])
         numbers = [int(path.name) for path in files.recordings_directory.glob("*") if path.name.isdigit()]
         segment_id = f"{max(numbers, default=0) + 1:0{TaskFiles.SEGMENT_ID_DIGITS}d}"
-        segment = Segment(
-            files.segment_directory(segment_id),
-            task,
-            self.cameras,
-            camera_feed,
-            robot_status_reader,
-            latest_context,
-        )
+        segment = Segment(files.segment_directory(segment_id), task, self.cameras, camera_feed, robot_status_reader)
         self.live_segments.append(segment)
         self.active_segment = segment
 
@@ -64,15 +53,9 @@ class Recordings:
 
         return segment
 
-    def on_event(self, kind: str, data: dict[str, Any]) -> None:
-        """Follows one event of the task: its usage, and what the recording segment captions."""
-        # the usage is followed while recording is off too, so that a segment started later begins with the latest
-        # context and not without the model session's history
-        latest_context, turn_usage = self.usage_tracker.on_event(kind, data)
-
-        segment = self.active_segment
-        if segment is not None:
-            segment.on_event(kind, data, latest_context=latest_context, turn_usage=turn_usage)
+    def is_recording(self) -> bool:
+        """Whether a segment records."""
+        return self.active_segment is not None
 
     def snapshot(self) -> dict[str, Any]:
         """Returns what the page shows of the recording: whether it is on, the recording segment and the live ones."""

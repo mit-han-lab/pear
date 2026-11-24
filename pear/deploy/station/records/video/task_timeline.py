@@ -46,7 +46,7 @@ class TaskTimeline:
         duration_s = sum((clip.duration_s for clip in clips), 0.0)
         answers = [
             (number, cls._elapsed_seconds(clip_spans, answered_at), action, tokens)
-            for number, answered_at, action, tokens in cls._answers(files)
+            for number, answered_at, action, tokens in cls.answers(files)
         ]
 
         return cls(
@@ -72,7 +72,7 @@ class TaskTimeline:
         )
 
     @staticmethod
-    def _answers(files: TaskFiles) -> list[tuple[int, float, dict[str, Any] | None, int | None]]:
+    def answers(files: TaskFiles) -> list[tuple[int, float, dict[str, Any] | None, int | None]]:
         """Returns, for each turn the model answered: its number, the monotonic time of the answer, the action or
         None, and the conversation's tokens."""
         usage = ContextUsage()
@@ -81,7 +81,7 @@ class TaskTimeline:
         for line in files.events_path.read_text().splitlines():
             event = json.loads(line)
             kind, data = event["type"], event["data"]
-            latest_context, _ = usage.on_event(kind, data)
+            latest_context = usage.on_event(kind, data)
 
             if kind == TaskEventKind.TURN_STARTED:
                 turns[data["attempt"]] = {

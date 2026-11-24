@@ -146,11 +146,12 @@ export function ImageAttachments({
       <button
         type="button"
         className="attach-button"
+        aria-label="Add images"
+        title="Add images"
         disabled={disabled || draft.images.length >= MAX_IMAGES}
         onClick={() => input.current?.click()}
       >
         <ImagePlus size={15} />
-        Add images
       </button>
       {draft.images.length > 0 && (
         <div className="attachment-list">

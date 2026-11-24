@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import io
 import json
 import threading
@@ -436,17 +437,16 @@ def test_the_service_names_follow_the_robot(console):
 
 
 @pytest.mark.parametrize("robot_name", ["yam"])
-def test_the_recording_endpoints_need_a_login_serve_ranges_and_export(console):
+def test_the_video_endpoints_need_a_login_and_serve_ranges(console):
     task_id = "b" * 32
-    directory = console.root / task_id / "recordings" / "001"
+    directory = console.root / task_id / "recordings" / "merged"
     directory.mkdir(parents=True)
-    (directory / "recording.json").write_text(json.dumps({"id": "001", "status": "saved"}))
+    (directory / "merged.json").write_text(json.dumps({"styled": True}))
     (directory / "full.mp4").write_bytes(b"0123456789")
-    (directory / "motion.partial.mp4").write_bytes(b"incomplete")
 
     async def scenario():
         async with TestClient(TestServer(ServedConsole.app(console, "video-token"))) as client:
-            url = f"/api/recordings/{task_id}/001/full.mp4"
+            url = f"/api/recordings/{task_id}/merged/full.mp4"
             assert (await client.get(url)).status == 401
             await client.post("/api/auth", json={"token": "video-token"})
             response = await client.get(url, headers={"Range": "bytes=2-5"})
@@ -454,35 +454,76 @@ def test_the_recording_endpoints_need_a_login_serve_ranges_and_export(console):
             assert await response.read() == b"2345"
             response = await client.get(url + "?download=1")
             assert "attachment" in response.headers["Content-Disposition"]
-            assert (await client.get(url.replace("full.mp4", "recording.json"))).status == 404
-            rows = await (await client.get(f"/api/history/{task_id}/recordings")).json()
-            assert len(rows) == 1
-            archive = await (await client.get(f"/api/history/{task_id}/export")).read()
-            with zipfile.ZipFile(io.BytesIO(archive)) as files:
-                assert files.read("recordings/001/full.mp4") == b"0123456789"
-                assert "recordings/001/motion.partial.mp4" not in files.namelist()
+            assert (await client.get(url.replace("full.mp4", "merged.json"))).status == 404
+            # a segment's camera videos are in the task's export, not served one by one
+            assert (await client.get(f"/api/recordings/{task_id}/001/head.mp4")).status == 404
 
     asyncio.run(scenario())
 
 
+class TaskDownloads:
+    """A task folder as a station of today or of before leaves it, and what its downloads are named."""
+
+    CREATED = 1795484448.8  # the task's start, on the station's clock
+    TASK_ID = "c" * 32
+
+    @classmethod
+    def write(cls, root: Path) -> Path:
+        """Writes the task's folder under ``root`` and returns it: its records, a turn's frame by today's name and
+        one by the name of before, recordings with an unfinished and an empty file, and a temporary file."""
+        directory = root / cls.TASK_ID
+        segment = directory / "recordings" / "001"
+        segment.mkdir(parents=True)
+        (directory / "turns").mkdir()
+        task = {"id": cls.TASK_ID, "instruction": "Lift the cup.", "created": cls.CREATED, "model": "vllm"}
+        (directory / "task.json").write_text(json.dumps(task))
+        (directory / "session.json").write_text(json.dumps({"system_prompt": "You drive a robot </script> safely."}))
+        frames = {
+            "head": f"/api/records/{cls.TASK_ID}/turns/001-head.jpg",
+            "wrist": f"/api/records/{cls.TASK_ID}/a1b2-head.jpg",
+        }
+        events = [
+            {"id": 1, "type": "turn_started", "data": {"attempt": "001", "turn_number": 1}, "time": cls.CREATED + 1},
+            {"id": 2, "type": "observation", "data": {"attempt": "001", "images": frames}, "time": cls.CREATED + 1},
+            {
+                "id": 3,
+                "type": "usage",
+                "data": {"attempt": "001", "input": 900, "output": 100},
+                "time": cls.CREATED + 2,
+            },
+            {"id": 4, "type": "model_output", "data": {"attempt": "001", "answer": "done"}, "time": cls.CREATED + 3},
+        ]
+        # every event the console saves carries the monotonic clock too
+        rows = [json.dumps({**event, "monotonic_s": event["time"] - cls.CREATED}) + "\n" for event in events]
+        (directory / "events.jsonl").write_text("".join(rows))
+        (directory / "turns" / "001-head.jpg").write_bytes(b"today's jpeg")
+        (directory / "a1b2-head.jpg").write_bytes(b"jpeg of before")
+        (directory / "notes.tmp").write_text("partial write")
+        (segment / "recording.json").write_text(json.dumps({"id": "001", "status": "saved"}))
+        (segment / "timeline.jsonl").write_text('{"start_frame": 0}\n' * 200)
+        for name in SOURCES.values():
+            (segment / name).write_bytes(name.encode() * 50)
+        (segment / "head.partial.mp4").write_bytes(b"incomplete")
+        (segment / "encoder.log").write_text("")
+
+        return directory
+
+    @classmethod
+    def name(cls) -> str:
+        """Returns the name of the task's downloads."""
+        return f"yam-{time.strftime('%Y-%m-%d-%H%M', time.localtime(cls.CREATED))}-{cls.TASK_ID[:8]}"
+
+    @staticmethod
+    def trace_data(page: str) -> dict[str, Any]:
+        """Returns the records a trace page holds."""
+        mark = '<script id="trace-data" type="application/json">'
+        return json.loads(page[page.index(mark) + len(mark) : page.index("</script>", page.index(mark))])
+
+
 @pytest.mark.parametrize("robot_name", ["yam"])
-def test_a_source_download_bundles_one_segment_with_the_task_records(console):
-    task_id = "c" * 32
-    directory = console.root / task_id
-    first, second = directory / "recordings" / "001", directory / "recordings" / "002"
-    first.mkdir(parents=True)
-    second.mkdir(parents=True)
-    (directory / "task.json").write_text('{"id": "task"}')
-    (directory / "events.jsonl").write_text('{"id": 1}\n' * 200)
-    (directory / "a1b2-head.jpg").write_bytes(b"jpeg")
-    (directory / "notes.tmp").write_text("partial write")
-    (first / "recording.json").write_text(json.dumps({"id": "001", "status": "saved"}))
-    (first / "timeline.jsonl").write_text('{"start_frame": 0}\n' * 200)
-    for name in ("full.mp4", *SOURCES.values()):
-        (first / name).write_bytes(name.encode() * 50)
-    (first / "head.partial.mp4").write_bytes(b"incomplete")
-    (second / "recording.json").write_text(json.dumps({"id": "002", "status": "recording"}))
-    (second / "full.mp4").write_bytes(b"second")
+def test_the_export_is_one_folder_of_the_task_with_its_trace(console):
+    directory = TaskDownloads.write(console.root)
+    task_id, name = TaskDownloads.TASK_ID, TaskDownloads.name()
 
     async def removed(pattern):
         # The handler deletes its temporary archive just after the client has the body.
@@ -493,47 +534,76 @@ def test_a_source_download_bundles_one_segment_with_the_task_records(console):
         raise AssertionError(f"{pattern} was left in the history directory")
 
     async def scenario():
-        async with TestClient(TestServer(ServedConsole.app(console, "source-token"))) as client:
-            url = f"/api/recordings/{task_id}/001/source.zip"
+        async with TestClient(TestServer(ServedConsole.app(console, "export-token"))) as client:
+            url = f"/api/history/{task_id}/export"
             assert (await client.get(url)).status == 401
-            await client.post("/api/auth", json={"token": "source-token"})
+            await client.post("/api/auth", json={"token": "export-token"})
             response = await client.get(url)
             assert response.status == 200
-            assert f"yam-{task_id}-001-source.zip" in response.headers["Content-Disposition"]
+            assert f'filename="{name}.zip"' in response.headers["Content-Disposition"]
             assert int(response.headers["Content-Length"]) == len(body := await response.read())
             with zipfile.ZipFile(io.BytesIO(body)) as archive:
-                names = set(archive.namelist())
-                assert names == {
-                    "task.json",
-                    "events.jsonl",
-                    "a1b2-head.jpg",
-                    "recordings/001/recording.json",
-                    "recordings/001/timeline.jsonl",
-                    "recordings/001/full.mp4",
-                    *(f"recordings/001/{name}" for name in SOURCES.values()),
+                assert set(archive.namelist()) == {
+                    f"{name}/{path}"
+                    for path in (
+                        "task.json",
+                        "session.json",
+                        "events.jsonl",
+                        "turns/001-head.jpg",
+                        "a1b2-head.jpg",
+                        "trace.html",
+                        "recordings/001/recording.json",
+                        "recordings/001/timeline.jsonl",
+                        *(f"recordings/001/{source}" for source in SOURCES.values()),
+                    )
                 }
-                assert archive.read("recordings/001/head.mp4") == b"head.mp4" * 50
+                assert archive.read(f"{name}/recordings/001/head.mp4") == b"head.mp4" * 50
                 kinds = {info.filename: info.compress_type for info in archive.infolist()}
-                assert kinds["recordings/001/full.mp4"] == zipfile.ZIP_STORED
-                assert kinds["a1b2-head.jpg"] == zipfile.ZIP_STORED
-                assert kinds["events.jsonl"] == zipfile.ZIP_DEFLATED
-            # Individual camera copies can also be fetched or played directly.
-            camera = await client.get(f"/api/recordings/{task_id}/001/left_wrist.mp4")
-            assert camera.status == 200
-            # A crashed interrupted manifest is finished; a live job is not yet.
-            assert (await client.get(url.replace("001", "002"))).status == 200
-            console.recordings.live_segments.append(StandInSegment(task_id, "002"))
-            try:
-                assert (await client.get(url.replace("001", "002"))).status == 409
-            finally:
-                console.recordings.live_segments.pop()
-            for bad in ("003", "1", "..", "001x"):
-                assert (await client.get(url.replace("001", bad))).status == 404
-            await removed(".download-*")
-            export = await client.get(f"/api/history/{task_id}/export")
-            assert export.status == 200 and len(await export.read()) > 0
+                assert kinds[f"{name}/recordings/001/head.mp4"] == zipfile.ZIP_STORED
+                assert kinds[f"{name}/turns/001-head.jpg"] == zipfile.ZIP_STORED
+                assert kinds[f"{name}/events.jsonl"] == zipfile.ZIP_DEFLATED
+                assert TaskDownloads.trace_data(archive.read(f"{name}/trace.html").decode())["task"]["id"] == task_id
+            assert (directory / "events.jsonl").is_file()
             # Export leaves no copy of the task beside the history.
+            await removed(".download-*")
             await removed("*.zip*")
+            assert (await client.get(f"/api/history/{'0' * 32}/export")).status == 404
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("robot_name", ["yam"])
+def test_the_trace_page_holds_the_records_with_every_picture_inlined(console):
+    TaskDownloads.write(console.root)
+    task_id, name = TaskDownloads.TASK_ID, TaskDownloads.name()
+
+    async def scenario():
+        async with TestClient(TestServer(ServedConsole.app(console, "trace-token"))) as client:
+            url = f"/api/history/{task_id}/trace"
+            assert (await client.get(url)).status == 401
+            await client.post("/api/auth", json={"token": "trace-token"})
+            response = await client.get(url)
+            assert response.status == 200 and response.content_type == "text/html"
+            assert f'filename="{name}-trace.html"' in response.headers["Content-Disposition"]
+            page = await response.text()
+            # the page loads nothing: its script and styles are in it
+            assert 'src="/' not in page and 'href="/' not in page
+            trace = TaskDownloads.trace_data(page)
+            assert trace["robot"] == "YAM" and trace["task"]["instruction"] == "Lift the cup."
+            # a "</script>" of the records cannot close the page's script element
+            assert trace["system_prompt"] == "You drive a robot </script> safely."
+            [observation] = [event for event in trace["events"] if event["type"] == "observation"]
+            prefix = "data:image/jpeg;base64,"
+            assert observation["data"]["images"] == {
+                "head": prefix + base64.b64encode(b"today's jpeg").decode(),
+                "wrist": prefix + base64.b64encode(b"jpeg of before").decode(),
+            }
+            assert trace["token_usage"] == 1000
+            # a turn's frame is served from the turns' folder
+            frame = await client.get(f"/api/records/{task_id}/turns/001-head.jpg")
+            assert frame.status == 200 and await frame.read() == b"today's jpeg"
+            for bad in ("..", ".hidden", "002-head.jpg"):
+                assert (await client.get(f"/api/records/{task_id}/turns/{bad}")).status == 404
 
     asyncio.run(scenario())
 
