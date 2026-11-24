@@ -13,17 +13,21 @@ from imageio_ffmpeg import count_frames_and_secs, read_frames
 from console_rig import ConsoleRig, StandInModel
 from pear.deploy.station.control.schemas import Camera
 from pear.deploy.station.records.recording.ffmpeg import FRAME_RATE, VIDEO_SIZE, FFmpeg
+from pear.deploy.station.records.recording.motion_cut import MotionCut
 from pear.deploy.station.records.recording.recordings import Recordings
 from pear.deploy.station.records.task_files import TaskFiles
+from pear.deploy.station.records.video import render_job as render_job_module
 from pear.deploy.station.records.video import render_worker as render_worker_module
 from pear.deploy.station.records.video.action_code import ActionCode
 from pear.deploy.station.records.video.ink import Palette
-from pear.deploy.station.records.video.render_job import RenderedRecordings
+from pear.deploy.station.records.video.render_job import RenderedRecordings, RenderJob
+from pear.deploy.station.records.video.render_plan import RenderPlan
 from pear.deploy.station.records.video.render_worker import RenderWorker
 from pear.deploy.station.records.video.sources import SourceClip
 from pear.deploy.station.records.video.styled_frames import StyledFrames, StyledLayout
 from pear.deploy.station.records.video.styled_render import StyledRender
 from pear.deploy.station.records.video.task_timeline import TaskTimeline, TurnSpan
+from pear.utils.worker_process import WorkerProcess
 from recorded_task import RecordedTask, RecordingWaits, StandInSegment
 from stand_in_cameras import StandInCameras
 from waiting import Waiting
@@ -255,6 +259,7 @@ def test_merge_renders_segments_with_sources_and_skips_the_rest(tmp_path):
             "segments": {"full": ["001", "002", "003"], "motion": ["001", "003"]},
             "pending": None,
             "current": False,
+            "complete": False,
             "merged": None,
             "render": None,
         }
@@ -262,7 +267,7 @@ def test_merge_renders_segments_with_sources_and_skips_the_rest(tmp_path):
         recordings.request_render(task_id, MERGED)
         status = RecordingWaits.await_merged(recordings, task_id)
 
-        assert status["current"] is True and status["render"] is None
+        assert status["current"] is True and status["complete"] is True and status["render"] is None
         merged = status["merged"]
         folder = directory / "recordings" / "merged"
         assert merged["styled"] is True
@@ -380,6 +385,121 @@ def test_a_paused_segment_renders_its_own_videos_once_saved(tmp_path):
         recordings.close()
 
 
+class WatchedWorkerProcess(WorkerProcess):
+    """A render's worker process that counts the workers started."""
+
+    count = 0  # of the workers started; each test starts again from 0
+
+    def __init__(self, target, args, *rest, **keywords) -> None:
+        type(self).count += 1
+        super().__init__(target, args, *rest, **keywords)
+
+
+class WatchedPublish:
+    """The videos each publish of a render has made, in order."""
+
+    kinds: list[list[str]] = []  # of each publish; each test starts a new list
+
+    @classmethod
+    def watch(cls, monkeypatch) -> None:
+        """Makes every styled render keep the videos of each of its publishes."""
+        publish = StyledRender.publish
+
+        def watched(styled_render, render_results):
+            cls.kinds.append(list(render_results))
+            publish(styled_render, render_results)
+
+        monkeypatch.setattr(cls, "kinds", [])
+        monkeypatch.setattr(StyledRender, "publish", watched)
+
+
+def test_a_render_runs_as_many_chunks_as_the_host_allows_and_one_while_a_task_records(tmp_path, monkeypatch):
+    monkeypatch.setattr(WatchedWorkerProcess, "count", 0)
+    monkeypatch.setattr(render_job_module, "WorkerProcess", WatchedWorkerProcess)
+    monkeypatch.setattr(RenderJob, "worker_count", classmethod(lambda cls: 3))
+    monkeypatch.setattr(RenderPlan, "CHUNK_FRAMES", 4)  # 24 frames in 6 chunks, 8 moving in 2
+    WatchedPublish.watch(monkeypatch)
+    task_id = "c" * 32
+    task = RecordedTask(tmp_path / task_id)
+    started = task.copy_stored_task()
+    task.add_segment(1, 24, 8, started_monotonic_s=started)
+    recordings = RenderedRecordings(tmp_path, StandInCameras.ROW)
+    try:
+        # another task records: one chunk at a time, and the motion-only video is out first
+        recordings.active_segment = StandInSegment("b" * 32, "001")
+        recordings.request_render(task_id, "001")
+        row = RecordingWaits.await_styled(recordings, task_id, "001")
+        assert row["styled"]["frames"] == 24 and row["styled"]["motion_frames"] == 8
+        assert WatchedWorkerProcess.count == 1
+        assert WatchedPublish.kinds == [["motion"], ["motion", "full"]]
+
+        # nothing records: the host's room for three chunks at once
+        recordings.active_segment = None
+        task.add_segment(2, 6, started_monotonic_s=started + 24 / 30)
+        recordings.request_render(task_id, MERGED)
+        status = RecordingWaits.await_merged(recordings, task_id)
+        assert status["complete"] and status["merged"]["frames"] == 30
+        assert WatchedWorkerProcess.count == 1 + 3
+        folder = tmp_path / task_id / "recordings" / "merged"
+        assert sorted(path.name for path in folder.iterdir()) == [
+            "encoder.log",
+            "full.mp4",
+            "merged.json",
+            "motion.mp4",
+        ]
+    finally:
+        recordings.close()
+
+
+def test_the_worker_count_follows_the_cores_this_process_may_run_on(monkeypatch):
+    for cores, workers in ((1, 1), (5, 1), (6, 2), (14, 4), (32, 10)):
+        monkeypatch.setattr(render_job_module.os, "sched_getaffinity", lambda pid, cores=cores: set(range(cores)))
+        assert RenderJob.worker_count() == workers, cores
+
+
+def test_a_plan_cuts_each_video_into_chunks_of_one_clip(tmp_path, monkeypatch):
+    monkeypatch.setattr(RenderPlan, "CHUNK_FRAMES", 3)
+    clips = [SourceClip(0.0, 7 / 30, {}), SourceClip(10.0, 2 / 30, {})]
+    # frames 1-5 of the first clip move, and the second clip's first frame
+    plan = RenderPlan(("motion", "full"), clips, [(1 / 30, 6 / 30), (7 / 30, 8 / 30)])
+
+    assert [
+        (c.kind, c.index, c.clip_index, c.first_frame, c.end_frame, c.first_output, c.frame_count) for c in plan.chunks
+    ] == [
+        ("motion", 0, 0, 1, 4, 0, 3),
+        ("motion", 1, 0, 4, 6, 3, 2),
+        ("motion", 2, 1, 0, 1, 5, 1),
+        ("full", 0, 0, 0, 3, 0, 3),
+        ("full", 1, 0, 3, 6, 3, 3),
+        ("full", 2, 0, 6, 7, 6, 1),
+        ("full", 3, 1, 0, 2, 7, 2),
+    ]
+    assert [chunk.clip_start for chunk in plan.chunks if chunk.clip_index == 1] == [7, 7]
+    assert plan.clip_frames == {"motion": [5, 1], "full": [7, 2]}
+    assert (plan.frame_count("motion"), plan.frame_count("full")) == (6, 9)
+
+
+def test_videos_join_in_order_without_encoding_again(tmp_path):
+    folder = tmp_path / "a folder's name"
+    folder.mkdir()
+    paths = []
+    for number, levels in enumerate(([10, 20, 30], [40, 50])):
+        paths.append(folder / f"{number}.mp4")
+        RecordedTask._write_video(paths[-1], levels)
+
+    with (folder / "encoder.log").open("w") as log:
+        FFmpeg.join(FFmpeg.executable(), paths, folder / "list.tmp.txt", folder / "joined.mp4", log)
+
+    greys = [
+        round(float(np.frombuffer(frame, np.uint8).mean()))
+        for frame in list(read_frames(str(folder / "joined.mp4")))[1:]
+    ]
+    assert all(
+        abs(grey - level) <= StandInStyledFrames.GREY_TOLERANCE for grey, level in zip(greys, [10, 20, 30, 40, 50])
+    )
+    assert len(greys) == 5 and not (folder / "list.tmp.txt").exists()
+
+
 def test_no_render_starts_after_shutdown(tmp_path):
     task_id = "b" * 32
     recordings = RenderedRecordings(tmp_path, StandInCameras.ROW)
@@ -414,13 +534,66 @@ def test_saved_segments_become_clips_with_the_sources_on_disk(tmp_path):
     ]
 
 
-def test_every_camera_is_decoded_in_step_and_the_motion_video_gets_only_its_frames(tmp_path, stand_in_frames):
+class ChunkedRender:
+    """A styled render that a test runs in its own process, chunk after chunk, with the timeline it gives."""
+
+    @staticmethod
+    def run(merge: StyledRender, timeline: TaskTimeline) -> dict[str, int]:
+        """Renders, joins and publishes each video of ``merge``, the motion-only one first, and returns the frames each
+        worker reported_frames by video; the publish after the motion-only video is checked on the way."""
+        plan = RenderPlan(merge.kinds(), merge.clips, timeline.motion_spans)
+        messages = queue.Queue()
+        worker = RenderWorker(
+            merge.files.directory,
+            merge.clips,
+            StandInCameras.ROW,
+            merge.folder,
+            queue.Queue(),
+            messages,
+            FFmpeg.executable(),
+        )
+        worker.timeline = timeline
+        worker.cut = MotionCut(timeline.motion_spans, sum(plan.clip_frame_counts))
+        render_results = {}
+        with (merge.folder / "encoder.log").open("w") as log:
+            for kind in plan.kinds:
+                chunks = [chunk for chunk in plan.chunks if chunk.kind == kind]
+                for chunk in chunks:
+                    worker.render(chunk, log)
+                paths = [merge.folder / TaskFiles.chunk_video_name(kind, chunk.index) for chunk in chunks]
+                FFmpeg.join(
+                    FFmpeg.executable(), paths, merge.folder / TaskFiles.CHUNK_LIST_NAME, merge.partial_path(kind), log
+                )
+                for path in paths:
+                    path.unlink()
+                render_results[kind] = {"frames": plan.frame_count(kind), "clip_frames": plan.clip_frames[kind]}
+                merge.publish(render_results)
+                if kind == "motion":
+                    # the motion-only video is out before the full one is rendered
+                    status = merge.status()
+                    assert status["current"] is True and status["complete"] is False
+                    assert status["merged"]["motion"] == "motion.mp4" and status["merged"]["full"] is None
+                    assert not (merge.folder / "full.mp4").exists()
+
+        reported_frames = {kind: 0 for kind in plan.kinds}
+        while not messages.empty():
+            message = messages.get_nowait()
+            reported_frames[message["kind"]] += message["frames"]
+        return reported_frames
+
+
+def test_every_camera_is_decoded_in_step_and_the_motion_video_gets_only_its_frames(
+    tmp_path, stand_in_frames, monkeypatch
+):
+    # chunks of three frames: the second chunk of each clip starts its decoding at a later frame
+    monkeypatch.setattr(RenderPlan, "CHUNK_FRAMES", 3)
     directory = tmp_path / ("b" * 32)
     task = RecordedTask(directory)
-    # Flat pictures whose brightness names the clip, the camera and the frame.
+    # Flat pictures whose brightness names the clip, the camera and the frame; the timeline below gives the motion.
     task.add_segment(
         1,
         6,
+        2,
         started_monotonic_s=10.0,
         grey_levels={
             "left": [20 + 20 * k for k in range(6)],
@@ -428,7 +601,8 @@ def test_every_camera_is_decoded_in_step_and_the_motion_video_gets_only_its_fram
             "right": [100 + 10 * k for k in range(6)],
         },
     )
-    # The second clip has no overhead source, and its right one is two frames short: its last picture stays.
+    # The second clip has no overhead source, and its right one is two frames short: its last picture stays in its
+    # chunk, and a chunk that begins past it shows that camera as missing.
     task.add_segment(
         2, 4, started_monotonic_s=20.0, grey_levels={"left": [30 + 25 * k for k in range(4)], "right": [60, 90]}
     )
@@ -446,54 +620,51 @@ def test_every_camera_is_decoded_in_step_and_the_motion_video_gets_only_its_fram
         motion_spans=[(1 / 30, 3 / 30), (8 / 30, 10 / 30)],
     )
     manifests = Recordings(tmp_path, StandInCameras.ROW).manifests_of_task(directory.name)
-    merge, messages = StyledRender(TaskFiles(directory), manifests, MERGED), queue.Queue()
+    merge = StyledRender(TaskFiles(directory), manifests, MERGED)
     merge.folder.mkdir()
-    worker = RenderWorker(directory, merge.clips, StandInCameras.ROW, merge.folder, messages, FFmpeg.executable())
+    assert merge.kinds() == ("motion", "full")
 
-    with (merge.folder / "encoder.log").open("w") as log:
-        rendered = worker.render(timeline, log)
+    reported_frames = ChunkedRender.run(merge, timeline)
 
-    assert rendered == {"frames": 10, "motion_frames": 4, "clip_motion_frames": [2, 2]}
-    full, motion = stand_in_frames
+    assert reported_frames == {"motion": 4, "full": 10}
+    motion, full = stand_in_frames
     assert full.header == motion.header == (INSTRUCTION, "Model", "xhigh")
     assert full.turns == turns and full.duration_s == 10 / 30
     assert full.times == [n / 30 for n in range(10)]
     expected = [{"left": 20 + 20 * k, "top": 200 - 20 * k, "right": 100 + 10 * k} for k in range(6)]
     # The second clip has no overhead source: the frames show that camera as missing.
-    expected += [{"left": 30 + 25 * k, "right": 60 if k == 0 else 90} for k in range(4)]
+    expected += [{"left": 30 + 25 * k, "right": 60 if k == 0 else 90} for k in range(3)] + [{"left": 30 + 25 * 3}]
     assert StandInStyledFrames.close_to(full.pictures, expected)
-    # The motion-only video runs on the timeline's own motion-only timeline.
+    # The motion-only video runs on the timeline's own motion-only timeline, and decodes only the frames it keeps:
+    # the right camera's video ends before the second clip's kept frames, which show it as missing.
     motion_timeline = timeline.cut_to_motion()
     assert (motion.turns, motion.duration_s) == (motion_timeline.turns, motion_timeline.duration_s)
     assert motion.times == [n / 30 for n in range(4)]
-    assert StandInStyledFrames.close_to(motion.pictures, [expected[n] for n in (1, 2, 8, 9)])
-    assert [messages.get_nowait()["progress"] for _ in range(messages.qsize())] == [0.4, 0.8]
+    kept_pictures = [expected[1], expected[2], *({"left": expected[n]["left"]} for n in (8, 9))]
+    assert StandInStyledFrames.close_to(motion.pictures, kept_pictures)
     for kind, frames in (("full", 10), ("motion", 4)):
-        assert FFmpeg.packet_count(FFmpeg.executable(), merge.folder / f"{kind}.partial.mp4") == frames
+        assert FFmpeg.packet_count(FFmpeg.executable(), merge.folder / f"{kind}.mp4") == frames
 
-    merge.publish(rendered)
-
-    manifest = merge.status()["merged"]
+    status = merge.status()
+    assert status["current"] is True and status["complete"] is True
+    manifest = status["merged"]
     assert manifest["segments"] == {
         "full": [{"id": "001", "start_frame": 0, "frames": 6}, {"id": "002", "start_frame": 6, "frames": 4}],
         "motion": [{"id": "001", "start_frame": 0, "frames": 2}, {"id": "002", "start_frame": 2, "frames": 2}],
     }
     assert manifest["motion_duration_s"] == 4 / 30
-    assert sorted(p.name for p in merge.folder.iterdir()) == [
-        "encoder.log",
-        "full.mp4",
-        "merged.json",
-        "motion.mp4",
-    ]
+    merge.discard()
+    assert sorted(p.name for p in merge.folder.iterdir()) == ["encoder.log", "full.mp4", "merged.json", "motion.mp4"]
 
 
 def test_a_task_without_motion_publishes_no_motion_video(tmp_path, stand_in_frames):
     directory = tmp_path / ("c" * 32)
     RecordedTask(directory).add_segment(1, 5, started_monotonic_s=10.0)
     manifests = Recordings(tmp_path, StandInCameras.ROW).manifests_of_task(directory.name)
-    merge, messages = StyledRender(TaskFiles(directory), manifests, MERGED), queue.Queue()
+    merge = StyledRender(TaskFiles(directory), manifests, MERGED)
     merge.folder.mkdir()
     (merge.folder / "motion.mp4").write_bytes(b"from an earlier merge")
+    assert merge.kinds() == ("full",)
     timeline = TaskTimeline(
         instruction=INSTRUCTION,
         model_label="Model",
@@ -502,13 +673,11 @@ def test_a_task_without_motion_publishes_no_motion_video(tmp_path, stand_in_fram
         turns=[TurnSpan(1, 0.0, 5 / 30, None, None)],
         motion_spans=[],
     )
-    worker = RenderWorker(directory, merge.clips, StandInCameras.ROW, merge.folder, messages, FFmpeg.executable())
 
-    with (merge.folder / "encoder.log").open("w") as log:
-        rendered = worker.render(timeline, log)
-    merge.publish(rendered)
+    reported_frames = ChunkedRender.run(merge, timeline)
 
-    assert len(stand_in_frames) == 1 and rendered["clip_motion_frames"] == [0]
+    assert len(stand_in_frames) == 1 and reported_frames == {"full": 5}
+    assert merge.status()["complete"] is True
     manifest = merge.status()["merged"]
     assert manifest["motion"] is None and manifest["motion_frames"] == 0
     assert manifest["skipped"]["motion"] == [{"id": "001", "reason": "no motion"}]

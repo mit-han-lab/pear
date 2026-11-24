@@ -11,6 +11,7 @@ from pear.deploy.station.agent_loop.agent_loop import StationAgentLoop
 from pear.deploy.station.agent_loop.clients.schemas import ModelOutput
 from pear.deploy.station.control.motion.kinematics import UnreachablePoseError
 from pear.deploy.station.control.robots.yam.motion.actions import BimanualDelta
+from pear.deploy.station.exceptions import OperatorPaused
 from pear.deploy.station.gui.console.phase import Phase
 from pear.deploy.station.gui.console.task_run import TaskRun
 from pear.deploy.station.records.task_events import TaskEvents
@@ -43,7 +44,19 @@ LIFT_Z = 0.3  # z delta of the late reply
 REBASED_POSITION = 0.16  # joint position the right arm is moved to before recovery
 RESUME_DELAY_S = 0.03  # inference delay of the model that resumes after recovery
 SESSION_TIMEOUT_S = 60  # how long the model of a session made by hand may take to answer
+
+
 # the console of the hold-fault tests settles fast, so that a hold that keeps moving faults soon
+class TaskJournal:
+    """What a console's task saved in its event file, read back by kind."""
+
+    @staticmethod
+    def data(console, kind: str) -> list[dict]:
+        """Returns the data of each saved event of ``kind`` of the console's task, in order."""
+        path = console.root / console.task_run.task["id"] / TaskFiles.EVENTS_NAME
+        return [event["data"] for event in TaskEvents(path).read() if event["type"] == kind] if path.exists() else []
+
+
 HOLD_FAULT_OVERRIDES = (
     f"control.settle_timeout_s={FAULT_SETTLE_TIMEOUT_S}",
     f"control.settle_window_s={FAULT_SETTLE_WINDOW_S}",
@@ -254,14 +267,14 @@ def test_pause_during_settling_fails_the_turn_as_paused_and_resume_steps_again(r
 
 def test_journal_failure_prevents_model_and_motion(enabled_console, monkeypatch):
     c = enabled_console
-    original = TaskFiles.write_json
+    original = TaskEvents.append
 
-    def fail(path, *args, **kwargs):
-        if "-observation.json" in path.name:
+    def fail(events, event):
+        if event["type"] == "observation":
             raise OSError("Simulated disk full")
-        return original(path, *args, **kwargs)
+        return original(events, event)
 
-    monkeypatch.setattr(TaskFiles, "write_json", fail)
+    monkeypatch.setattr(TaskEvents, "append", fail)
     before = c.robot.observe()["joint_positions"].copy()
     c.commands.run("start", {"instruction": "Hold"})
     Waiting.until(lambda: not c.is_busy, ConsoleRig.WAIT_S, ConsoleRig.POLL_S)
@@ -359,11 +372,9 @@ def test_hold_fault_survives_gui_cancellation_at_each_boundary(holding_gui, monk
         if order != "policy_first":
             assert boundary.is_set()
         detail = runtime.snapshot()["fault_details"]
-        result_files = list((c.root / c.task_run.task["id"]).glob("*-result.json"))
-        assert len(result_files) == 1
-        result = json.loads(result_files[0].read_text())
+        [result] = TaskJournal.data(c, "execution")
         request = c.task_run.session.last_turn
-        assert result["turn_id"] == request.attempt_id
+        assert result["attempt"] == request.attempt_id
         assert result["status"] == "failed" and not result["settled"] and not result["reached"]
         assert result["error"] == {"code": "StabilityError", "message": detail["message"]}
         assert c.task_run.active_turn["phase"] == "Failed" and c.phase == "Fault"
@@ -404,7 +415,7 @@ def test_operator_pause_without_fault_keeps_interrupted_result(holding_gui):
     release.set()
     assert replied.wait(FAULT_WAIT_S)
     Waiting.until(lambda: not c.is_busy, ConsoleRig.WAIT_S, ConsoleRig.POLL_S)
-    result = json.loads(next((c.root / c.task_run.task["id"]).glob("*-result.json")).read_text())
+    [result] = TaskJournal.data(c, "execution")
     assert result["error"]["code"] == "OperatorPaused"
     assert c.task_run.active_turn["phase"] == "Interrupted"
     assert runtime.status == "HOLD" and runtime.snapshot()["fault_details"] is None
@@ -445,7 +456,7 @@ def test_fault_before_new_request_does_not_rewrite_previous_turn(holding_gui, mo
     Waiting.until(lambda: runtime.status == "FAULT" and not c.is_busy, ConsoleRig.WAIT_S, ConsoleRig.POLL_S)
     assert c.task_run.session.last_turn is old_request and c.task_run.session.turn_count == sequence
     assert c.task_run.session.previous_result == previous
-    assert not list((c.root / c.task_run.task["id"]).glob("*-result.json"))
+    assert not TaskJournal.data(c, "execution")
     assert c.task_run.active_turn["phase"] == "Failed" and c.phase == "Fault"
     assert any(e["type"] == "diagnostic" for e in c.events)
     assert not any(e["type"] in ("action", "execution", "interrupted") for e in c.events)
@@ -490,7 +501,7 @@ def test_recover_retains_task_and_uses_fresh_observation(holding_gui, monkeypatc
     else:
         assert len(runtime.driver.sent_targets) == before
     before, targets = len(runtime.driver.sent_targets), dict(runtime.targets)
-    failed_result = json.loads(next((c.root / task["id"]).glob("*-result.json")).read_text())
+    [failed_result] = TaskJournal.data(c, "execution")
     observed = []
     demo = StandInModel(c, delay_s=RESUME_DELAY_S, is_moving=False)(c.model, task["instruction"])
 
@@ -507,8 +518,59 @@ def test_recover_retains_task_and_uses_fresh_observation(holding_gui, monkeypatc
     assert "StabilityError" in observed[0].text
     assert c.task_run.task is task and c.task_run.session is session
     assert runtime.targets == targets and len(runtime.driver.sent_targets) == before
-    saved = [json.loads(p.read_text()) for p in (c.root / task["id"]).glob("*-result.json")]
-    assert failed_result in saved
+    assert failed_result in TaskJournal.data(c, "execution")
+
+
+def test_turns_are_named_by_number_and_save_their_frames_in_the_turns_folder(enabled_console):
+    c = enabled_console
+    c.commands.run("start", {"instruction": "Hold"})
+    Waiting.until(lambda: c.task_run.total_steps >= 2, ConsoleRig.WAIT_S, ConsoleRig.POLL_S)
+    c.commands.run("pause", None)
+    Waiting.until(lambda: not c.is_busy, ConsoleRig.WAIT_S, ConsoleRig.POLL_S)
+    files = TaskFiles(c.root / c.task_run.task["id"])
+
+    starts = TaskJournal.data(c, "turn_started")
+    assert [start["attempt"] for start in starts] == [f"{n:03d}" for n in range(1, len(starts) + 1)]
+    observations = TaskJournal.data(c, "observation")
+    cameras = [camera.name for camera in c.robot.CAMERAS]
+    for observation in observations:
+        assert sorted(observation["images"]) == sorted(cameras) and "details_url" not in observation
+        for camera, url in observation["images"].items():
+            name = f"{observation['attempt']}-{camera}.jpg"
+            assert url == f"/api/records/{files.directory.name}/turns/{name}"
+            assert (files.turns_directory / name).is_file()
+    # the events hold every record of a turn: no file beside them repeats one
+    records = {path.name for path in files.directory.iterdir() if path.is_file()}
+    assert records == {TaskFiles.TASK_NAME, TaskFiles.SESSION_NAME, TaskFiles.EVENTS_NAME}
+    assert all("dispatched" in result for result in TaskJournal.data(c, "execution"))
+
+
+def test_streamed_text_is_kept_only_by_the_answer_or_the_end_of_an_unanswered_turn(enabled_console):
+    c = enabled_console
+    c.task_run.task = {"id": "a" * 32, "instruction": "Hold", "model": "demo"}
+    (c.root / c.task_run.task["id"]).mkdir()
+    for attempt, is_answered in (("001", True), ("002", False)):
+        c.task_run.active_attempt_id = attempt
+        c.task_run.active_turn = {"attempt": attempt, "turn_number": int(attempt), "phase": "Thinking"}
+        c.task_run.streamed_text = {}
+        c.task_run.on_event(c.cancellation, attempt, "reasoning_delta", {"text": "Look ", "reasoning_kind": "raw"})
+        c.task_run.on_event(c.cancellation, attempt, "reasoning_delta", {"text": "closer."})
+        c.task_run.on_event(c.cancellation, attempt, "answer_delta", {"text": "Mov"})
+        if is_answered:
+            c.task_run.on_event(
+                c.cancellation, attempt, "model_output", {"reasoning": "Look closer.", "answer": "Move"}
+            )
+    # the page saw every piece as it streamed
+    assert sum(e["type"] == "reasoning_delta" for e in c.events) == 4
+
+    c.task_run._end_turn(OperatorPaused("paused"), is_unfinished=True)
+
+    saved = [event["type"] for event in TaskEvents(c.root / c.task_run.task["id"] / "events.jsonl").read()]
+    assert "reasoning_delta" not in saved and "answer_delta" not in saved
+    [partial] = TaskJournal.data(c, "model_text")
+    assert partial["attempt"] == "002"
+    assert (partial["reasoning"], partial["answer"], partial["reasoning_kind"]) == ("Look closer.", "Mov", "raw")
+    c.task_run.task = c.task_run.active_turn = None
 
 
 def test_live_metrics_of_the_current_attempt_stay_in_memory_and_only_final_ones_are_journaled(enabled_console):
@@ -686,16 +748,45 @@ def test_ik_retry_observes_again_resets_after_success_and_numbers_every_attempt(
     assert "Previous execution:" not in observations[3]["text"]
     assert "Previous execution:" in observations[4]["text"]
     # Omitting model-facing feedback must not remove any successful execution data.
-    root = c.root / c.task_run.task["id"]
     success = starts[2]["attempt"]
     previous = observations[3]["previous_result"]
-    saved_result = json.loads((root / f"{success}-result.json").read_text())
-    saved_observation = json.loads((root / f"{starts[3]['attempt']}-observation.json").read_text())
     execution = next(e["data"] for e in events if e["type"] == "execution" and e["data"]["attempt"] == success)
-    assert saved_observation["previous_result"] == previous
     assert previous["measured_state"] is not None and previous["measured_position"] is not None
-    assert all(saved_result[k] == value == execution[k] for k, value in previous.items())
+    assert all(execution[k] == value for k, value in previous.items())
     assert "IK target" in c.error
+
+
+@pytest.mark.parametrize("robot_name", ["so101", "yam"])
+def test_an_ik_rejection_read_from_an_unsettled_hold_is_retried_too(enabled_console, monkeypatch):
+    c = enabled_console
+    execute, failure_result = c.robot.execute, c.robot.failure_result
+    attempts = []
+
+    def unreachable_once(action, **kwargs):
+        attempts.append(kwargs["reference_observation"]["observation_id"])
+        if len(attempts) == 1:
+            raise UnreachablePoseError("IK target outside reachable workspace")
+        return execute(action, **kwargs)
+
+    def unsettled(error, **kwargs):
+        # the rejection's snapshot read the hold while its stability window did not confirm it: nothing moved
+        return replace(failure_result(error, **kwargs), is_settled=False)
+
+    monkeypatch.setattr(c.robot, "execute", unreachable_once)
+    monkeypatch.setattr(c.robot, "failure_result", unsettled)
+    c.commands.run("start", {"instruction": "Hold"})
+    Waiting.until(lambda: c.task_run.total_steps >= 1 or not c.is_busy, ConsoleRig.WAIT_S, ConsoleRig.POLL_S)
+    c.commands.run("pause", None)
+    Waiting.until(lambda: not c.is_busy, ConsoleRig.WAIT_S, ConsoleRig.POLL_S)
+
+    rejection, *later_results = TaskJournal.data(c, "execution")
+    assert rejection["status"] == "rejected" and rejection["settled"] is False
+    assert rejection["error"]["code"] == "UnreachablePoseError"
+    # the turn after it observed again and its action ran: the task did not pause on the rejection
+    assert [notice["retry"] for notice in TaskJournal.data(c, "notice")] == [1]
+    assert later_results and later_results[0]["status"] == "completed" and c.task_run.total_steps >= 1
+    assert len(set(attempts)) == len(attempts) >= 2
+    assert not c.task_run.resume_pending
 
 
 @pytest.mark.parametrize("failure", [ValueError("Joint limit exceeded"), RuntimeError("Feedback unavailable")])

@@ -16,12 +16,13 @@ type TurnCardProps = {
   phase?: string;
   format?: string;
   connected?: boolean;
+  isOpen?: boolean; // whether the thought and what the model saw start unfolded
 };
 
 /** One model turn: its thought, answer and action and what the action did; what the model saw folds away. */
-export function TurnCard({turn: t, active, phase, format, connected = true}: TurnCardProps) {
-  const [thoughtOpen, setThoughtOpen] = useState(false);
-  const [detailsOpen, setDetailsOpen] = useState(false);
+export function TurnCard({turn: t, active, phase, format, connected = true, isOpen = false}: TurnCardProps) {
+  const [thoughtOpen, setThoughtOpen] = useState(isOpen);
+  const [detailsOpen, setDetailsOpen] = useState(isOpen);
   const {text, block} = Turns.split(t.answer);
   const thought = t.answered && t.inferenceStarted ? t.answered - t.inferenceStarted : null;
   const generated = Turns.generated(t);

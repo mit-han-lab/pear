@@ -65,7 +65,6 @@
   border-radius: 50%;
   background: var(--surface);
   color: var(--text-body);
-  font-size: 0; /* the button text stays only as its accessible name */
 }
 .composer-pill {
   display: flex;

@@ -168,7 +168,7 @@ class StationAgentLoop:
         self.client = client
         self.action_format = action_format
         self.timeout_s = timeout_s  # how long the model may take to answer a turn
-        self.directory = Path(directory)  # the task's folder, where each turn's camera frames are saved
+        self.directory = Path(directory)  # where each turn's camera frames are saved
         # the task's images, in every turn's input; a client sends them once
         self.reference_images = tuple(reference_images)
         self.episode_id = str(uuid4())  # the session's identity, which its records carry

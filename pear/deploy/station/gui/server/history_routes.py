@@ -1,12 +1,13 @@
 import asyncio
 import json
 import re
+from pathlib import Path
 from typing import Any
 
 from aiohttp import web
 
 from pear.deploy.station.gui.console.console import Console
-from pear.deploy.station.gui.console.task_run import RECORD_URL
+from pear.deploy.station.gui.console.task_run import RECORD_URL, TURN_IMAGE_URL
 from pear.deploy.station.records.annotations import Annotations
 from pear.deploy.station.records.task_events import TaskEvents
 from pear.deploy.station.records.task_files import TaskFiles
@@ -31,7 +32,6 @@ class HistoryRoutes(TaskRoutes):
     """The list of the tasks, their tags, and the events, recordings and records of a past task."""
 
     RECORD_NAME_PATTERN = re.compile(r"[a-zA-Z0-9_.-]+")  # the name of a file of a task's folder that may be served
-    EVENT_PAGE_SIZE = 100  # events one request reads, unless it asks for all
 
     def add_routes(self, router: web.UrlDispatcher) -> None:
         """Adds the routes to ``router``."""
@@ -45,6 +45,7 @@ class HistoryRoutes(TaskRoutes):
         router.add_post("/api/history/{task_id}/recordings/merged", self.render_merged_recordings)
         router.add_post("/api/history/{task_id}/recordings/{segment}/styled", self.styled_recording)
         router.add_get(RECORD_URL, self.record)
+        router.add_get(TURN_IMAGE_URL, self.turn_image)
 
     async def history(self, request: web.Request) -> web.Response:
         """Answers every task's record with its tags, the latest first."""
@@ -72,12 +73,12 @@ class HistoryRoutes(TaskRoutes):
         return web.json_response(annotations)
 
     async def events(self, request: web.Request) -> web.Response:
-        """Answers a page of a task's events after the event the request names, or all of them."""
+        """Answers the events of a task that the page shows."""
         files = self.task_files(request)
-        after_id = int(request.query.get("after", "0"))
-        limit = None if request.query.get("all") == "1" else self.EVENT_PAGE_SIZE
+        if not files.events_path.exists():
+            return web.json_response([])
 
-        return web.json_response(await asyncio.to_thread(self.read_events, files, after_id, limit))
+        return web.json_response(await asyncio.to_thread(TaskEvents(files.events_path).read_shown))
 
     async def recordings(self, request: web.Request) -> web.Response:
         """Answers the manifests of a task's recording segments."""
@@ -115,15 +116,11 @@ class HistoryRoutes(TaskRoutes):
 
     async def record(self, request: web.Request) -> web.FileResponse:
         """Answers one file of a task's folder."""
-        files = self.task_files(request)
-        name = request.match_info["name"]
-        if not self.RECORD_NAME_PATTERN.fullmatch(name) or name.startswith("."):
-            raise web.HTTPNotFound()
-        path = files.directory / name
-        if not path.is_file():
-            raise web.HTTPNotFound()
+        return self._send_file(self.task_files(request).directory, request.match_info["name"])
 
-        return web.FileResponse(path)
+    async def turn_image(self, request: web.Request) -> web.FileResponse:
+        """Answers a camera frame one of a task's turns showed the model."""
+        return self._send_file(self.task_files(request).turns_directory, request.match_info["name"])
 
     def all_tasks(self) -> list[dict[str, Any]]:
         """Returns every task's record with its tags, the latest first."""
@@ -133,16 +130,10 @@ class HistoryRoutes(TaskRoutes):
         )
         return [{**json.loads(path.read_text()), **Annotations.read(TaskFiles(path.parent))} for path in paths]
 
-    @staticmethod
-    def read_events(files: TaskFiles, after_id: int, limit: int | None) -> list[dict[str, Any]]:
-        """Returns the task's events after the event ``after_id``, at most ``limit`` of them (None: all), each event of
-        a turn with the turn's number."""
-        events = []
-        if files.events_path.exists():
-            for event in TaskEvents(files.events_path).read_numbered():
-                if event["id"] > after_id:
-                    events.append(event)
-                    if len(events) == limit:
-                        break
+    def _send_file(self, folder: Path, name: str) -> web.FileResponse:
+        """Answers the file ``name`` of ``folder``; a name that is not a plain file's is not found."""
+        path = folder / name
+        if not self.RECORD_NAME_PATTERN.fullmatch(name) or name.startswith(".") or not path.is_file():
+            raise web.HTTPNotFound()
 
-        return events
+        return web.FileResponse(path)

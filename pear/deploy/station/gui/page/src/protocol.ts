@@ -138,15 +138,18 @@ export type RecordingSegment = {
 /** A render of styled videos still under way, or the last one, which failed. */
 export type VideoRender = {
   status: 'waiting' | 'queued' | 'rendering' | 'failed';
+  /** The video being rendered: the motion-only one comes first, the full one ends the render. */
+  kind: 'motion' | 'full' | null;
   progress: number | null;
   error: string | null;
 };
 
 export type MergedRecording = {
   created: number;
-  full: string;
+  /** Null while the render that published the motion-only video still renders the full one. */
+  full: string | null;
   motion: string | null;
-  duration_s: number;
+  duration_s: number | null;
   motion_duration_s: number;
   segments: {full: {id: string}[]; motion: {id: string}[]};
   skipped: {full: Skip[]; motion: Skip[]};
@@ -157,6 +160,8 @@ export type MergeState = {
   segments: {full: string[]; motion: string[]};
   pending: string | null;
   current: boolean;
+  /** Whether `merged` holds the full video too, which ends a render. */
+  complete: boolean;
   merged: MergedRecording | null;
   render?: VideoRender | null;
 };

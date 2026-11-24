@@ -1,4 +1,3 @@
-import threading
 from typing import Any
 
 from pear.deploy.station.agent_loop.clients.schemas import ModelEvent, Usage
@@ -7,43 +6,28 @@ from pear.deploy.station.records.task_events import TaskEventKind
 
 
 class ContextUsage:
-    """The tokens a model's context held at its latest report and the tokens of the current turn, followed over the
-    events of one task."""
+    """The tokens a model's context held at its latest report, followed over the events of one task."""
 
     METRIC_KEYS = ("input", "output", "context_limit")  # the counts read from a capacity or usage event
 
     def __init__(self) -> None:
-        self.lock = threading.Lock()  # held while one event is followed
-        self.task_id: str | None = None  # of the task the reports belong to
         self.episode_id: str | None = None  # of the model session the reports belong to
         self._reset()
 
-    def on_event(self, kind: str, data: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-        """Follows one event of the task and returns the latest context and the current turn's usage, each None
-        while there is none."""
-        with self.lock:
-            if kind in (TaskEventKind.TASK, TaskEventKind.TASK_END):
-                self._reset()
-                self.task_id, self.episode_id = data.get("id"), None
-            elif kind == TaskEventKind.SESSION:
-                self._reset()
-                self.episode_id = data.get("episode_id")
-            elif kind == TaskEventKind.TURN_STARTED:
-                self._start_turn(data)
-            elif self.attempt_id and data.get("attempt") == self.attempt_id:
-                self._record(kind, data)
+    def on_event(self, kind: str, data: dict[str, Any]) -> dict[str, Any] | None:
+        """Follows one event of the task and returns the latest context, None while there is none."""
+        if kind in (TaskEventKind.TASK, TaskEventKind.TASK_END):
+            self._reset()
+            self.episode_id = None
+        elif kind == TaskEventKind.SESSION:
+            self._reset()
+            self.episode_id = data.get("episode_id")
+        elif kind == TaskEventKind.TURN_STARTED:
+            self._start_turn(data)
+        elif self.attempt_id and data.get("attempt") == self.attempt_id:
+            self._record(kind, data)
 
-            # the two are replaced, never changed, so a frame that was given one keeps its values
-            return self.latest_context, self.turn_usage
-
-    def context_for_task(self, task_id: str) -> dict[str, Any] | None:
-        """Returns the latest context of the task ``task_id``; the reports of another task are forgotten first."""
-        with self.lock:
-            if task_id != self.task_id:
-                self._reset()
-                self.task_id, self.episode_id = task_id, None
-
-            return self.latest_context
+        return self.latest_context
 
     def _reset(self) -> None:
         """Forgets every report."""
@@ -51,7 +35,6 @@ class ContextUsage:
         self.request_id: str | None = None  # of the current turn's request
         self.turn_number: int | None = None
         self.latest_context: dict[str, Any] | None = None  # the context's tokens at the latest report
-        self.turn_usage: dict[str, Any] | None = None  # the tokens of the current turn's request
         # the counts of the current turn's capacity and usage events
         self.capacity: dict[str, int | None] = {}
         self.usage: dict[str, int | None] = {}
@@ -64,7 +47,6 @@ class ContextUsage:
         self.episode_id = data.get("episode_id")
         self.attempt_id, self.turn_number = data["attempt"], data["turn_number"]
         self.request_id = None
-        self.turn_usage = None
         self.capacity, self.usage = {}, {}
 
     def _record(self, kind: str, data: dict[str, Any]) -> None:
@@ -81,18 +63,6 @@ class ContextUsage:
         """Takes a usage report of a service that measures the context apart from the request's own tokens."""
         context = usage["context"]
         metadata = {"turn_number": self.turn_number, "episode_id": self.episode_id, "request_id": self.request_id}
-        input_tokens, output_tokens = usage.get("input"), usage.get("output")
-
-        self.turn_usage = {
-            **metadata,
-            "input": input_tokens,
-            "output": output_tokens,
-            "tokens": input_tokens + output_tokens if input_tokens is not None and output_tokens is not None else None,
-            "partial": bool(usage.get("partial")),
-            "final": usage.get("final", True),
-            "compaction": dict(usage.get("compaction", {})),
-        }
-
         self.latest_context = {
             **metadata,
             **context,
@@ -130,4 +100,3 @@ class ContextUsage:
             "episode_id": self.episode_id,
             "request_id": self.request_id,
         }
-        self.turn_usage = self.latest_context

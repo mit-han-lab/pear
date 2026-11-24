@@ -31,24 +31,6 @@
     "type"
    ]
   },
-  "answer_delta": {
-   "event": [
-    "data",
-    "id",
-    "monotonic_s",
-    "task_id",
-    "time",
-    "type"
-   ],
-   "data": [
-    "attempt",
-    "episode_id",
-    "phase",
-    "started_at",
-    "text",
-    "turn_number"
-   ]
-  },
   "execution": {
    "event": [
     "data",
@@ -136,26 +118,6 @@
     "episode_id",
     "phase",
     "started_at",
-    "turn_number"
-   ]
-  },
-  "reasoning_delta": {
-   "event": [
-    "data",
-    "id",
-    "monotonic_s",
-    "task_id",
-    "time",
-    "type"
-   ],
-   "data": [
-    "attempt",
-    "episode_id",
-    "phase",
-    "reasoning_kind",
-    "simulated",
-    "started_at",
-    "text",
     "turn_number"
    ]
   },

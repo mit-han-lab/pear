@@ -1,5 +1,5 @@
 import {useEffect, useRef, useState} from 'react';
-import {Archive, Download, Film, Layers, LoaderCircle, Video, X} from 'lucide-react';
+import {Download, Film, Layers, LoaderCircle, Video, X} from 'lucide-react';
 import {Api} from './api';
 import type {MergedRecording, MergeState, RecordingSegment, Skip, VideoRender} from './protocol';
 import './Recordings.css';
@@ -11,7 +11,8 @@ const RENDER_STAGES: Record<string, string> = {
   queued: 'Queued',
   rendering: 'Generating',
 };
-const duration = (seconds?: number) => (seconds == null ? '' : `${seconds.toFixed(1)} s`);
+const RENDER_KINDS: Record<string, string> = {motion: 'motion only', full: 'full video'};
+const duration = (seconds?: number | null) => (seconds == null ? '' : `${seconds.toFixed(1)} s`);
 const segmentCount = (count: number) => `${count} ${count === 1 ? 'segment' : 'segments'}`;
 const segmentNames = (ids: string[]) => `${ids.length === 1 ? 'segment' : 'segments'} ${ids.map(Number).join(', ')}`;
 const inProgress = (render?: VideoRender | null) => (render && render.status !== 'failed' ? render : null);
@@ -26,9 +27,11 @@ function skipNote(label: string, rows: Skip[]) {
 /** Where a render of styled videos is, with its progress. */
 function RenderStage({render}: {render: VideoRender}) {
   const percent = render.progress == null ? '' : ` ${Math.round(render.progress * 100)}%`;
+  const kind = render.status === 'rendering' && render.kind ? ` ${RENDER_KINDS[render.kind]}` : '';
   return (
     <>
       <LoaderCircle className="spin" size={12} /> {RENDER_STAGES[render.status]}
+      {kind}
       {percent}
     </>
   );
@@ -137,7 +140,7 @@ export function Recordings({taskId}: {taskId?: string}) {
   const mergeRender = inProgress(merge?.render);
   // A single segment's own videos are the task's; merging starts at two.
   const showMerge = !!merge && (merge.segments.full.length > 1 || !!mergeRender);
-  const canMerge = !!merge && !merge.current && merge.segments.full.length > 1 && !mergeRender;
+  const canMerge = !!merge && !merge.complete && merge.segments.full.length > 1 && !mergeRender;
   return (
     <section className="recordings" aria-label="Task recordings">
       <div className="recordings-title">
@@ -187,7 +190,7 @@ export function Recordings({taskId}: {taskId?: string}) {
                 <span>Rendered when the task ends: one full and one motion-only video of all segments</span>
               )
             )}
-            {joined && !joined.motion && <span>No motion in any segment</span>}
+            {joined?.full && !joined.motion && <span>No motion in any segment</span>}
           </div>
           {canMerge && merge.pending && (
             <p className="recording-note">Available after segment {Number(merge.pending)} finishes.</p>
@@ -212,7 +215,7 @@ export function Recordings({taskId}: {taskId?: string}) {
         const rendering = inProgress(row.render);
         const isSaved = row.status === 'saved';
         // A segment recorded before styled videos, or whose render failed, renders on request.
-        const canRender = isSaved && !row.styled && !rendering;
+        const canRender = isSaved && !row.styled?.full && !rendering;
         return (
           <div className="recording-row" key={row.id}>
             <div>
@@ -236,18 +239,7 @@ export function Recordings({taskId}: {taskId?: string}) {
                   onPlay={setPlaying}
                 />
               )}
-              {row.styled && !row.styled.motion && <span>No motion in this segment</span>}
-              {(isSaved || row.status === 'failed') && (
-                <a
-                  className="recording-source"
-                  aria-label={`Download source files segment ${number}`}
-                  title="Camera videos without captions, timeline and task records for re-editing"
-                  href={`/api/recordings/${taskId}/${row.id}/source.zip`}
-                >
-                  <Archive size={15} />
-                  Source files
-                </a>
-              )}
+              {row.styled?.full && !row.styled.motion && <span>No motion in this segment</span>}
               {row.status === 'recording' && (
                 <span>{duration(row.duration_s)} · Recording cameras and model actions</span>
               )}

@@ -30,25 +30,6 @@
   color: var(--text-hint);
   font-size: 12px;
 }
-.history-footer {
-  display: flex;
-  justify-content: space-between;
-  margin: 20px 0;
-  font-size: 11px;
-}
-.history-footer a {
-  display: flex;
-  gap: 7px;
-  text-decoration: none;
-  color: var(--accent-green);
-}
-.history-footer button {
-  background: var(--surface-accent);
-  border: 0;
-  border-radius: 4px;
-  font-size: 10px;
-  padding: 6px 10px;
-}
 .history-list .history-tags {
   display: flex;
   flex-wrap: wrap;

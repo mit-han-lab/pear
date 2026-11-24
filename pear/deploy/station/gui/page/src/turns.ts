@@ -25,6 +25,7 @@ export type Turn = {
 
 /** Folds the events of one task into its turns, in order of first appearance. */
 export class Turns {
+  static readonly NOTICE_TYPES = ['session', 'notice', 'interrupted']; // events of a task, not of a turn, it shows
   static readonly ACTION_BLOCK = /```json\s*(\{[\s\S]*?\})\s*```/g; // a fenced json action, as the service reads it
   static readonly OPEN_FENCE = '```json'; // the start of an action block that is still streaming
 

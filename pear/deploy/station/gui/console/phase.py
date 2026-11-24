@@ -3,7 +3,6 @@ from enum import StrEnum
 from pear.deploy.station.agent_loop.clients.schemas import ModelPhase
 from pear.deploy.station.agent_loop.schemas import TurnPhase
 from pear.deploy.station.control.schemas import ActionPhase, RobotStatus
-from pear.deploy.station.records.recording.captions import CaptionPhase
 
 STOPPED_STATUSES = (RobotStatus.READY, RobotStatus.OFF)  # the robot's statuses in which a stop has ended
 
@@ -27,14 +26,14 @@ class Phase(StrEnum):
     HOMING = "Homing"
     HOME_COMPLETE = "Home complete"
     HOME_FAILED = "Home failed"
-    # the phases of a turn, in the words the agent loop, the model's client, the robot and the recording use for them
+    # the phases of a turn, in the words the agent loop, the model's client and the robot use for them
     OBSERVING = TurnPhase.OBSERVING
     THINKING = ModelPhase.THINKING
     COMPACTING = ModelPhase.COMPACTING
     PLANNING = ActionPhase.PLANNING
     EXECUTING = ActionPhase.EXECUTING
     SETTLING = ActionPhase.SETTLING
-    COMPLETED = CaptionPhase.COMPLETED
+    COMPLETED = "Completed"
     REJECTED = "Rejected"
     FAILED = "Failed"
     INTERRUPTED = "Interrupted"

@@ -136,11 +136,8 @@ class RecordedTask:
             "fps": FRAME_RATE,
             "frames": frame_count,
             "started_monotonic_s": started_monotonic_s,
-            "full": TaskFiles.video_name(TaskFiles.FULL_KIND) if is_saved else None,
             "sources": {role: self.SOURCE_FILES[role] for role in grey_levels} if is_saved else None,
-            "motion": TaskFiles.video_name(TaskFiles.MOTION_KIND) if motion_frame_count else None,
             "motion_intervals": [[0, motion_frame_count]] if motion_frame_count else [],
-            "no_motion": is_saved and not motion_frame_count,
         }
         TaskFiles.write_json(directory / TaskFiles.MANIFEST_NAME, manifest)
 

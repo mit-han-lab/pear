@@ -1,4 +1,3 @@
-import copy
 import math
 import queue
 import threading
@@ -7,15 +6,10 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from pear.deploy.station.agent_loop.clients.schemas import ModelEvent
-from pear.deploy.station.agent_loop.schemas import TurnEvent, TurnPhase
 from pear.deploy.station.control.cameras import CameraSource
-from pear.deploy.station.control.schemas import MOVING_CONTROL_STATES, ActionPhase, Camera, ControlState
-from pear.deploy.station.records.recording.captions import CaptionPhase
+from pear.deploy.station.control.schemas import MOVING_CONTROL_STATES, Camera, ControlState
 from pear.deploy.station.records.recording.encode_worker import FINISHED_STATUSES, EncodeWorker, SegmentStatus
-from pear.deploy.station.records.recording.ffmpeg import FRAME_RATE, VIDEO_SIZE, FFmpeg
-from pear.deploy.station.records.recording.frame_renderer import UNKNOWN_MODEL_LABEL, CaptionedLayout
-from pear.deploy.station.records.task_events import TaskEventKind
+from pear.deploy.station.records.recording.ffmpeg import FRAME_RATE, FFmpeg
 from pear.deploy.station.records.task_files import TaskFiles
 from pear.utils.logging_utils import get_logger
 from pear.utils.worker_process import WorkerProcess
@@ -26,7 +20,9 @@ logger = get_logger(__name__)
 class Segment:
     """One recording segment of a task: it samples the cameras and hands the frames to its encode worker."""
 
-    MAX_QUEUED_PACKETS = 3  # samples waiting for the worker; one more is dropped
+    # of samples waiting for the worker, one more is dropped: long enough for the worker to catch up after another
+    # process held the cores, a render's chunks that run on as a task starts included
+    MAX_QUEUED_S = 10
     START_TIMEOUT_S = 10  # for the worker to report that its encoders are open
     MAX_PENDING_UPDATES = 300  # changes of state the worker has not been given yet
     SETTLING_MOTION_S = 0.2  # of settling that still counts as motion
@@ -42,20 +38,11 @@ class Segment:
         cameras: tuple[Camera, ...],
         camera_feed: CameraSource,
         robot_status_reader: Callable[[], dict[str, Any]],
-        latest_context: dict[str, Any] | None,
     ) -> None:
         self.directory = directory  # the segment's folder, named by its id
         self.camera_feed = camera_feed
         self.robot_status_reader = robot_status_reader  # returns the robot's status with its control snapshot
-        self.lock = threading.Lock()  # guards the caption state, the manifest and the times
-        # what the frames sampled from now on are captioned with
-        self.caption_state: dict[str, Any] = {
-            "phase": CaptionPhase.STARTING.value,
-            "turn_number": None,
-            "action": None,
-            "context_usage": latest_context,
-            "inference_usage": None,
-        }
+        self.lock = threading.Lock()  # guards the manifest and the times
         self.ended_at: float | None = None  # when the segment was stopped, on the monotonic clock
         self.stop_event = threading.Event()
         self.started_at: float | None = None  # when its first frame was captured, on the monotonic clock
@@ -65,18 +52,11 @@ class Segment:
         self.manifest: dict[str, Any] = {
             "id": directory.name,
             "task_id": task["id"],
-            "model": task.get("model"),
-            "model_label": task.get("model_label") or task.get("model") or UNKNOWN_MODEL_LABEL,
             "status": SegmentStatus.STARTING.value,
             "created": time.time(),
             "fps": FRAME_RATE,
-            "width": VIDEO_SIZE[0],
-            "height": VIDEO_SIZE[1],
-            "full": None,
-            "motion": None,
             "sources": None,
             "source_error": None,
-            "camera_tiles": CaptionedLayout.for_cameras(cameras).tiles,
             "dropped_samples": 0,
             "error": None,
         }
@@ -85,11 +65,11 @@ class Segment:
         directory.mkdir(parents=True)
         TaskFiles.write_json(self.manifest_path, self.manifest)
 
-        self.packets = WorkerProcess.CONTEXT.Queue(maxsize=self.MAX_QUEUED_PACKETS)
+        self.packets = WorkerProcess.CONTEXT.Queue(maxsize=self.MAX_QUEUED_S * FRAME_RATE)
         self.messages = WorkerProcess.CONTEXT.Queue()
         self.encoder = WorkerProcess(
             EncodeWorker.main,
-            (str(directory), task, cameras, self.packets, self.messages, executable),
+            (str(directory), cameras, self.packets, self.messages, executable),
             "gui-video-encoder",
             FFmpeg.WORKER_EXIT_TIMEOUT_S,
             is_group_leader=True,
@@ -101,41 +81,6 @@ class Segment:
 
         self.thread = threading.Thread(target=self.run, name="gui-video-sampler", daemon=True)
         self.thread.start()
-
-    def on_event(
-        self,
-        kind: str,
-        data: dict[str, Any],
-        *,
-        latest_context: dict[str, Any] | None,
-        turn_usage: dict[str, Any] | None,
-    ) -> None:
-        """Takes one event of the task into what the frames are captioned with."""
-        with self.lock:
-            if self.ended_at is not None:
-                return
-
-            if kind == TaskEventKind.TURN_STARTED:
-                self.caption_state = {
-                    "phase": TurnPhase.OBSERVING.value,
-                    "turn_number": data["turn_number"],
-                    "attempt": data["attempt"],
-                    "action": None,
-                }
-            elif kind == ModelEvent.PHASE:
-                self.caption_state = {**self.caption_state, "phase": data["phase"]}
-            elif kind == TurnEvent.ACTION:
-                action = {key: value for key, value in data.items() if key != "attempt"}
-                self.caption_state = {**self.caption_state, "action": copy.deepcopy(action)}
-            elif kind in (TaskEventKind.EXECUTION, TaskEventKind.TURN_END):
-                phase = data.get("phase", data.get("status", CaptionPhase.COMPLETED.value))
-                self.caption_state = {**self.caption_state, "phase": phase}
-
-            self.caption_state = {
-                **self.caption_state,
-                "context_usage": latest_context,
-                "inference_usage": turn_usage,
-            }
 
     def snapshot(self) -> dict[str, Any]:
         """Returns the manifest as it stands, with the duration so far while the segment is not finished."""
@@ -207,7 +152,7 @@ class Segment:
 
         try:
             frames, errors = self.camera_feed.read_preview()
-            state = {**self.caption_state, "moving": False, "control_state": ControlState.HOLD.value}
+            state = {"moving": False, "control_state": ControlState.HOLD.value}
             self.packets.put_nowait(
                 {"index": 0, "captured": self.started_at, "frames": frames, "errors": errors, "state": state}
             )
@@ -233,12 +178,11 @@ class Segment:
             with self.lock:
                 if self.ended_at is not None:
                     break
-                state = dict(self.caption_state)
                 robot_status = self.robot_status_reader()
                 now = time.monotonic()
 
             index = max(index, math.floor((now - self.started_at) * FRAME_RATE))
-            self._describe_motion(state, robot_status, now)
+            state = self._motion_state(robot_status, now)
             if state != last_state:
                 updates.append({"index": index, "state": state})
                 last_state = state
@@ -265,8 +209,8 @@ class Segment:
 
         return updates
 
-    def _describe_motion(self, state: dict[str, Any], robot_status: dict[str, Any], now: float) -> None:
-        """Adds to a sampled state whether the robot moves, its control state and the phase of a settling arm."""
+    def _motion_state(self, robot_status: dict[str, Any], now: float) -> dict[str, Any]:
+        """Returns the state of a sample: whether the robot moves, and its control state."""
         is_settling = robot_status.get("motion", {}).get("settling", False)
         if not is_settling:
             self.settle_started_at = None
@@ -274,12 +218,12 @@ class Segment:
             self.settle_started_at = now
 
         # the commands, the grippers' too, and at most SETTLING_MOTION_S of settling count as motion
-        state["moving"] = robot_status.get("control_state") in MOVING_CONTROL_STATES and (
+        is_moving = robot_status.get("control_state") in MOVING_CONTROL_STATES and (
             not is_settling or now - self.settle_started_at <= self.SETTLING_MOTION_S
         )
-        state["control_state"] = robot_status.get("control_state", ControlState.CLOSED.value)  # a closed robot has none
-        if is_settling and state["phase"] == ActionPhase.EXECUTING:
-            state["phase"] = ActionPhase.SETTLING.value
+
+        # a closed robot has no control state
+        return {"moving": is_moving, "control_state": robot_status.get("control_state", ControlState.CLOSED.value)}
 
     def _finalize(self, updates: list[dict[str, Any]]) -> None:
         """Gives the worker the end of the recording and waits until it has finished the files."""
