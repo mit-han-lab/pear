@@ -2,7 +2,7 @@ import asyncio
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Coroutine
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
@@ -49,6 +49,7 @@ class ModelClient(ABC):
     CANCEL_POLL_S = 0.02  # how often a running request looks for a stop
     CLEANUP_TIMEOUT_S = 10.0  # how long close waits for a running request to end
     RELATIVE_PATH_ARGUMENTS: tuple[str, ...] = ()  # arguments that are paths, relative ones to the station's own file
+    LOOP_THREAD_NAME = "model-client-loop"  # the thread that runs the client's event loop
 
     def __init__(self, system_prompt: str, *, timeout_s: float) -> None:
         self.system_prompt = system_prompt
@@ -58,6 +59,12 @@ class ModelClient(ABC):
         self._request_lock = threading.Lock()  # held by the one request that runs
         self._is_closed = False
         self._lost_reason: str | None = None  # why the model's conversation cannot go on; None while it can
+
+        # the client's one event loop, run by its own thread until the client closes: each turn's request runs in it,
+        # so the connections a request leaves open serve the next turn, whichever thread asks
+        self._loop = asyncio.new_event_loop()
+        self._loop_thread = threading.Thread(target=self._loop.run_forever, daemon=True, name=self.LOOP_THREAD_NAME)
+        self._loop_thread.start()
 
     @abstractmethod
     def check(self) -> ModelHealth:
@@ -78,7 +85,7 @@ class ModelClient(ABC):
             OperatorPaused.check_cancelled(cancellation)
             self._abort_event.clear()
 
-            return asyncio.run(self._infer_async(model_input, on_event, cancellation))
+            return self._run(self._infer_async(model_input, on_event, cancellation))
         finally:
             self._request_lock.release()
 
@@ -87,15 +94,19 @@ class ModelClient(ABC):
         self._abort_event.set()
 
     def close(self) -> None:
-        """Stops the request that runs, waits for it to end and frees what the client holds; raises SessionLost when
-        the request does not end in time."""
+        """Stops the request that runs, waits for it to end, frees what the client holds and ends its event loop;
+        raises SessionLost when the request does not end in time."""
         self.cancel()
         if not self._request_lock.acquire(timeout=self.CLEANUP_TIMEOUT_S):
             raise SessionLost(f"{self.LABEL} request did not finish cancellation")
 
         try:
             if not self._is_closed:
-                self._release()
+                # a release that fails leaves the loop running, so that a later close can try it again
+                self._run(self._release())
+                self._loop.call_soon_threadsafe(self._loop.stop)
+                self._loop_thread.join(self.CLEANUP_TIMEOUT_S)
+                self._loop.close()
                 self._is_closed = True
         finally:
             self._request_lock.release()
@@ -142,8 +153,12 @@ class ModelClient(ABC):
         """Returns whether the request is stopped: its cancellation is set or the client was cancelled."""
         return cancellation.is_set() or self._abort_event.is_set()
 
-    def _release(self) -> None:  # noqa: B027  (a client may hold nothing)
-        """Frees what the client holds, once no request runs (by default nothing)."""
+    def _run(self, coroutine: Coroutine[Any, Any, Any]) -> Any:
+        """Runs ``coroutine`` in the client's event loop and returns what it returns, from any thread but the loop's."""
+        return asyncio.run_coroutine_threadsafe(coroutine, self._loop).result()
+
+    async def _release(self) -> None:  # noqa: B027  (a client may hold nothing)
+        """Frees what the client holds, in its event loop once no request runs (by default nothing)."""
 
     def _lost_session(self, reason: str) -> SessionLost:
         """Remembers that the model's conversation is lost for ``reason`` and returns the error that says so."""

@@ -10,7 +10,10 @@ model: ???  # the checkpoint
 draft: null  # a draft checkpoint, decoding with it as speculative says; null: no speculative decoding
 speculative: {}  # vLLM's speculative_config without its model
 kernels: null  # a model family's deploy kernels (pear/models/kernels.py) by class path; null: vLLM's own
-env: {}  # environment variables of the server and of the engine processes it starts
+env:  # environment variables of the server and of the engine processes it starts
+  # seconds an idle connection stays open for the client's next request: longer than a station's model client keeps
+  # one (VLLMClient.KEEPALIVE_S), so that a turn reuses the connection of the turn before
+  VLLM_HTTP_TIMEOUT_KEEP_ALIVE: "90"
 server: {}  # vLLM's server options (host, port, served_model_name, ...)
 engine:  # vLLM's engine arguments
   tensor_parallel_size: 1

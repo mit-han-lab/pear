@@ -30,12 +30,20 @@ class SentRequest:
 
 
 @pytest.fixture
-def service():
-    """An in-process OpenAI-compatible server for the vLLM client: its URL, the requests it received and the modes
-    queued for its next answers."""
+def ports():
+    """The client port of each completion request the in-process server received: one port is one connection."""
+    return []
+
+
+@pytest.fixture
+def service(ports):
+    """An in-process OpenAI-compatible server for the vLLM client, which keeps its connections open between requests:
+    its URL, the requests it received and the modes queued for its next answers."""
     calls, modes = [], []
 
     class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"  # a connection serves one request after another, as vLLM's server does
+
         def do_GET(self):
             body = json.dumps(
                 {
@@ -50,7 +58,12 @@ def service():
 
         def do_POST(self):
             calls.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            ports.append(self.client_address[1])
             mode = modes.pop(0) if modes else "ok"
+            if mode == "drop":
+                # the connection closes with no answer, as a server's does at its keep-alive's end
+                self.close_connection = True
+                return
             if isinstance(mode, tuple) or mode in ("cache", "network", "context"):
                 # a pair is a refusal of the test's own: its status and its message
                 status, message = (
@@ -73,11 +86,15 @@ def service():
                 return
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Transfer-Encoding", "chunked")  # the stream's end is its last chunk, not a closed socket
             self.end_headers()
 
-            def send(value):
-                self.wfile.write(("data: " + json.dumps(value) + "\n\n").encode())
+            def write(data):
+                self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
                 self.wfile.flush()
+
+            def send(value):
+                write(("data: " + json.dumps(value) + "\n\n").encode())
 
             def chunk(delta, finish=None):
                 return {
@@ -88,7 +105,8 @@ def service():
                     "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
                 }
 
-            try:
+            def answer():
+                """Writes the answer of the mode as server-sent events."""
                 if mode == "stall":
                     time.sleep(1)
                 thinking = chunk({"reasoning": "visible thinking"})
@@ -118,7 +136,7 @@ def service():
                     return
                 send(chunk({"content": "complete answer"}, "length" if mode == "length" else "stop"))
                 if mode == "no_usage":
-                    self.wfile.write(b"data: [DONE]\n\n")
+                    write(b"data: [DONE]\n\n")
                     return
                 send(
                     {
@@ -141,9 +159,13 @@ def service():
                         },
                     }
                 )
-                self.wfile.write(b"data: [DONE]\n\n")
+                write(b"data: [DONE]\n\n")
+
+            try:
+                answer()
+                self.wfile.write(b"0\r\n\r\n")
             except (BrokenPipeError, ConnectionResetError):
-                pass
+                self.close_connection = True
 
         def log_message(self, *_):
             pass
@@ -476,6 +498,83 @@ def test_the_data_url_of_a_sent_image_names_a_jpeg(service, inputs):
         assert sent == ["data:image/jpeg;base64," + im.base64() for im in item.images]
     finally:
         client.close()
+
+
+def test_a_session_s_turns_share_one_connection_whichever_thread_asks(service, ports, inputs):
+    url, _, _ = service
+    client = VLLMClient("system", timeout_s=TIMEOUT_S, base_url=url, model="vllm")
+    answers = []
+
+    def ask(number):
+        answers.append(client.infer(inputs(number), on_event=lambda *a: None, cancellation=threading.Event()))
+
+    try:
+        for number in range(3):  # each turn from a thread of its own, as the agent loop asks
+            thread = threading.Thread(target=ask, args=(number,))
+            thread.start()
+            thread.join(10)
+
+        assert [answer.answer for answer in answers] == ["complete answer"] * 3
+        assert len(ports) == 3 and len(set(ports)) == 1
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("drops,is_answered", [(["drop"], True), (["drop", "drop"], False)])
+def test_a_request_whose_connection_closed_before_any_answer_is_sent_once_more(
+    service, ports, inputs, drops, is_answered
+):
+    url, calls, modes = service
+    client = VLLMClient("system", timeout_s=TIMEOUT_S, base_url=url, model="vllm")
+    events = []
+
+    def ask():
+        return client.infer(inputs(1), on_event=lambda k, d: events.append((k, d)), cancellation=threading.Event())
+
+    try:
+        client.infer(inputs(0), on_event=lambda *a: None, cancellation=threading.Event())
+        modes.extend(drops)
+        if is_answered:
+            assert ask().answer == "complete answer"
+        else:
+            with pytest.raises(openai.APIConnectionError):
+                ask()
+
+        assert len(calls) == 3 and calls[1] == calls[2]
+        assert [d["message"] for k, d in events if k == "notice"] == [VLLMClient.RESEND_NOTICE]
+        assert ports[1] == ports[0] and ports[2] != ports[1]
+    finally:
+        client.close()
+
+
+def test_a_turn_after_a_cancelled_stream_answers_on_a_new_connection(service, ports, inputs):
+    url, _, modes = service
+    modes.append("thinking_stall")
+    client = VLLMClient("system", timeout_s=TIMEOUT_S, base_url=url, model="vllm")
+    cancel = threading.Event()
+
+    def emit(kind, data):
+        if kind == "reasoning_delta":
+            cancel.set()
+
+    try:
+        with pytest.raises(OperatorPaused):
+            client.infer(inputs(0), on_event=emit, cancellation=cancel)
+        answer = client.infer(inputs(1), on_event=lambda *a: None, cancellation=threading.Event())
+
+        assert answer.answer == "complete answer" and len(set(ports)) == 2
+    finally:
+        client.close()
+
+
+def test_close_closes_the_connection_and_ends_the_event_loop(service, inputs):
+    url, _, _ = service
+    client = VLLMClient("system", timeout_s=TIMEOUT_S, base_url=url, model="vllm")
+    client.infer(inputs(0), on_event=lambda *a: None, cancellation=threading.Event())
+
+    client.close()
+
+    assert client.openai_client.is_closed() and not client._loop_thread.is_alive()
 
 
 @pytest.mark.parametrize(

@@ -25,8 +25,8 @@ from pear.deploy.station.agent_loop.clients.schemas import (
 )
 from pear.deploy.station.exceptions import OperatorPaused
 
-if TYPE_CHECKING:  # annotations only: the SDK is imported where a request is made
-    from openai import AsyncOpenAI
+if TYPE_CHECKING:  # annotations only: the SDK is imported where a client is made
+    from openai import AsyncStream
     from openai.types.chat import ChatCompletionChunk
 
 
@@ -57,6 +57,12 @@ class VLLMClient(ModelClient):
     CHECK_TIMEOUT_S = 3  # of the model-list request that checks the endpoint
     USAGE_INTERVAL_S = 0.25  # between two reports of a streaming request's token counts
     SDK_RETRIES = 0  # the SDK itself sends no request a second time
+    # how long an idle connection waits for the next turn: below the server's keep-alive (pear/configs/server.yaml),
+    # so that the server never closes a connection as a request goes out on it
+    KEEPALIVE_S = 60
+    IDLE_CONNECTIONS = 1  # connections kept between turns: one request runs at a time
+    # what the operator reads when a request's connection failed before any answer, and the request is sent again
+    RESEND_NOTICE = "Server connection was closed; sending the request once more."
     UNUSED_API_KEY = "unused"  # what the SDK is given for a server that asks for no key
     RELATIVE_PATH_ARGUMENTS = ("api_key_file",)  # its key file may be given relative to the station's own file
     REQUEST_ID = "request"  # the one request of a turn, as its token rate knows it
@@ -116,8 +122,13 @@ class VLLMClient(ModelClient):
         if reasoning_effort != self.REASONING_EFFORT:
             raise ValueError(f"reasoning_effort must be {self.REASONING_EFFORT}")
 
+        service_url = self._service_url(base_url)  # checked before the client's event loop starts
+
+        from httpx2 import Limits
+        from openai import AsyncOpenAI, DefaultAsyncHttpxClient
+
         super().__init__(system_prompt, timeout_s=timeout_s)
-        self.base_url = self._service_url(base_url)
+        self.base_url = service_url
         self.model = model
         # holds the server's API key, absolute once the station's configuration is read; None: the server asks for none
         self.api_key_file = api_key_file
@@ -130,6 +141,16 @@ class VLLMClient(ModelClient):
 
         # the conversation: the system prompt, then each turn's input and the model's answer to it
         self.history: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+        # the session's one SDK client, whose open connection each turn's request reuses
+        self.openai_client = AsyncOpenAI(
+            base_url=self.base_url,
+            api_key=self._api_key(),
+            max_retries=self.SDK_RETRIES,
+            timeout=self.timeout_s,
+            http_client=DefaultAsyncHttpxClient(
+                limits=Limits(max_keepalive_connections=self.IDLE_CONNECTIONS, keepalive_expiry=self.KEEPALIVE_S)
+            ),
+        )
 
     def check(self) -> ModelHealth:
         """Returns the health of a server that lists the model; raises when the server does not answer or does not
@@ -150,20 +171,13 @@ class VLLMClient(ModelClient):
     ) -> ModelOutput:
         """Returns the model's answer to the conversation with ``model_input``, both of which then join the
         history."""
-        from openai import AsyncOpenAI
-
         # the task's images went out with the first input the history holds
         if any(isinstance(message.get("content"), ModelInput) for message in self.history):
             model_input = replace(model_input, reference_images=())
 
-        async with AsyncOpenAI(
-            base_url=self.base_url, api_key=self._api_key(), max_retries=self.SDK_RETRIES, timeout=self.timeout_s
-        ) as openai_client:
-            output = await self._race(
-                self._generate(openai_client, model_input, on_event, cancellation),
-                cancellation,
-                timeout_s=self.timeout_s,
-            )
+        output = await self._race(
+            self._generate(model_input, on_event, cancellation), cancellation, timeout_s=self.timeout_s
+        )
 
         # a complete answer belongs to the history even if its motion is cancelled later
         self.history.extend(
@@ -176,26 +190,20 @@ class VLLMClient(ModelClient):
         return output
 
     async def _generate(
-        self,
-        openai_client: AsyncOpenAI,
-        model_input: ModelInput,
-        on_event: EventHandler,
-        cancellation: threading.Event,
+        self, model_input: ModelInput, on_event: EventHandler, cancellation: threading.Event
     ) -> ModelOutput:
         """Returns the model's answer to the conversation with ``model_input``; saved images the server's cache lost
         are sent once more."""
         turn = VLLMProgress(on_event=on_event, cancellation=cancellation, start_time=time.monotonic())
 
         try:
-            return await self._stream(openai_client, turn, model_input, resends_images=False)
+            return await self._stream(turn, model_input, resends_images=False)
         except ImageCacheMiss:
             turn.on_event(ModelEvent.NOTICE, {"message": "Image cache missed; resending saved images once."})
 
-        return await self._stream(openai_client, turn, model_input, resends_images=True)
+        return await self._stream(turn, model_input, resends_images=True)
 
-    async def _stream(
-        self, openai_client: AsyncOpenAI, turn: VLLMProgress, model_input: ModelInput, *, resends_images: bool
-    ) -> ModelOutput:
+    async def _stream(self, turn: VLLMProgress, model_input: ModelInput, *, resends_images: bool) -> ModelOutput:
         """Sends the conversation with ``model_input`` once and returns the answer the server streams."""
         OperatorPaused.check_cancelled(turn.cancellation)
         OperatorPaused.check_cancelled(self._abort_event)
@@ -212,23 +220,25 @@ class VLLMClient(ModelClient):
             },
         )
 
-        try:
-            stream = await openai_client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                stream=True,
-                stream_options={"include_usage": True, "continuous_usage_stats": True},
-                max_tokens=self.max_output_tokens,
-                **self.sampling,
-                extra_body={
-                    **self.extra_body,
-                    "chat_template_kwargs": {
-                        "enable_thinking": True,
-                        "preserve_thinking": True,
-                        "reasoning_effort": self.reasoning_effort,
-                    },
+        request = dict(
+            model=self.model,
+            messages=messages,
+            stream=True,
+            stream_options={"include_usage": True, "continuous_usage_stats": True},
+            max_tokens=self.max_output_tokens,
+            **self.sampling,
+            extra_body={
+                **self.extra_body,
+                "chat_template_kwargs": {
+                    "enable_thinking": True,
+                    "preserve_thinking": True,
+                    "reasoning_effort": self.reasoning_effort,
                 },
-            )
+            },
+        )
+
+        try:
+            stream = await self._open_stream(turn, request)
             async with stream:
                 async for chunk in stream:
                     self._receive(turn, chunk)
@@ -279,6 +289,20 @@ class VLLMClient(ModelClient):
         image_url = {"url": self.IMAGE_URL_PREFIX + image.base64()} if sends_data else None
 
         return {"type": "image_url", "image_url": image_url, "uuid": image.uuid}
+
+    async def _open_stream(self, turn: VLLMProgress, request: dict[str, Any]) -> AsyncStream[ChatCompletionChunk]:
+        """Sends ``request`` and returns its stream once the server answers; a request whose connection failed before
+        any answer, as one the server had just closed does, is sent once more on a new one."""
+        from openai import APIConnectionError, APITimeoutError
+
+        try:
+            return await self.openai_client.chat.completions.create(**request)
+        except APITimeoutError:
+            raise
+        except APIConnectionError:
+            turn.on_event(ModelEvent.NOTICE, {"message": self.RESEND_NOTICE})
+
+        return await self.openai_client.chat.completions.create(**request)
 
     def _receive(self, turn: VLLMProgress, chunk: ChatCompletionChunk) -> None:
         """Takes one chunk of the stream: what the server reports of the request, and the next text of the answer."""
@@ -362,9 +386,10 @@ class VLLMClient(ModelClient):
 
         turn.on_event(ModelEvent.PERFORMANCE, report)
 
-    def _release(self) -> None:
-        """Forgets the conversation."""
+    async def _release(self) -> None:
+        """Forgets the conversation and closes the session's connection."""
         self.history.clear()
+        await self.openai_client.close()
 
     def _api_key(self) -> str:
         """Returns the server's API key from its file, a word in its place for a server that asks for none."""
