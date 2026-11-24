@@ -564,6 +564,77 @@ def test_a_failed_turn_whose_error_mentions_context_is_an_overflow(tmp_path):
     assert not isinstance(asyncio.run(run("upstream unavailable")), ContextLimit)
 
 
+@pytest.mark.parametrize("dropped_turns", [0, 1])
+def test_a_session_s_requests_share_one_connection_and_a_dropped_one_is_sent_once_more(tmp_path, dropped_turns):
+    frame = tmp_path / "frame.jpg"
+    frame.write_bytes(b"\xff\xd8")
+    observation = ModelInput("camera observation", (CameraImage("head", frame),))
+    ports, turns, events = [], [], []
+
+    async def run():
+        def record(request):
+            ports.append(request.transport.get_extra_info("peername")[1])
+
+        async def health(request):
+            record(request)
+            return web.json_response(
+                {"service": "pear-station-claude-code", "protocol": 1, "model": "vllm", "status": "ok"}
+            )
+
+        async def create(request):
+            record(request)
+            return web.json_response({"session_id": (await request.json())["session_id"]})
+
+        async def turn(request):
+            record(request)
+            body = await request.json()
+            turns.append(body["turn_id"])
+            if len(turns) <= dropped_turns:
+                # the connection closes with no answer, as a service's does at its keep-alive's end
+                request.transport.close()
+                return web.Response()
+            response = web.StreamResponse()
+            await response.prepare(request)
+            event = {
+                "session_id": request.match_info["sid"],
+                "turn_id": body["turn_id"],
+                "type": "result",
+                "data": {"status": "completed", "answer": "hold", "reasoning": ""},
+            }
+            await response.write((json.dumps(event) + "\n").encode())
+            return response
+
+        async def delete(request):
+            record(request)
+            return web.json_response({"closed": True})
+
+        app = web.Application()
+        app.router.add_get("/health", health)
+        app.router.add_post("/sessions", create)
+        app.router.add_post("/sessions/{sid}/turns", turn)
+        app.router.add_delete("/sessions/{sid}", delete)
+        async with TestServer(app) as server:
+            client = ClaudeCodeClient("system", timeout_s=TIMEOUT_S, base_url=str(server.make_url("")), model="vllm")
+
+            def ask():
+                return client.infer(observation, on_event=lambda k, d: events.append((k, d)), cancellation=cancel)
+
+            cancel = threading.Event()
+            try:
+                assert (await asyncio.to_thread(client.check))["status"] == "ok"
+                assert (await asyncio.to_thread(ask)).answer == "hold"
+                assert (await asyncio.to_thread(ask)).answer == "hold"
+            finally:
+                await asyncio.to_thread(client.close)
+
+    asyncio.run(run())
+
+    notices = [d["message"] for k, d in events if k == "notice"]
+    assert notices == [ClaudeCodeClient.RESEND_NOTICE] * dropped_turns
+    assert len(turns) == 2 + dropped_turns and turns[0] == turns[dropped_turns]
+    assert len(set(ports)) == 1 + dropped_turns
+
+
 @pytest.mark.parametrize(
     "argument,message",
     [

@@ -6,7 +6,13 @@ import time
 import pytest
 
 from pear.deploy.station.agent_loop.clients.client import ModelClient, SessionLost
-from pear.deploy.station.agent_loop.clients.schemas import CameraImage, HealthStatus, ModelInput, ReferenceImage
+from pear.deploy.station.agent_loop.clients.schemas import (
+    CameraImage,
+    HealthStatus,
+    ModelInput,
+    ModelOutput,
+    ReferenceImage,
+)
 from pear.deploy.station.exceptions import OperatorPaused
 
 SLACK_POLLS = 10  # a cancel must be noticed well within this many poll intervals
@@ -28,6 +34,31 @@ class HangingClient(ModelClient):
     async def _infer_async(self, observation, on_event, cancel):
         self.started.set()
         return await self._race(asyncio.sleep(self.TIMEOUT_S), cancel, timeout_s=self.TIMEOUT_S)
+
+
+class LoopClient(ModelClient):
+    """A client that answers at once, remembers the event loop and the thread each request ran in, and fails its
+    first ``failed_releases`` releases."""
+
+    LABEL = "Loop"
+
+    def __init__(self, failed_releases=0):
+        super().__init__("system", timeout_s=HangingClient.TIMEOUT_S)
+        self.failed_releases = failed_releases
+        self.loops, self.thread_names, self.release_count = [], [], 0
+
+    def check(self):
+        return {"status": HealthStatus.OK.value, "message": "Loop client"}
+
+    async def _infer_async(self, observation, on_event, cancel):
+        self.loops.append(asyncio.get_running_loop())
+        self.thread_names.append(threading.current_thread().name)
+        return ModelOutput("answer")
+
+    async def _release(self):
+        self.release_count += 1
+        if self.release_count <= self.failed_releases:
+            raise RuntimeError("release failed")
 
 
 class Request:
@@ -103,6 +134,35 @@ def test_close_cancels_the_request_and_waits_for_it():
 
     assert not request.thread.is_alive()
     assert isinstance(request.error, OperatorPaused)
+
+
+def test_turns_asked_from_several_threads_run_in_the_client_s_one_event_loop():
+    client = LoopClient()
+
+    for _ in range(3):  # one after another, each from a thread of its own, as the agent loop asks
+        thread = threading.Thread(
+            target=client.infer,
+            args=(ModelInput("observation", ()),),
+            kwargs={"on_event": lambda *args: None, "cancellation": threading.Event()},
+        )
+        thread.start()
+        thread.join(5)
+
+    assert len(client.loops) == 3 and len({id(loop) for loop in client.loops}) == 1
+    assert set(client.thread_names) == {ModelClient.LOOP_THREAD_NAME}
+    client.close()
+    assert not client._loop_thread.is_alive()
+
+
+def test_a_failed_release_keeps_the_event_loop_for_a_later_close():
+    client = LoopClient(failed_releases=1)
+
+    with pytest.raises(RuntimeError, match="release failed"):
+        client.close()
+
+    assert client._loop_thread.is_alive()
+    client.close()
+    assert not client._loop_thread.is_alive() and client.release_count == 2
 
 
 def test_the_file_bytes_are_ascii_base64(tmp_path):

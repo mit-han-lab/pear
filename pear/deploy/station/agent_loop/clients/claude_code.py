@@ -1,7 +1,9 @@
 import asyncio
+import contextlib
 import json
 import threading
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -68,13 +70,20 @@ class ClaudeCodeClient(ModelClient):
     CONTEXT_ERROR_WORD = "context"  # what a failed turn's error holds when the conversation outgrew its context
     # what a turn is refused with once a compaction dropped the task's images
     COMPACTED_IMAGES_MESSAGE = "Image context was compacted; clear the task to restart"
+    # how long an idle connection waits for the next request: below the service's keep-alive (aiohttp's default), so
+    # that the service never closes a connection as a request goes out on it
+    KEEPALIVE_S = 60
+    STREAM_END_TIMEOUT_S = 3  # for a turn's stream to end after its result; one that ends later loses its connection
+    # what the operator reads when a request's connection failed before any answer, and the request is sent again
+    RESEND_NOTICE = "Service connection was closed; sending the request once more."
 
     def __init__(self, system_prompt: str, *, timeout_s: float, base_url: str, model: str) -> None:
         if type(model) is not str or not model:
             raise ValueError("model must be the name the service has the model under, a non-empty string")
+        service_url = self._service_url(base_url)  # checked before the client's event loop starts
 
         super().__init__(system_prompt, timeout_s=timeout_s)
-        self.base_url = self._service_url(base_url)
+        self.base_url = service_url
         self.model = model
 
         self.session_id = str(uuid4())
@@ -88,23 +97,32 @@ class ClaudeCodeClient(ModelClient):
         self._reference_count = 0  # the task images the service was sent
         self._has_references = False  # whether the task has images
         self._image_context_blocked = False  # whether the task's images may be gone from the context
+        # the session's one HTTP client, whose open connection each request reuses
+        self.http_session: aiohttp.ClientSession = self._run(self._open_http_session())
 
     def check(self) -> ModelHealth:
         """Returns the health of a service that has the model; raises when the service or the model is unavailable."""
-        return asyncio.run(self._health())
+        return self._run(self._health())
 
     @classmethod
     def supports_reference_images(cls, health: ModelHealth) -> bool:
         """Returns whether the service's last connection check said it takes a task's reference images."""
         return health.get("reference_images") is True
 
+    async def _open_http_session(self) -> aiohttp.ClientSession:
+        """Returns the session's HTTP client, which aiohttp makes inside the event loop it serves."""
+        return aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(keepalive_timeout=self.KEEPALIVE_S),
+            timeout=aiohttp.ClientTimeout(total=None, sock_connect=self.CHECK_TIMEOUT_S),
+        )
+
     async def _health(self) -> ModelHealth:
         """Returns the health the service reports of itself and the model, and remembers what it says it does with a
         task's images; raises when the service or the model is unavailable."""
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.CHECK_TIMEOUT_S)) as http_session:
-            async with http_session.get(self.base_url + "/health") as response:
-                response.raise_for_status()
-                health_answer = await response.json()
+        health_timeout = aiohttp.ClientTimeout(total=self.CHECK_TIMEOUT_S)
+        async with self.http_session.get(self.base_url + "/health", timeout=health_timeout) as response:
+            response.raise_for_status()
+            health_answer = await response.json()
 
         if (
             health_answer.get("service") != self.SERVICE_NAME
@@ -137,7 +155,7 @@ class ClaudeCodeClient(ModelClient):
         references = model_input.reference_images if not self._references_sent else ()
         if references:
             if self._supports_references is None:
-                await asyncio.to_thread(self.check)
+                await self._health()
             if not self._supports_references:
                 raise ValueError("Claude Code service does not support task images; update it first")
             self._has_references = True
@@ -159,57 +177,51 @@ class ClaudeCodeClient(ModelClient):
         if references:
             payload["reference_images"] = [{"data": image.base64()} for image in references]
 
-        connect_timeout = aiohttp.ClientTimeout(total=None, sock_connect=self.CHECK_TIMEOUT_S)
-        async with aiohttp.ClientSession(timeout=connect_timeout) as http_session:
-            request_task = asyncio.create_task(self._request(http_session, turn, payload))
-            stop_task = asyncio.create_task(self._wait_stopped(cancellation))
-            is_stop_confirmed = False
+        request_task = asyncio.create_task(self._request(turn, payload))
+        stop_task = asyncio.create_task(self._wait_stopped(cancellation))
+        is_stop_confirmed = False
 
-            try:
-                finished_tasks, _ = await asyncio.wait(
-                    (request_task, stop_task), timeout=self.timeout_s, return_when=asyncio.FIRST_COMPLETED
-                )
-                if request_task in finished_tasks:
-                    return request_task.result()
+        try:
+            finished_tasks, _ = await asyncio.wait(
+                (request_task, stop_task), timeout=self.timeout_s, return_when=asyncio.FIRST_COMPLETED
+            )
+            if request_task in finished_tasks:
+                return request_task.result()
 
-                # a timeout too needs the service's confirmed interrupt: a dropped connection does not stop the turn
-                has_timed_out = not finished_tasks
-                await self._interrupt(http_session, turn, request_task)
-                is_stop_confirmed = True
-                if has_timed_out:
-                    raise TimeoutError(self.TIMED_OUT_MESSAGE)
-                raise OperatorPaused(self.INTERRUPTED_MESSAGE)
-            except (OperatorPaused, _TurnError, TimeoutError, ContextLimit) as exc:
-                # only an explicit result of the model, or a timeout whose stop the service confirmed, keeps the session
-                if isinstance(exc, TimeoutError) and not is_stop_confirmed:
-                    raise self._lost_session("Claude Code cancellation could not be confirmed") from exc
-                raise
-            except Exception as exc:
-                raise self._lost_session(f"Claude Code session state is uncertain: {exc}") from exc
-            finally:
-                for unfinished_task in (request_task, stop_task):
-                    if not unfinished_task.done():
-                        unfinished_task.cancel()
-                await asyncio.gather(request_task, stop_task, return_exceptions=True)
-                if turn.usage and not turn.is_terminal_emitted:
-                    # a stream that broke must not leave the saved usage in progress
-                    if not turn.usage.get("final"):
-                        turn.usage = {**turn.usage, "partial": True, "final": True}
-                        on_event(ModelEvent.USAGE, turn.usage)
-                    self._emit_performance(
-                        turn, RequestStatus.FAILED if self._lost_reason else RequestStatus.INTERRUPTED
-                    )
+            # a timeout too needs the service's confirmed interrupt: a dropped connection does not stop the turn
+            has_timed_out = not finished_tasks
+            await self._interrupt(turn, request_task)
+            is_stop_confirmed = True
+            if has_timed_out:
+                raise TimeoutError(self.TIMED_OUT_MESSAGE)
+            raise OperatorPaused(self.INTERRUPTED_MESSAGE)
+        except (OperatorPaused, _TurnError, TimeoutError, ContextLimit) as exc:
+            # only an explicit result of the model, or a timeout whose stop the service confirmed, keeps the session
+            if isinstance(exc, TimeoutError) and not is_stop_confirmed:
+                raise self._lost_session("Claude Code cancellation could not be confirmed") from exc
+            raise
+        except Exception as exc:
+            raise self._lost_session(f"Claude Code session state is uncertain: {exc}") from exc
+        finally:
+            for unfinished_task in (request_task, stop_task):
+                if not unfinished_task.done():
+                    unfinished_task.cancel()
+            await asyncio.gather(request_task, stop_task, return_exceptions=True)
+            if turn.usage and not turn.is_terminal_emitted:
+                # a stream that broke must not leave the saved usage in progress
+                if not turn.usage.get("final"):
+                    turn.usage = {**turn.usage, "partial": True, "final": True}
+                    on_event(ModelEvent.USAGE, turn.usage)
+                self._emit_performance(turn, RequestStatus.FAILED if self._lost_reason else RequestStatus.INTERRUPTED)
 
-    async def _request(
-        self, http_session: aiohttp.ClientSession, turn: ClaudeCodeProgress, payload: dict[str, Any]
-    ) -> ModelOutput:
+    async def _request(self, turn: ClaudeCodeProgress, payload: dict[str, Any]) -> ModelOutput:
         """Creates the session if the service has none yet, sends the turn and reads its events up to the result."""
         if not self._is_session_created:
-            await self._create_session(http_session, turn)
+            await self._create_session(turn)
         if self._is_stopped(turn.cancellation):
             raise OperatorPaused("Paused before submitting the observation")
 
-        async with http_session.post(self.session_url + "/turns", json=payload) as response:
+        async with self._posted(turn, self.session_url + "/turns", json=payload) as response:
             response.raise_for_status()
             self._references_sent = True
 
@@ -226,16 +238,21 @@ class ClaudeCodeClient(ModelClient):
                         continue
                     output = self._receive(turn, json.loads(line))
                     if output is not None:
+                        # the service ends the stream right after the result: a stream read to its end gives its
+                        # connection back for the next request, and one that does not end in time closes it
+                        with contextlib.suppress(TimeoutError, aiohttp.ClientError):
+                            async with asyncio.timeout(self.STREAM_END_TIMEOUT_S):
+                                await response.content.read()
                         return output
 
         raise SessionLost("Connection ended without a terminal turn result")
 
-    async def _create_session(self, http_session: aiohttp.ClientSession, turn: ClaudeCodeProgress) -> None:
+    async def _create_session(self, turn: ClaudeCodeProgress) -> None:
         """Opens this client's session on the service with its system prompt and model."""
         self._was_creation_attempted = True
 
         session_request = {"session_id": self.session_id, "system": self.system_prompt, "model": self.model}
-        async with http_session.post(self.base_url + "/sessions", json=session_request) as response:
+        async with self._posted(turn, self.base_url + "/sessions", json=session_request) as response:
             response.raise_for_status()
             session_answer = await response.json()
         if session_answer.get("session_id") != self.session_id:
@@ -339,16 +356,14 @@ class ClaudeCodeClient(ModelClient):
         if not self._is_stopped(turn.cancellation):
             self._emit_performance(turn, RequestStatus.STREAMING)
 
-    async def _interrupt(
-        self, http_session: aiohttp.ClientSession, turn: ClaudeCodeProgress, request_task: asyncio.Task
-    ) -> None:
+    async def _interrupt(self, turn: ClaudeCodeProgress, request_task: asyncio.Task) -> None:
         """Asks the service to interrupt the turn and takes the turn's last events; raises TimeoutError when the
         service does not confirm in time."""
         async with asyncio.timeout(self.CLEANUP_TIMEOUT_S - self.INTERRUPT_MARGIN_S):
             # the session's creation may still be completing: neither it nor its observation is sent again
             await turn.session_created.wait()
 
-            async with http_session.post(self.session_url + "/turns/" + turn.id + "/interrupt") as response:
+            async with self._posted(turn, self.session_url + "/turns/" + turn.id + "/interrupt") as response:
                 response.raise_for_status()
                 await response.json()
 
@@ -384,13 +399,25 @@ class ClaudeCodeClient(ModelClient):
             },
         )
 
-    def _release(self) -> None:
-        """Has the service end the session, if the client asked it for one."""
-        if self._was_creation_attempted:
-            asyncio.run(self._delete_session())
+    @contextlib.asynccontextmanager
+    async def _posted(
+        self, turn: ClaudeCodeProgress, url: str, **request: Any
+    ) -> AsyncIterator[aiohttp.ClientResponse]:
+        """Yields the response of a POST to ``url``; a request whose connection failed before any answer, as one the
+        service had just closed does, is sent once more on a new one (aiohttp does so only for idempotent methods)."""
+        try:
+            response = await self.http_session.post(url, **request)
+        except (aiohttp.ServerDisconnectedError, aiohttp.ClientOSError):
+            turn.on_event(ModelEvent.NOTICE, {"message": self.RESEND_NOTICE})
+            response = await self.http_session.post(url, **request)
 
-    async def _delete_session(self) -> None:
-        """Has the service end this client's session."""
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.CLEANUP_TIMEOUT_S)) as http_session:
-            async with http_session.delete(self.session_url) as response:
+        async with response:
+            yield response
+
+    async def _release(self) -> None:
+        """Has the service end the session, if the client asked it for one, and closes the session's connection."""
+        if self._was_creation_attempted:
+            cleanup_timeout = aiohttp.ClientTimeout(total=self.CLEANUP_TIMEOUT_S)
+            async with self.http_session.delete(self.session_url, timeout=cleanup_timeout) as response:
                 response.raise_for_status()
+        await self.http_session.close()
