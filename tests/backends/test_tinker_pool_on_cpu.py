@@ -181,6 +181,41 @@ async def test_zero_prefetch_waits_for_the_update_and_limits_restored_groups(tmp
 
 
 @pytest.mark.asyncio
+async def test_update_admits_more_work_while_prefetched_rollouts_are_running(tmp_path):
+    started, release = asyncio.Queue(), asyncio.Event()
+
+    async def run(task, sampler, uid, member):
+        if uid != "g000000000001":
+            await started.put((uid, member, sampler))
+            await release.wait()
+        return SimpleNamespace(reward=float(member), generated_tokens=1)
+
+    original = pool_for(tmp_path, batch_groups=1)
+    config = replace(original.config, prefetch_groups=1)
+    pool = RolloutPool(
+        config, original.tasks, SimpleNamespace(run=run), object(), {"test.Env": 4}, RunState(next_group=1)
+    )
+    pool.start()
+    try:
+        running = [await asyncio.wait_for(started.get(), 2) for _ in range(2)]
+        assert {(uid, member) for uid, member, _ in running} == {("g000000000002", 0), ("g000000000002", 1)}
+        [batch] = await asyncio.wait_for(pool.take_batch(), 2)
+        assert batch.uid == "g000000000001" and pool.held_groups == 1
+
+        pool.sampler = updated_sampler = object()
+        pool.state.step += 1
+        pool.update_completed()
+
+        admitted = [await asyncio.wait_for(started.get(), 2) for _ in range(2)]
+        assert {(uid, member) for uid, member, _ in admitted} == {("g000000000003", 0), ("g000000000003", 1)}
+        assert all(sampler is updated_sampler for _, _, sampler in admitted)
+        assert pool.state.groups[-1].dispatch_step == 1
+        assert pool.state.counters["completed"] == 1 and len(pool.jobs) == 4
+    finally:
+        await pool.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("after_update", [False, True])
 async def test_zero_prefetch_does_not_start_a_group_beyond_the_refill_limit(tmp_path, after_update):
     original = pool_for(tmp_path, batch_groups=1, limit=1)

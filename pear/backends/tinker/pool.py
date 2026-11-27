@@ -88,12 +88,15 @@ class RolloutPool:
     async def _run(self) -> None:
         try:
             while True:
+                self.wake.clear()
                 self._fill()
-                if not self.jobs:
-                    self.wake.clear()
-                    await self.wake.wait()
-                    continue
-                done, _ = await asyncio.wait(self.jobs, return_when=asyncio.FIRST_COMPLETED)
+                waiter = asyncio.create_task(self.wake.wait())
+                try:
+                    done, _ = await asyncio.wait([*self.jobs, waiter], return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    waiter.cancel()
+                    await asyncio.gather(waiter, return_exceptions=True)
+                done.discard(waiter)
                 by_uid = {group.uid: group for group in self.state.groups}
                 for job in done:
                     uid, member = self.jobs.pop(job)
@@ -106,7 +109,8 @@ class RolloutPool:
                         if len({t.reward for t in group.trajectories}) == 1:
                             self.state.groups.remove(group)
                             self.state.counters["filtered"] += 1
-                self.changed.set()
+                if done:
+                    self.changed.set()
         finally:
             for job in self.jobs:
                 job.cancel()
