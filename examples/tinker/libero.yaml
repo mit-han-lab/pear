@@ -1,0 +1,25 @@
+# A small LIBERO run using two CPU simulator workers.
+base_model: Qwen/Qwen3.8-27B:peft:262144
+renderer: qwen3_8_xhigh_reasoning
+think_end: </think>
+episode_files:
+  - examples/tinker/libero_train.json
+eval_episode_files:
+  - examples/tinker/libero_eval.json
+tool_configs:
+  - pear/envs/libero/configs/tool_config.yaml
+run_dir: runs/tinker_libero
+objective: stable_reinforce
+loss_config:
+  kl_coeff: 0.0
+response_budget: 160000
+group_size: 8
+batch_groups: 1
+max_sessions: 8
+prefetch_groups: 0
+max_groups_per_step: 2
+shuffle: false
+steps: 1
+ray_num_cpus: 2
+ray_resources:
+  libero: 2

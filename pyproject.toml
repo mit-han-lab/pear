@@ -13,6 +13,11 @@ requires-python = ">=3.10"  # the LIBERO simulators' Python; the trainer's is 3.
 dependencies = []
 
 [project.optional-dependencies]
+# Tinker runs the model; this environment coordinates episodes and the existing simulator pools on CPUs.
+tinker = [
+    "tinker==0.40.1", "tinker-cookbook==0.7.1", "tml-renderers==0.5.0", "ray==2.58.0",
+    "omegaconf", "numpy", "pillow", "torch", "torchvision",
+]
 # the training and rollout environment, next to the requirements.txt of the patched verl checkout: the GPU stack, cupy
 # (verl's NCCL weight sync), flash-linear-attention (Ulysses on Qwen3.5), aiohttp (the LMCache clear hook),
 # qwen-vl-utils (the agent loop's images) and the tests

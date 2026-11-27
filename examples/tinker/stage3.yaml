@@ -1,0 +1,43 @@
+base_model: Qwen/Qwen3.8-27B:peft:262144
+renderer: qwen3_8_xhigh_reasoning
+think_end: </think>
+episode_files:
+  - pear/envs/libero/configs/libero_all.json
+  - pear/envs/robodojo/configs/pickup_align_all.json
+  - pear/envs/robodojo/configs/pickup_align_all.json
+  - pear/envs/robodojo/configs/pickup_align_all.json
+  - pear/envs/robodojo/configs/pickup_align_all.json
+  - pear/envs/robodojo/configs/pickup_align_all.json
+  - pear/envs/robodojo/configs/pickup_align_all.json
+eval_episode_files:
+  - pear/envs/libero/configs/libero_goal_val.json
+  - pear/envs/robodojo/configs/official_smoke.json
+tool_configs:
+  - examples/tinker/combined_tool_config.yaml
+run_dir: runs/tinker_stage3
+context_length: 262144
+max_prompt_tokens: 4096
+response_budget: 256000
+rank: 32
+train_mlp: true
+train_attn: true
+train_unembed: true
+# A LoRA starting point to tune, not a measured replacement for the full-model learning rate.
+learning_rate: 1e-5
+objective: stable_reinforce
+loss_config:
+  kl_coeff: 0.0
+normalize_advantages: true
+topk: 32
+group_size: 8
+batch_groups: 128
+max_sessions: 32
+max_staleness: 4
+sampler_kind: inflight
+steps: 1000
+save_every: 1
+keep_checkpoints: 2
+ray_resources:
+  libero: 32
+ray_num_cpus: 32
+init_checkpoint: ???

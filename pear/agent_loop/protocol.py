@@ -25,6 +25,21 @@ class JsonBlockProtocol:
         """Returns the text of a user turn: the parts' quantities as JSON, then ``reminder``."""
         return json.dumps(state) + "\n\n" + reminder
 
+    @classmethod
+    def parse(cls, text: str, think_end: str | None = None) -> str:
+        """The last JSON object after the model's thinking, kept as text for the tool adapter."""
+        answer = text.rpartition(think_end)[2] if think_end else text
+        blocks = cls.JSON_BLOCK_PATTERN.findall(answer)
+        if not blocks:
+            raise NoToolCall("no ```json block found", text, answer)
+        try:
+            json.loads(blocks[-1])
+        except json.JSONDecodeError as exc:
+            raise NoToolCall(
+                f"the ```json block is not valid JSON ({exc.msg} at line {exc.lineno})", text, answer
+            ) from None
+        return blocks[-1]
+
     @staticmethod
     def check_action(action: Any, schema: dict[str, tuple[str, ...]]) -> None:
         """Raises InvalidAction unless ``action`` gives every quantity of every part of ``schema`` as a finite
@@ -43,3 +58,12 @@ class JsonBlockProtocol:
 
 class InvalidAction(ValueError):
     """Raised for an answer whose json block is no action of the family's schema; its message is the reason."""
+
+
+class NoToolCall(ValueError):
+    """An answer without a usable JSON block, with its original text and the answer after thinking."""
+
+    def __init__(self, reason: str, text: str, answer: str) -> None:
+        super().__init__(reason)
+        self.text = text
+        self.answer = answer

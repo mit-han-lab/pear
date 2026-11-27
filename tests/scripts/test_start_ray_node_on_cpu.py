@@ -35,19 +35,20 @@ class NodeStart:
             path.write_text(text)
             path.chmod(0o755)
 
-    def run(self, role: str, **variables: str) -> list[str]:
+    def run(self, role: str, address: str | None = None, **variables: str) -> list[str]:
         """Starts the head of a cluster as a machine of ``role`` and returns the arguments ray got."""
         environment = {
             "PATH": f"{self.directory / 'bin'}:{os.environ['PATH']}",
             "WORK_DIR": str(self.directory / "work"),
             "VERL_ENV": str(self.directory / "env"),
+            "TINKER_ENV": str(self.directory / "env"),
             "LOCAL_DIR": str(self.local_dir),
             "RAY_RECORD": str(self.ray_record),
             **variables,
         }
 
         subprocess.run(
-            ["bash", str(REPO / "scripts/start_ray_node.sh"), role],
+            ["bash", str(REPO / "scripts/start_ray_node.sh"), role, *([address] if address else [])],
             env=environment,
             umask=CALLER_UMASK,
             check=True,
@@ -85,3 +86,33 @@ def test_a_rollout_machine_registers_its_libero_slots_next_to_its_role(node_star
 
     # what a LIBERO family counts its servers from (server_n of its env class)
     assert json.loads(resources.removeprefix("--resources=")) == {"rollout": GPU_N, "libero": 12}
+
+
+@pytest.mark.parametrize("role", ["cpu", "libero"])
+@pytest.mark.parametrize("address", [None, "ray-head:6379"])
+def test_cpu_nodes_need_no_nvidia_tools(node_start, role, address):
+    (node_start.directory / "bin/nvidia-smi").write_text("#!/bin/sh\nexit 99\n")
+    arguments = node_start.run(role, address, NUM_CPUS="4")
+    assert "--num-gpus=0" in arguments and "--num-cpus=4" in arguments
+    assert ("--head" if address is None else f"--address={address}") in arguments
+    resources = json.loads(next(a.removeprefix("--resources=") for a in arguments if a.startswith("--resources=")))
+    assert resources == {"libero": 4 if role == "libero" else 0}
+
+
+@pytest.mark.parametrize("cpu_slots", [0, 2])
+def test_isaac_nodes_offer_only_explicit_spare_cpu_capacity(node_start, cpu_slots):
+    runtime = node_start.directory / "isaac"
+    (runtime / "kit_exts").mkdir(parents=True)
+    (runtime / "RoboDojo").mkdir()
+    arguments = node_start.run(
+        "robodojo", "ray-head:6379", SIM_RUNTIME_DIR=str(runtime), SIM_LIBERO_CPUS=str(cpu_slots)
+    )
+    assert f"--num-cpus={cpu_slots}" in arguments and f"--num-gpus={GPU_N}" in arguments
+    resources = json.loads(next(a.removeprefix("--resources=") for a in arguments if a.startswith("--resources=")))
+    assert resources == {"robodojo": GPU_N, **({"libero": cpu_slots} if cpu_slots else {})}
+
+
+def test_cpu_worker_rejects_oversubscribed_libero_capacity(node_start):
+    with pytest.raises(subprocess.CalledProcessError) as error:
+        node_start.run("libero", NUM_CPUS="2", LIBERO_SERVERS_PER_NODE="3")
+    assert "must fit the offered CPU slots" in error.value.stderr

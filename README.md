@@ -67,6 +67,7 @@ Then start a Ray cluster and launch your first run:
 - [Installation](docs/getting_started/installation.md)
 - [Quick Start](docs/getting_started/quickstart.md)
 - [Recipes](examples/README.md)
+- [Tinker backend](examples/tinker/README.md): sampling and LoRA training through Tinker with PEAR's simulators
 
 ## Supported Models
 
