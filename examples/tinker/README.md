@@ -3,6 +3,8 @@
 Run PEAR's sampling and LoRA training on Tinker, with simulators on your own machines. The backend uses the
 Tinker Cookbook's environment and sampler interfaces with PEAR's prompts, action parser and rewards.
 The coordinator and LIBERO run on CPUs; RoboDojo and RoboLab require GPUs for their simulators.
+Camera frames use lossless PNG transport. `model_revision` pins tokenizer and image processor assets to PEAR's
+Hugging Face revision; Tinker does not expose a base-weight revision through its model-info API.
 
 ## Install and run
 

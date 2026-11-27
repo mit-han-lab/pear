@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -16,6 +17,7 @@ class TinkerConfig:
     episode_files: list[str]
     tool_configs: list[str]
     run_dir: str
+    model_revision: str | None = None
     think_end: str | None = None
     context_length: int = 262144
     max_prompt_tokens: int = 4096
@@ -75,6 +77,8 @@ class TinkerConfig:
         return config
 
     def validate(self) -> None:
+        if self.model_revision is not None and not re.fullmatch(r"[0-9a-f]{40}", self.model_revision):
+            raise ValueError("model_revision must be a full Hugging Face commit hash")
         for name in (
             "context_length",
             "max_prompt_tokens",

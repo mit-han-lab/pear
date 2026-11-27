@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import pkgutil
-from copy import deepcopy
+from dataclasses import replace
 from functools import lru_cache
 from pathlib import Path
 
 from omegaconf import OmegaConf
+from PIL import Image
 
 from pear.agent_loop.tasks import load_tasks
 from pear.envs.session import EnvironmentSession
@@ -38,22 +40,74 @@ def resource_plan(tool_configs, resources, available, nodes):
 
 
 def make_renderer(config):
-    return _renderer(config.base_model, config.renderer, json.dumps(config.image_processor_options, sort_keys=True))
+    if not config.model_revision:
+        raise ValueError("set model_revision to the Hugging Face commit for the service model's assets")
+    return _renderer(
+        config.base_model,
+        config.model_revision,
+        config.renderer,
+        json.dumps(config.image_processor_options, sort_keys=True),
+    )
 
 
 @lru_cache
-def _renderer(model: str, name: str, options: str):
-    from tinker_cookbook.image_processing_utils import get_image_processor
+def _renderer(model: str, revision: str, name: str, options: str):
     from tinker_cookbook.renderers import get_renderer
-    from tinker_cookbook.tokenizer_utils import get_tokenizer
+    from transformers import AutoImageProcessor, AutoTokenizer
 
-    tokenizer = get_tokenizer(model)
-    processor = deepcopy(get_image_processor(model))
+    asset_model = model.split(":")[0]
+    tokenizer = AutoTokenizer.from_pretrained(asset_model, revision=revision)
+    processor = AutoImageProcessor.from_pretrained(asset_model, revision=revision)
     for key, value in json.loads(options).items():
         if processor is None or not hasattr(processor, key):
             raise ValueError(f"image processor has no option {key!r}")
         setattr(processor, key, value)
-    return get_renderer(name, tokenizer, processor, model_name=model)
+    return LosslessRenderer(get_renderer(name, tokenizer, processor, model_name=model))
+
+
+class LosslessRenderer:
+    """Keep Cookbook rendering and token counts, but transport PEAR's original frames losslessly."""
+
+    def __init__(self, renderer):
+        self.renderer = renderer
+
+    def __getattr__(self, name):
+        return getattr(self.renderer, name)
+
+    @staticmethod
+    def _chunks(chunks, messages):
+        from tinker.types import ImageChunk
+
+        frames = [
+            part["image"]
+            for message in messages
+            if not isinstance(message["content"], str)
+            for part in message["content"]
+            if part["type"] == "image"
+        ]
+        positions = [i for i, chunk in enumerate(chunks) if isinstance(chunk, ImageChunk)]
+        if len(positions) != len(frames):
+            raise ValueError("PEAR requires one image chunk per observation frame")
+        chunks = list(chunks)
+        for index, frame in zip(positions, frames, strict=True):
+            if not isinstance(frame, Image.Image):
+                raise TypeError("PEAR observation frames must be PIL images")
+            data = io.BytesIO()
+            frame.save(data, format="PNG")
+            chunks[index] = ImageChunk(
+                data=data.getvalue(), format="png", expected_tokens=chunks[index].expected_tokens
+            )
+        return chunks
+
+    def build_generation_prompt(self, messages):
+        from tinker import ModelInput
+
+        prompt = self.renderer.build_generation_prompt(messages)
+        return ModelInput(chunks=self._chunks(prompt.chunks, messages))
+
+    def render_message(self, message, ctx):
+        rendered = self.renderer.render_message(message, ctx)
+        return replace(rendered, output=self._chunks(rendered.output, [message]))
 
 
 class PearDataset:

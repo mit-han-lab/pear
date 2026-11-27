@@ -1,5 +1,6 @@
 # A small LIBERO run using two CPU simulator workers.
 base_model: Qwen/Qwen3.8-27B:peft:262144
+model_revision: 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0
 renderer: qwen3_8_xhigh_reasoning
 think_end: </think>
 episode_files:
