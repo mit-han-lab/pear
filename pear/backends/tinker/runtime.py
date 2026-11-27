@@ -8,12 +8,9 @@ from functools import lru_cache
 from pathlib import Path
 
 from omegaconf import OmegaConf
-from tinker_cookbook.rl.types import RLDataset
 
 from pear.agent_loop.tasks import load_tasks
 from pear.envs.session import EnvironmentSession
-
-from .rollout import PearEnvGroupBuilder
 
 
 def resource_plan(tool_configs, resources, available, nodes):
@@ -59,9 +56,10 @@ def _renderer(model: str, name: str, options: str):
     return get_renderer(name, tokenizer, processor, model_name=model)
 
 
-class PearDataset(RLDataset):
+class PearDataset:
+    """Validated tasks for the rollout pool and evaluation."""
+
     def __init__(self, config, tool_configs: dict[str, dict], evaluation: bool = False) -> None:
-        self.config, self.tool_configs = config, tool_configs
         paths = config.eval_episode_files if evaluation else config.episode_files
         self.tasks = load_tasks(paths)
         if not self.tasks:
@@ -69,18 +67,6 @@ class PearDataset(RLDataset):
         for task in self.tasks:
             if task.env_class not in tool_configs:
                 raise ValueError(f"no environment configuration for {task.env_class}")
-
-    def __len__(self) -> int:
-        return (len(self.tasks) + self.config.batch_groups - 1) // self.config.batch_groups
-
-    def get_batch(self, index: int):
-        if not 0 <= index < len(self):
-            raise IndexError(index)
-        start = index * self.config.batch_groups
-        return [
-            PearEnvGroupBuilder(self.config, task, self.tool_configs[task.env_class])
-            for task in self.tasks[start : start + self.config.batch_groups]
-        ]
 
 
 class SimulatorRuntime:
