@@ -58,7 +58,8 @@ is a LoRA starting point to tune. See the [simulator setup](../models/qwen3_8_27
 
 The default objective is native StableReinforce with sampler–learner KL disabled. PEAR's group-standardized
 advantages, observation masking, full-batch token normalization and constant-reward filtering are preserved.
-LoRA with StableReinforce has not been shown to reproduce the original full-model PEAR training results.
+The native and explicit PEAR paths produced different updates in a fixed-batch service comparison.
+Learning parity with the original full-model PEAR recipe remains unverified.
 
 `batch_groups` controls groups per update, `max_sessions` limits concurrent episodes, and `prefetch_groups=0`
 collects only the next batch. A group can be collected through fewer sessions than its `group_size`.
