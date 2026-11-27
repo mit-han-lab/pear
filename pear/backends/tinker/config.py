@@ -51,6 +51,7 @@ class TinkerConfig:
     max_groups_per_step: int = 0
     save_every: int = 1
     keep_checkpoints: int = 2
+    dump_training_batch: bool = False
     init_checkpoint: str | None = None
     eval_episode_files: list[str] = field(default_factory=list)
     eval_group_size: int = 1
@@ -153,6 +154,7 @@ class TinkerConfig:
             "train_inflight_requests",
             "save_every",
             "keep_checkpoints",
+            "dump_training_batch",
             "allow_head_continuations",
             "eval_episode_files",
             "eval_group_size",

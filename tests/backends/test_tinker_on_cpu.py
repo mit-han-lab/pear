@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import pickle
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -26,7 +27,7 @@ from pear.backends.tinker.loss import (
 )
 from pear.backends.tinker.preflight import preflight
 from pear.backends.tinker.rollout import EpisodeRollout
-from pear.backends.tinker.state import Checkpoints, Group
+from pear.backends.tinker.state import Checkpoints, Group, RunState
 from pear.backends.tinker.train import evaluate, train
 from pear.backends.tinker.usage import Usage
 from pear.envs.session import EnvironmentSession
@@ -438,9 +439,16 @@ async def test_native_loss_keeps_provenance_images_and_global_token_weighting(se
 
 
 @pytest.mark.asyncio
-async def test_native_resume_recollects_session_bound_rollouts(setup, monkeypatch):
+@pytest.mark.parametrize("checkpoint_form", ["compact", "diagnostic", "legacy"])
+async def test_native_resume_recollects_session_bound_rollouts(setup, monkeypatch, checkpoint_form):
     config, session, task, runtime = setup
-    config = replace(config, objective="stable_reinforce", max_sessions=config.group_size)
+    config = replace(
+        config,
+        objective="stable_reinforce",
+        max_sessions=config.group_size,
+        prefetch_groups=0,
+        dump_training_batch=checkpoint_form != "compact",
+    )
     service = TestService()
     original = TestTrainingClient.forward_backward
 
@@ -450,17 +458,69 @@ async def test_native_resume_recollects_session_bound_rollouts(setup, monkeypatc
     monkeypatch.setattr(TestTrainingClient, "forward_backward", fail)
     with pytest.raises(RuntimeError, match="service disconnected"):
         await train(config, runtime, SimpleNamespace(tasks=[task]), TestRenderer(), service)
-    state, _ = Checkpoints(config).load()
-    assert state.step == 0 and state.groups[0].complete
-    discarded = sum(t is not None for g in state.groups for t in g.trajectories)
+    checkpoints = Checkpoints(config)
+    state, _ = checkpoints.load()
+    assert state.step == 0 and all(t is None for g in state.groups for t in g.trajectories)
+    discarded = state.counters["pending_episodes"]
+    discarded_tokens = state.counters["pending_generated_tokens"]
+    assert discarded == config.group_size and discarded_tokens > 0
+    dump = checkpoints.root / "batch.pkl"
+    assert dump.exists() == (checkpoint_form != "compact")
+    if dump.exists():
+        with dump.open("rb") as file:
+            groups = pickle.load(file)
+        assert groups[0].complete
+        assert sum(t.generated_tokens for g in groups for t in g.trajectories) == discarded_tokens
+        if checkpoint_form == "legacy":
+            state.groups = groups
+            state.counters.pop("pending_episodes")
+            state.counters.pop("pending_generated_tokens")
+            with (checkpoints.root / "step_00000000.pkl").open("wb") as file:
+                pickle.dump(state, file)
     old_episodes = set(session.client.closed)
     monkeypatch.setattr(TestTrainingClient, "forward_backward", original)
-    result = await train(config, runtime, SimpleNamespace(tasks=[task]), TestRenderer(), service)
+    result = await train(
+        replace(config, dump_training_batch=False), runtime, SimpleNamespace(tasks=[task]), TestRenderer(), service
+    )
     assert result["step"] == 1 and service.resumed_optimizer
     state, _ = Checkpoints(config).load()
     assert state.counters["session_discarded_episodes"] == discarded
+    usage = Usage(config.run_dir)
+    assert usage.totals["resume_discarded_episodes"] == discarded
+    assert usage.totals["resume_discarded_generated_tokens"] == discarded_tokens
     assert len(set(session.client.closed) - old_episodes) >= config.group_size
     assert not session.client.steps
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("objective", ["stable_reinforce", "pear", "importance_sampling", "ppo"])
+async def test_checkpoints_keep_payloads_only_for_replayable_objectives(setup, objective):
+    config, _, _, _ = setup
+    native = objective == "stable_reinforce"
+    checkpoints = Checkpoints(replace(config, objective=objective))
+    # A native snapshot must not even attempt to pickle the trajectory payload.
+    trajectory = SimpleNamespace(generated_tokens=7, payload=(lambda: None) if native else b"camera")
+    pending = Group("pending", 0, 2, [trajectory, trajectory])
+    queued = Group("queued", 1, 1, [trajectory, None])
+    state = RunState(step=3, epoch=2, cursor=1, next_group=8, groups=[queued])
+    client = await TestService().create_lora_training_client()
+    path = await checkpoints.save(client, state)
+    saved, model_path = checkpoints.load()
+    assert model_path == path
+    assert saved.counters.get("pending_episodes", 0) == int(native)
+    checkpoints.save_pending(state, [pending])
+    saved, model_path = checkpoints.load()
+    assert model_path == path
+    assert (saved.step, saved.epoch, saved.cursor, saved.next_group) == (3, 2, 1, 8)
+    assert [(g.uid, g.task_index, g.dispatch_step) for g in saved.groups] == [("pending", 0, 2), ("queued", 1, 1)]
+    if native:
+        assert all(t is None for g in saved.groups for t in g.trajectories)
+        assert saved.counters["pending_episodes"] == 3 and saved.counters["pending_generated_tokens"] == 21
+    else:
+        assert saved.groups == [pending, queued]
+    assert state.groups == [queued] and queued.trajectories == [trajectory, None]
+    assert pending.trajectories == [trajectory, trajectory] and "pending_episodes" not in state.counters
+    assert not (checkpoints.root / "batch.pkl").exists()
 
 
 def test_native_recipe_defaults_and_kl_validation():

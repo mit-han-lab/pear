@@ -38,6 +38,9 @@ bash examples/tinker/run_libero.sh train --config examples/tinker/libero.yaml st
 Evaluation uses the latest checkpoint in the same run directory, or the base model if none exists.
 Pass `--checkpoint` to select another Tinker checkpoint. Native training resamples pending trajectories after a
 restart because Tinker's sampling records belong to the previous service session.
+Native checkpoints keep task order, group metadata and discard counts; other objectives retain trajectories for
+replay. Set `dump_training_batch=true` to save the latest full batch in `checkpoints/batch.pkl` for debugging.
+That optional dump is separate from the restart checkpoint.
 
 ## Training recipes
 
@@ -78,7 +81,9 @@ NUM_CPUS=8 LIBERO_SERVERS_PER_NODE=4 bash scripts/start_ray_node.sh libero "$HEA
 RAY_ENV="$WORK_DIR/envs/tinker" bash scripts/start_ray_node.sh robodojo "$HEAD_ADDRESS"
 ```
 
-Nodes need the same PEAR checkout and compatible Ray/Python versions. Set WORK_DIR on each machine.
+CPU roles require NUM_CPUS to be set to the slots allocated to that node. Nodes need the same PEAR checkout and
+compatible Ray/Python versions. Set WORK_DIR on each machine. Isaac roles keep their original Ray environment;
+set RAY_ENV explicitly to use the Tinker environment, as above.
 For stage 3, set ROBODOJO_SERVER_N and ROBODOJO_APPS_PER_GPU to the allocated simulator capacity.
 Isaac workers can also serve LIBERO with `SIM_LIBERO_CPUS=2 LIBERO_SERVERS_PER_NODE=2` when LIBERO is installed;
 leave enough CPU capacity for Isaac. A run owns the named simulator pools on its Ray cluster.

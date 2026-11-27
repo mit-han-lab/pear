@@ -85,8 +85,11 @@ async def train(config, runtime, dataset, renderer, service, usage=None) -> dict
     if restored and record_stability:
         # Stability records belong to the old ServiceClient session. Retain tasks and optimizer state,
         # but collect every member again so a resumed group never mixes valid and expired provenance.
-        discarded = sum(t is not None for group in state.groups for t in group.trajectories)
-        discarded_tokens = sum(
+        # Older checkpoints still contain trajectories; new native checkpoints keep only these counts.
+        discarded = state.counters.pop("pending_episodes", 0) + sum(
+            t is not None for group in state.groups for t in group.trajectories
+        )
+        discarded_tokens = state.counters.pop("pending_generated_tokens", 0) + sum(
             t.generated_tokens for group in state.groups for t in group.trajectories if t is not None
         )
         usage.record(

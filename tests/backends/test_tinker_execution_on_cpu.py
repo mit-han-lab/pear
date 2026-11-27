@@ -181,6 +181,7 @@ def test_group_size_is_independent_of_global_session_count():
     assert config.group_size == 8
     assert replace(config, train_inflight_requests=1).signature() == config.signature()
     assert replace(config, prefetch_groups=0).signature() == config.signature()
+    assert replace(config, dump_training_batch=True).signature() == config.signature()
     for value in (0, 2, None):
         replace(config, prefetch_groups=value).validate()
     for value in (-1, True, 1.5):

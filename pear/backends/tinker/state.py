@@ -104,16 +104,36 @@ class Checkpoints:
         return saved.path
 
     def save_pending(self, state: RunState, groups: list[Group]) -> None:
-        """Keep an expensive batch before submitting its update, paired with the preceding saved optimizer."""
+        """Save pending tasks, and replayable trajectories, against the preceding saved optimizer."""
         meta = self.reference()
         if meta is not None and meta["step"] == state.step:
             self._write_state(replace(state, groups=[*groups, *state.groups]))
+        if self.config.dump_training_batch:
+            self._write_pickle(self.root / "batch.pkl", groups)
 
     def _write_state(self, state: RunState) -> None:
-        path = self.root / f"step_{state.step:08d}.pkl"
+        if self.config.objective == "stable_reinforce":
+            # Native provenance cannot be replayed in a new service session. Snapshot metadata without
+            # mutating live groups or traversing their prompts, tokens and camera payloads in pickle.
+            episodes = tokens = 0
+            groups = []
+            for group in state.groups:
+                for trajectory in group.trajectories:
+                    if trajectory is not None:
+                        episodes += 1
+                        tokens += trajectory.generated_tokens
+                groups.append(replace(group, trajectories=[None] * len(group.trajectories)))
+            counters = dict(state.counters)
+            counters["pending_episodes"] = counters.get("pending_episodes", 0) + episodes
+            counters["pending_generated_tokens"] = counters.get("pending_generated_tokens", 0) + tokens
+            state = replace(state, groups=groups, counters=counters)
+        self._write_pickle(self.root / f"step_{state.step:08d}.pkl", state)
+
+    @staticmethod
+    def _write_pickle(path: Path, value) -> None:
         temporary = path.with_suffix(".tmp")
         with temporary.open("wb") as file:
-            pickle.dump(state, file, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump(value, file, protocol=pickle.HIGHEST_PROTOCOL)
             file.flush()
             os.fsync(file.fileno())
         os.replace(temporary, path)
