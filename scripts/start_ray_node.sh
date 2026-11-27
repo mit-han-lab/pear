@@ -7,8 +7,8 @@
 #   bash scripts/start_ray_node.sh rollout <head ip>:6379    # the vLLM replicas and LIBERO's simulators
 #   bash scripts/start_ray_node.sh robodojo <head ip>:6379   # a RoboDojo simulator machine
 #   bash scripts/start_ray_node.sh robolab <head ip>:6379    # a RoboLab simulator machine
-#   bash scripts/start_ray_node.sh cpu                     # a Tinker coordinator, or worker with a head address
-#   bash scripts/start_ray_node.sh libero <head ip>:6379    # CPU-only LIBERO workers
+#   NUM_CPUS=2 bash scripts/start_ray_node.sh cpu           # a Tinker coordinator, or worker with a head address
+#   NUM_CPUS=8 bash scripts/start_ray_node.sh libero <head ip>:6379  # CPU-only LIBERO workers
 # Start it from a clean shell: a Conda base's compiler variables and library paths would reach the simulators. On a
 # shared network turn on Ray's token authentication, on every machine and for the recipe:
 #   export RAY_AUTH_MODE=token RAY_AUTH_TOKEN_PATH=<a file only you can read>
@@ -29,7 +29,7 @@ RAY_ENV=${RAY_ENV:-}
 # the machine's own disk: not a shared file system, and not a /tmp held in memory
 LOCAL_DIR=${LOCAL_DIR:-/var/tmp/${USER:-$(id -un)}/pear}
 PORT=${PORT:-6379}     # of the head
-NUM_CPUS=${NUM_CPUS:-} # defaults: available CPUs on CPU nodes, 120 on model nodes
+NUM_CPUS=${NUM_CPUS:-} # required allocation on CPU nodes; defaults to 120 on model nodes
 # a rollout machine's LIBERO servers, one CPU slot each: a run starts one per slot of its cluster; enough that the
 # machine's sessions seldom queue for a simulator, speculative decoding's shorter generation included
 LIBERO_SERVERS_PER_NODE=${LIBERO_SERVERS_PER_NODE:-}
@@ -142,15 +142,9 @@ configure_robolab_machine() {
   offer_simulator_resources
 }
 
-# A configured Tinker environment is preferred; existing simulator installations keep their Ray fallback.
+# Keep each simulator's existing Ray environment unless the caller selects another one.
 simulator_ray() {
-  if [ -n "$RAY_ENV" ]; then
-    RAY=$RAY_ENV/bin/ray
-  elif [ -x "$TINKER_ENV/bin/ray" ]; then
-    RAY=$TINKER_ENV/bin/ray
-  else
-    RAY=$1/bin/ray
-  fi
+  RAY=${RAY_ENV:-$1}/bin/ray
 }
 
 # An Isaac App's CPU and memory needs remain outside Ray's CPU scheduling. Advertise only an explicit spare budget.
@@ -174,7 +168,7 @@ check_libero_capacity() {
 
 configure_cpu_machine() {
   RAY=${RAY_ENV:-$TINKER_ENV}/bin/ray
-  NUM_CPUS=${NUM_CPUS:-$(getconf _NPROCESSORS_ONLN)}
+  : "${NUM_CPUS:?set NUM_CPUS to the CPU slots allocated to this Ray node}"
   OBJECT_STORE_GB=${OBJECT_STORE_GB:-2}
   if [ "$ROLE" = libero ]; then
     LIBERO_SERVERS_PER_NODE=${LIBERO_SERVERS_PER_NODE:-$NUM_CPUS}
