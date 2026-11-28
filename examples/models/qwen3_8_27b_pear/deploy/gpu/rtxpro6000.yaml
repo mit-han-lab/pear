@@ -1,0 +1,7 @@
+# @package _global_
+# The deploy server's engine arguments on one RTX PRO 6000 (96 GB), composed as +gpu=rtxpro6000: GB300's, without
+# vLLM's TRT-LLM attention kernels (SM100's).
+engine:
+  kv_cache_dtype: auto  # the model's bf16; fp8_e4m3: the cache as e4m3 at scale 1
+  # what the engine takes of the GPU: the decode megakernel's and its draft's buffers live outside it
+  gpu_memory_utilization: 0.85

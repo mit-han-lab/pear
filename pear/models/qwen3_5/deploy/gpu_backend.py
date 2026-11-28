@@ -110,3 +110,20 @@ class Nvfp4CheckpointMixin:
         if vllm_config.kernel_config.linear_backend == "auto":
             vllm_config.kernel_config.linear_backend = cls.LINEAR_BACKEND
         super().install(vllm_config)
+
+
+class Fp8KvCacheMixin:
+    """What a backend adds whose build of the megakernel reads an FP8 KV cache: the cache's e4m3 rows at scale 1."""
+
+    KV_CACHE_DTYPES = ("fp8", "fp8_e4m3")  # "fp8" is e4m3 on CUDA
+
+    @classmethod
+    def can_implement(cls, vllm_config: VllmConfig) -> tuple[bool, str | None]:
+        is_implementable, reason = super().can_implement(vllm_config)
+        if not is_implementable:
+            return is_implementable, reason
+
+        if getattr(vllm_config.cache_config, "calculate_kv_scales", False):
+            return False, "its attention reads the FP8 KV cache at scale 1, not with calculated KV scales"
+
+        return True, None

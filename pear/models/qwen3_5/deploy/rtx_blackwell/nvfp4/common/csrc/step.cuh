@@ -2,7 +2,7 @@
 // the paged KV cache blocks of the attention layers and the Gated DeltaNet state slots (the Instr struct lives in
 // megakernel.cuh).
 #pragma once
-#include "common.cuh"
+// (after the GPU's csrc/common.cuh, which every includer includes first)
 
 namespace mk {
 

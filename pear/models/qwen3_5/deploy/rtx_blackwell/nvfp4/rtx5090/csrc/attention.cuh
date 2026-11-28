@@ -3,7 +3,7 @@
 // FlashInfer's NHD layout [kernel blocks of 16 tokens][token][4 heads][k 256 | v 256] bytes.
 #pragma once
 #include "common.cuh"
-#include "step.cuh"
+#include "../../common/csrc/step.cuh"
 
 namespace mk {
 

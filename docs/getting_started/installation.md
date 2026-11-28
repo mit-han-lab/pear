@@ -5,8 +5,8 @@ it installs is pinned in the repository.
 
 ## Requirements
 
-- **GPU**: NVIDIA GB300, H100 or H200, with a driver for CUDA 13. The model server also runs on an RTX 5090; the
-  robot station needs no GPU
+- **GPU**: NVIDIA GB300, H100 or H200, with a driver for CUDA 13. The model server also runs on an RTX PRO 6000
+  or an RTX 5090; the robot station needs no GPU
 - **OS**: Linux on x86_64 or aarch64
 - **Tools**: bash 4.4 or newer, `git`, `curl`, `tar`, `patch`, `perl`, `gcc` and `g++`
 - **Network** while installing: PyPI, PyTorch's index, GitHub, conda-forge, the Hugging Face Hub and FlashInfer's

@@ -2,7 +2,7 @@
 // One persistent CTA per SM walks its instruction list (schedule.py); the MMAs are mma.sync with register accumulators.
 #pragma once
 #include "common.cuh"
-#include "step.cuh"
+#include "../../common/csrc/step.cuh"
 
 namespace mk {
 

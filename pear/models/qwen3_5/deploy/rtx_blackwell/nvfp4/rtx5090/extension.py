@@ -3,9 +3,9 @@ import torch
 from pear.models.qwen3_5.cuda_extension import CudaExtension
 
 
-class RtxBlackwellNvfp4Extension(CudaExtension):
-    """The decode megakernel of rtx_blackwell/nvfp4/csrc/ as torch.ops.pear_deploy_rtx_blackwell_nvfp4, built at first
-    use."""
+class Rtx5090Nvfp4Fp8KvExtension(CudaExtension):
+    """The RTX 5090's decode megakernel (rtx_blackwell/nvfp4/rtx5090/csrc/), on an FP8 e4m3 KV cache, as
+    torch.ops.pear_deploy_rtx_blackwell_nvfp4, built at first use."""
 
     OP_NAMESPACE = "pear_deploy_rtx_blackwell_nvfp4"
     # no fast math: the kernel reproduces the lowerings of the kernels it replaces
