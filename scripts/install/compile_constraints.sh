@@ -4,11 +4,12 @@
 # pins) with the SHA-256 of every file of each version, which uv checks at every install. It needs uv and the network,
 # and no work directory.
 #   bash scripts/install/compile_constraints.sh <environment>
-#   environments: verl | server | libero | libero_plus | libero_pro | robodojo | evalscope | station | claude_code
+#   environments: verl | tinker | server | libero | libero_plus | libero_pro | robodojo | evalscope | station
+#                 claude_code
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-ENVIRONMENT=${1:?verl | server | libero | libero_plus | libero_pro | robodojo | evalscope | station | claude_code}
+ENVIRONMENT=${1:?supply an environment listed above}
 ENVIRONMENT_DIR=$ROOT/scripts/install/$ENVIRONMENT
 # a simulator environment's directory
 SIM_ENVIRONMENT_DIR=$ROOT/scripts/install/sim/$ENVIRONMENT
@@ -26,6 +27,10 @@ case "$ENVIRONMENT" in
   server)
     PYTHON_VERSION=$SERVER_PYTHON_VERSION
     INDEX_ARGS=(--torch-backend "$CUDA_TAG" --find-links "$FLASHINFER_CUBIN_WHEELS_URL")
+    ;;
+  tinker)
+    PYTHON_VERSION=$TINKER_PYTHON_VERSION
+    INDEX_ARGS=(--torch-backend cpu)
     ;;
   libero)
     ENVIRONMENT_DIR=$SIM_ENVIRONMENT_DIR
@@ -58,7 +63,7 @@ case "$ENVIRONMENT" in
     ;;
   *)
     echo "unknown environment $ENVIRONMENT" >&2
-    echo "  environments: verl | server | libero | libero_plus | libero_pro | robodojo | evalscope | station" \
+    echo "  environments: verl | tinker | server | libero | libero_plus | libero_pro | robodojo | evalscope | station" \
       "| claude_code" >&2
     exit 1
     ;;

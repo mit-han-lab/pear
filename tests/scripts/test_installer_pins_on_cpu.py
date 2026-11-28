@@ -11,6 +11,7 @@ INSTALL_DIR = REPO / "scripts/install"
 # constraints.txt: a simulator environment's is under sim/
 ENVIRONMENT_DIRS = {
     "verl": INSTALL_DIR / "verl",
+    "tinker": INSTALL_DIR / "tinker",
     "server": INSTALL_DIR / "server",
     "libero": INSTALL_DIR / "sim/libero",
     "libero_plus": INSTALL_DIR / "sim/libero_plus",
@@ -96,7 +97,7 @@ def test_every_extra_of_pyproject_is_installed_at_the_pins_of_an_environment():
 @pytest.mark.parametrize(("extra", "environment"), ENVIRONMENT_BY_EXTRA.items())
 def test_every_package_of_an_extra_is_pinned_in_the_environment_it_is_installed_at(extra, environment):
     # a requirement's name, without the extras it asks of the package and its marker
-    package_names = {PinFile.normalized(re.split(r"[\[;\s]", name)[0]) for name in EXTRAS[extra]}
+    package_names = {PinFile.normalized(re.split(r"[\[;<>=!~\s]", name)[0]) for name in EXTRAS[extra]}
     assert package_names <= set(PinFile.of_environment(environment))
 
 

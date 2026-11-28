@@ -9,3 +9,4 @@ recipe runs on the head of a Ray cluster, and its extra arguments are Hydra over
     station that runs with it
 - **[eval](eval/README.md)**: One evaluation per benchmark: LIBERO, LIBERO-Plus, LIBERO-Pro, RoboDojo, RoboLab-120
   and nine general benchmarks
+- **[Tinker](tinker/README.md)**: Sampling and LoRA training through Tinker, with PEAR's simulators.

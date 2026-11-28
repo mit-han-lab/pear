@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import json
-
 from pear.agent_loop.protocol import JsonBlockProtocol
+from pear.agent_loop.protocol import NoToolCall as NoToolCall
 from verl.experimental.agent_loop.tool_parser import FunctionCall, ToolParser
 from verl.tools.schemas import OpenAIFunctionToolSchema
 from verl.utils.ray_utils import get_event_loop
@@ -32,26 +31,5 @@ class JsonBlockToolParser(ToolParser):
         """Returns ``(text, [the call])`` from the last ```json block of the answer and raises NoToolCall when the
         answer has no usable one."""
         text = await get_event_loop().run_in_executor(None, self.tokenizer.decode, responses_ids)
-        answer = text.rpartition(self.THINK_END)[2] if self.THINK_END else text
-        blocks = JsonBlockProtocol.JSON_BLOCK_PATTERN.findall(answer)
-        if not blocks:
-            raise NoToolCall("no ```json block found", text, answer)
-
-        try:
-            json.loads(blocks[-1])  # the call carries the block's text: here it only has to parse
-        except json.JSONDecodeError as exc:
-            raise NoToolCall(
-                f"the ```json block is not valid JSON ({exc.msg} at line {exc.lineno})", text, answer
-            ) from None
-
-        return text, [FunctionCall(name=tools[0].function.name, arguments=blocks[-1])]
-
-
-class NoToolCall(ValueError):
-    """Raised for an answer without a usable ```json block; its message is the reason, ``text`` what the model
-    generated and ``answer`` what follows its thinking."""
-
-    def __init__(self, reason: str, text: str, answer: str) -> None:
-        super().__init__(reason)
-        self.text = text
-        self.answer = answer
+        arguments = JsonBlockProtocol.parse(text, self.THINK_END)
+        return text, [FunctionCall(name=tools[0].function.name, arguments=arguments)]

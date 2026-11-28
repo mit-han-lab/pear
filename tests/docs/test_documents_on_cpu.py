@@ -65,6 +65,8 @@ EXTERNAL_OPTIONS = {
     "--exclude",  # tar
     "--fixup",  # git commit
     "--onto",  # git rebase
+    "--rm",  # Docker removes an exited container
+    "--shm-size",  # Docker's shared-memory allocation
 }
 
 

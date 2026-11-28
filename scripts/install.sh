@@ -4,6 +4,7 @@
 #   WORK_DIR=<work dir> bash scripts/install.sh <target>
 # For every environment family (the target's script: scripts/install/<target>/install.sh):
 #   verl          the training and rollout environment
+#   tinker        the CPU coordinator for Tinker sampling and training
 #   evalscope     the general evaluation's environment and datasets
 #   numactl       numactl and numastat, on a machine that lacks them: libero_run runs it
 #   station       the robot station's environment, on the machine a robot is plugged into
@@ -24,7 +25,8 @@ set -euo pipefail
 
 INSTALL_DIR=$(cd "$(dirname "$0")/install" && pwd)
 TARGETS=(
-  verl evalscope numactl station server claude_code libero libero_plus libero_pro robodojo robolab mesa imagemagick
+  verl tinker evalscope numactl station server claude_code libero libero_plus libero_pro robodojo robolab
+  mesa imagemagick
   libero_run
 )
 

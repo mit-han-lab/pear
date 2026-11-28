@@ -14,6 +14,7 @@ from repository import REPO
 # every target of scripts/install.sh, in the order its usage names them
 TARGETS = [
     "verl",
+    "tinker",
     "evalscope",
     "numactl",
     "station",

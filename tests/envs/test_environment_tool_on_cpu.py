@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
+import sys
 
 import pytest
 from PIL import Image
@@ -14,8 +16,9 @@ from pear.envs.libero_plus.env import LiberoPlusEnv
 from pear.envs.libero_pro.env import LiberoProEnv
 from pear.envs.robodojo.env import RoboDojoEnv
 from pear.envs.robolab.env import RoboLabEnv
-from pear.envs.tool import EnvironmentTool
+from pear.envs.session import EnvironmentSession
 from pear.sim.env import BaseEnv, EpisodeLost
+from repository import REPO
 
 ENVS = [LiberoEnv, LiberoPlusEnv, LiberoProEnv, RoboDojoEnv, RoboLabEnv]
 # env args with what every family's task name reads
@@ -46,6 +49,10 @@ class FakeClient:
         self.calls.append("step")
         return self._result(action)
 
+    async def close(self, uid: str):
+        self.calls.append("close")
+        self.closed_uid = uid
+
     def _result(self, action):
         if self.lost_at == self.calls[-1]:
             raise EpisodeLost("the server process crashed")
@@ -74,12 +81,23 @@ def fake_clients(monkeypatch):
         monkeypatch.setattr(env_class, "CLIENT_CLASS_PATH", f"{FakeClient.__module__}.{FakeClient.__qualname__}")
 
 
+@pytest.fixture(params=["shared", "verl"])
+def session_class(request):
+    """The same episode behavior through the shared interface and through verl's adapter."""
+    if request.param == "shared":
+        return EnvironmentSession
+
+    from pear.envs.tool import EnvironmentTool
+
+    return EnvironmentTool
+
+
 class TrajectoryHarness:
     """The environment tool of a family's env class on a fake client, called as PearAgentLoop calls it for one
     trajectory."""
 
-    def __init__(self, env_class: type[BaseEnv], tmp_path) -> None:
-        self.tool = EnvironmentTool(
+    def __init__(self, session_class, env_class: type[BaseEnv], tmp_path) -> None:
+        self.tool = session_class(
             {"env_class": f"{env_class.__module__}.{env_class.__qualname__}", "log_dir": str(tmp_path)}
         )
         self.zero = {part: dict.fromkeys(quantities, 0.0) for part, quantities in env_class.SCHEMA.items()}
@@ -99,18 +117,16 @@ class TrajectoryHarness:
 
 
 @pytest.mark.parametrize("env_class", ENVS)
-def test_a_trajectory_s_answers_open_and_step_its_episode(env_class, tmp_path):
-    harness = TrajectoryHarness(env_class, tmp_path)
+def test_a_trajectory_s_answers_open_and_step_its_episode(session_class, env_class, tmp_path):
+    harness = TrajectoryHarness(session_class, env_class, tmp_path)
 
     [(content, opened), (_, stepped), (ended, _)] = harness.play(harness.zero, harness.zero)
 
     assert harness.tool.client.calls == ["open", "step", "step"]
-    assert content[0]["text"] == json.dumps({"arm": {"x": 1.0}}) + "\n\n" + EnvironmentTool.REMINDER
+    assert content[0]["text"] == json.dumps({"arm": {"x": 1.0}}) + "\n\n" + EnvironmentSession.REMINDER
     assert [block["text"] for block in content[1::2]] == [f"[{name}]" for name in env_class.CAMERAS]
     assert all(isinstance(block["image"], Image.Image) for block in content[2::2])
     assert stepped["actions"] == [harness.zero] * 2 and ended is None  # the episode ended: no next user turn
-    # named by its config's env class, which the episodes' rows select it by (EpisodeDataset)
-    assert harness.tool.name == f"{env_class.__module__}.{env_class.__qualname__}"
     assert "stack the bowls" in harness.tool.system_prompt(opened)
     records = [json.loads(line) for line in harness.log.read_text().splitlines()]
     assert [(record["steps_before"], record["executed"], record["success"]) for record in records] == [
@@ -121,11 +137,23 @@ def test_a_trajectory_s_answers_open_and_step_its_episode(env_class, tmp_path):
     assert all(record["env"] == ENV_ARGS and set(env_class.LOG_KEYS) <= set(record) for record in records)
     # every call carries its episode's uid, which tells a task's concurrent episodes apart (the val dump's episode uid)
     assert {record["uid"] for record in records} == {harness.episode.uid}
+    asyncio.run(harness.tool.close(harness.episode))
+    assert harness.tool.client.calls[-1] == "close"
+    assert harness.tool.client.closed_uid == harness.episode.uid
 
 
 @pytest.mark.parametrize("env_class", ENVS)
-def test_an_unusable_answer_raises_its_reason_and_never_reaches_the_client(env_class, tmp_path):
-    zero = TrajectoryHarness(env_class, tmp_path).zero
+def test_the_verl_tool_is_named_by_the_env_class_its_episode_rows_select(env_class, tmp_path):
+    from pear.envs.tool import EnvironmentTool
+
+    harness = TrajectoryHarness(EnvironmentTool, env_class, tmp_path)
+
+    assert harness.tool.name == f"{env_class.__module__}.{env_class.__qualname__}"
+
+
+@pytest.mark.parametrize("env_class", ENVS)
+def test_an_unusable_answer_raises_its_reason_and_never_reaches_the_client(session_class, env_class, tmp_path):
+    zero = TrajectoryHarness(session_class, env_class, tmp_path).zero
     part, quantity = next(iter(env_class.SCHEMA.items()))[0], env_class.SCHEMA[next(iter(env_class.SCHEMA))][0]
     unusable = {
         "must map exactly the parts": [[zero], {p: v for p, v in zero.items() if p != part}],
@@ -138,15 +166,17 @@ def test_an_unusable_answer_raises_its_reason_and_never_reaches_the_client(env_c
 
     for reason, actions in unusable.items():
         for action in actions:
-            harness = TrajectoryHarness(env_class, tmp_path)
+            harness = TrajectoryHarness(session_class, env_class, tmp_path)
             with pytest.raises(InvalidAction, match=reason):
                 harness.play(action)
             assert harness.tool.client.calls == ["open"]
 
 
 @pytest.mark.parametrize("lost_at, logged_call_n", [("open", 0), ("step", 1)])
-def test_a_call_that_loses_its_episode_leaves_no_record_in_the_call_log(monkeypatch, tmp_path, lost_at, logged_call_n):
-    harness = TrajectoryHarness(RoboDojoEnv, tmp_path)
+def test_a_call_that_loses_its_episode_leaves_no_record_in_the_call_log(
+    session_class, monkeypatch, tmp_path, lost_at, logged_call_n
+):
+    harness = TrajectoryHarness(session_class, RoboDojoEnv, tmp_path)
     monkeypatch.setattr(FakeClient, "lost_at", lost_at)
 
     with pytest.raises(EpisodeLost):  # the agent loop starts the trajectory over in a new episode
@@ -157,14 +187,26 @@ def test_a_call_that_loses_its_episode_leaves_no_record_in_the_call_log(monkeypa
     assert len(records) == logged_call_n
 
 
-def test_a_perturbed_libero_plus_viewpoint_keeps_the_agentview_line_s_first_clause(tmp_path):
-    tool = TrajectoryHarness(LiberoPlusEnv, tmp_path).tool
+def test_a_perturbed_libero_plus_viewpoint_keeps_the_agentview_line_s_first_clause(session_class, tmp_path):
+    tool = TrajectoryHarness(session_class, LiberoPlusEnv, tmp_path).tool
 
     standard = tool.system_prompt({"instruction": "x", "standard_camera": True})
     perturbed = tool.system_prompt({"instruction": "x", "standard_camera": False})
 
     assert "+x points toward the bottom of the image" in standard
     assert "- agentview: a fixed camera.\n" in perturbed and "+x points toward the bottom" not in perturbed
+
+
+def test_the_shared_session_imports_without_backend_packages():
+    # No site-packages: a backend can use the episode interface without importing another backend's stack.
+    process = subprocess.run(
+        [sys.executable, "-S", "-c", "from pear.envs.session import EnvironmentSession"],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+    )
+
+    assert process.returncode == 0, process.stderr
 
 
 def test_each_family_names_the_task_of_an_episode():
