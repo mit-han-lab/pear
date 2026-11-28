@@ -60,6 +60,7 @@ class Setup:
         monkeypatch.setenv("ROBODOJO_ROOT", str(self.repo))
         monkeypatch.setenv("ROBODOJO_KIT_EXTS_DIR", str(tmp_path / "kit_exts"))
         monkeypatch.setenv("ROBODOJO_LOCAL_DIR", str(tmp_path / "local"))
+        monkeypatch.delenv("ROBODOJO_PYTHON", raising=False)
         monkeypatch.delenv("ROBODOJO_MESH_STORE_TEMPLATE_DIR", raising=False)
         self.local_dir = tmp_path / "local" / "gpu1"  # in the node's local directory, named by the server's GPU
         # the processes the setup starts (the Apps it only makes), each a warm-up, whose build replies warm_up_reply
@@ -153,6 +154,15 @@ def test_a_server_fills_its_apps_kit_cache_template_in_a_warm_up_on_its_gpu(setu
     assert f"--portable-root {template}/kit" in kit and "--/renderer/activeGpu=1" in kit
     assert sorted(path.name for path in template.iterdir()) == sorted(RoboDojoApps.DIRECTORY_NAMES)
     assert len(apps) == APPS_PER_GPU
+
+
+def test_native_python_is_used_for_warm_up_and_episodes(setup, monkeypatch):
+    monkeypatch.setenv("ROBODOJO_PYTHON", "/sim/bin/python")
+
+    apps, _ = setup.setup_env()
+
+    assert setup.warm_ups[0].command[0] == "/sim/bin/python"
+    assert all(app.command[0] == "/sim/bin/python" for app in apps)
 
 
 def test_a_failed_warm_up_fails_the_server_before_any_app(setup):

@@ -87,6 +87,8 @@ RAY_ENV="$WORK_DIR/envs/tinker" bash scripts/start_ray_node.sh robodojo "$HEAD_A
 CPU roles require NUM_CPUS to be set to the slots allocated to that node. Nodes need the same PEAR checkout and
 compatible Ray/Python versions. Set WORK_DIR on each machine. Isaac roles keep their original Ray environment;
 set RAY_ENV explicitly to use the Tinker environment, as above.
+For a native RoboDojo installation, set ROBODOJO_PYTHON to its simulator Python; otherwise PEAR uses the Isaac
+container's Python wrapper.
 For stage 3, set ROBODOJO_SERVER_N and ROBODOJO_APPS_PER_GPU to the allocated simulator capacity.
 Isaac workers can also serve LIBERO with `SIM_LIBERO_CPUS=2 LIBERO_SERVERS_PER_NODE=2` when LIBERO is installed;
 leave enough CPU capacity for Isaac. A run owns the named simulator pools on its Ray cluster.
