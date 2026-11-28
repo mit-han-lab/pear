@@ -34,8 +34,23 @@ __device__ __forceinline__ bool opaque_flag(bool b) {
   asm volatile("" : "+r"(v));
   return v != 0;
 }
+// v, in the FP8 KV cache's build hidden from the compiler: what a role's op derives from its thread index, block index or
+// TMEM base is then computed inside the op instead of hoisted out of the role's instruction loop and held across every
+// other op, which the workers' register peak would spill (a no-op in the bf16 KV cache's build)
+__device__ __forceinline__ uint32_t fresh(uint32_t v) {
+#if MK_KV_FP8
+  asm volatile("" : "+r"(v));
+#endif
+  return v;
+}
+__device__ __forceinline__ int fresh(int v) { return (int)fresh((uint32_t)v); }
 // shared-memory loads / stores by 32-bit shared addresses (through the generic pointers of a struct the compiler
 // emits generic LD / ST: an address-space check on every access)
+__device__ __forceinline__ uint2 lds64(const void* p) {
+  uint2 v;
+  asm volatile("ld.shared.v2.u32 {%0, %1}, [%2];" : "=r"(v.x), "=r"(v.y) : "r"(smem_u32(p)));
+  return v;
+}
 __device__ __forceinline__ uint4 lds128(const void* p) {
   uint4 v;
   asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "r"(smem_u32(p)));
@@ -246,6 +261,14 @@ __device__ __forceinline__ uint32_t f32x2_to_e2m1x2(float lo, float hi) {
   asm("{\n .reg .b8 q;\n cvt.rn.satfinite.e2m1x2.f32 q, %2, %1;\n cvt.u32.u8 %0, q;\n}" : "=r"(r) : "f"(lo), "f"(hi));
   return r;
 }
+#if MK_KV_FP8
+// e4m3 codes of two floats (first -> low byte), round-to-nearest-even, saturating
+__device__ __forceinline__ uint32_t f32x2_to_e4m3x2(float lo, float hi) {
+  uint16_t r;
+  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;" : "=h"(r) : "f"(lo), "f"(hi));
+  return r;
+}
+#endif
 // Triton's lowerings (the PTX of vLLM's kernels): fp32 '/' = div.full, tl.rsqrt = rsqrt.approx.ftz
 __device__ __forceinline__ float div_full(float a, float b) {
   float r;

@@ -123,6 +123,21 @@ __device__ __noinline__ void book_inputs(const BookDesc& d, uint32_t T, int pt, 
   const int64_t ring_token = post_pending && pt < Tp ? reinterpret_cast<const int64_t*>(d.sampled)[r * d.nt + pt] : 0;
   const int64_t last_token = pt == 0 ? reinterpret_cast<const int64_t*>(d.last_sampled)[req] : 0;
   nc += post_pending ? (int32_t)Tp - rej : 0;
+#if MK_KV_FP8
+  // (the FP8 KV cache's build: the step's start with its loads in flight together; the same values to the same
+  // addresses) every KV cache group's count, row and destination with the states, before any store: lane g of every
+  // warp holds group g's (groups <= 32)
+  const int lane = pt & 31;
+  const uint32_t G = d.groups;
+  int n_l = 0;
+  uint64_t row_l = 0, out_l = 0;
+  if (lane < (int)G) {
+    n_l = reinterpret_cast<const int32_t*>(d.num_blocks)[(size_t)lane * d.num_blocks_stride + req];
+    row_l = reinterpret_cast<const uint64_t*>(d.bt_src)[lane] +
+            (uint64_t)(req * reinterpret_cast<const int64_t*>(d.bt_stride)[lane]) * sizeof(int32_t);
+    out_l = reinterpret_cast<const uint64_t*>(d.bt_dst)[lane];
+  }
+#endif
   const int last_row = ns > 0 ? ns - 1 : 0;  // (the thread holding the last sampled token)
   if (pt == last_row) reinterpret_cast<int32_t*>(d.input_ids)[0] = (int32_t)(ns > 0 ? ring_token : last_token);
   if (pt == 0) {
@@ -135,6 +150,33 @@ __device__ __noinline__ void book_inputs(const BookDesc& d, uint32_t T, int pt, 
     reinterpret_cast<int64_t*>(d.positions)[pt] = (int64_t)nc + pt;
     reinterpret_cast<bool*>(d.is_padding)[pt] = false;
   }
+#if MK_KV_FP8
+  // the rows by warps (warp w: groups w, w + nth / 32, ...): 16-byte pieces, BK_U a lane loaded before their stores, a
+  // row's last n % 4 ids one a lane; a row or destination not 16-byte aligned, or more than 32 groups: the loop below
+  const bool vec = G <= 32u && __all_sync(0xffffffffu, ((row_l | out_l) & 15u) == 0u);
+  if (vec) {
+    constexpr uint32_t BK_U = 8;
+#pragma unroll 1
+    for (uint32_t g = (uint32_t)pt >> 5; g < G; g += (uint32_t)nth >> 5) {  // (warp-uniform)
+      const int n = __shfl_sync(0xffffffffu, n_l, (int)g);
+      const uint4* s = reinterpret_cast<const uint4*>(__shfl_sync(0xffffffffu, row_l, (int)g));
+      uint4* o = reinterpret_cast<uint4*>(__shfl_sync(0xffffffffu, out_l, (int)g));
+      const uint32_t v = (uint32_t)n >> 2, tl = (uint32_t)n & 3u;
+      const int32_t tv = (uint32_t)lane < tl ? reinterpret_cast<const int32_t*>(s)[4 * v + lane] : 0;
+#pragma unroll 1
+      for (uint32_t b0 = lane; b0 < v; b0 += BK_U * 32) {
+        uint4 x[BK_U];
+#pragma unroll
+        for (uint32_t u = 0; u < BK_U; u++) x[u] = b0 + u * 32 < v ? s[b0 + u * 32] : make_uint4(0u, 0u, 0u, 0u);
+#pragma unroll
+        for (uint32_t u = 0; u < BK_U; u++)
+          if (b0 + u * 32 < v) o[b0 + u * 32] = x[u];
+      }
+      if ((uint32_t)lane < tl) reinterpret_cast<int32_t*>(o)[4 * v + lane] = tv;
+    }
+  }
+  if (!vec) {
+#endif
   const uint64_t* src = reinterpret_cast<const uint64_t*>(d.bt_src);
   const uint64_t* dst = reinterpret_cast<const uint64_t*>(d.bt_dst);
   const int64_t* stride = reinterpret_cast<const int64_t*>(d.bt_stride);
@@ -147,6 +189,9 @@ __device__ __noinline__ void book_inputs(const BookDesc& d, uint32_t T, int pt, 
 #pragma unroll 1
     for (int j = pt; j < n; j += nth) out[j] = row[j];
   }
+#if MK_KV_FP8
+  }
+#endif
   if (post_pending) {  // (post_pending is the record's: every thread reaches the barrier)
     named_sync(bar, nth);
     if (pt == last_row && ns > 0) reinterpret_cast<int64_t*>(d.last_sampled)[req] = ring_token;

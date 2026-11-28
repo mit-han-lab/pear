@@ -49,18 +49,35 @@ constexpr int KSTEP_BYTES = 32;                    // K bytes per MMA instructio
 constexpr int KSTEPS = CHUNK / KSTEP_BYTES;        // MMAs per stage
 
 // ---- warp roles (each walks the CTA's instruction list on its own; synchronized by mbarriers) ----
-constexpr int NW = 20, NTHREADS = NW * 32;
 constexpr int WG_WARPS = 4;  // warps per warpgroup, one per TMEM lane quadrant (the base taps', the epilogue's)
+#if MK_KV_FP8
+// the FP8 KV cache's build: 16 warps, the epilogue warpgroup also writing the convs' base taps (as the decode
+// megakernel's draft phase does), so that the workers' FP8 attention gets REG_HI of the 512 threads' budget
+constexpr int NW = 16, NTHREADS = NW * 32;
+constexpr int NBASE_WG = 0;  // warpgroups of their own for the base taps: none (dk_kernel.cu)
+constexpr int W_EPI0 = 0;   // 0..3: epilogue (TMEM -> split-K reduction -> the op's finisher), the base taps
+constexpr int W_PROD = 4;   // weight tiles by TMA into the ring (never waits on dependencies)
+constexpr int W_MMA = 5;    // tcgen05.mma issuer (6, 7 idle)
+constexpr int W_WRK0 = 8;   // 8..15: B operands, attention, top-k, selector, walk
+#else
+constexpr int NW = 20, NTHREADS = NW * 32;
+constexpr int NBASE_WG = 1;  // warpgroups of their own for the base taps: 0
 constexpr int W_SF0 = 0;    // 0..3: the convs' base taps into TMEM (lane quadrants 0..3)
 constexpr int W_EPI0 = 4;   // 4..7: epilogue (TMEM -> split-K reduction -> the op's finisher)
 constexpr int W_PROD = 8;   // weight tiles by TMA into the ring (never waits on dependencies)
 constexpr int W_MMA = 9;    // tcgen05.mma issuer (10, 11 idle)
 constexpr int W_WRK0 = 12;  // 12..19: B operands, attention, top-k, selector, walk
+#endif
 constexpr int NWRK = NW - W_WRK0, NWT = NWRK * 32;
 constexpr int NEPI = 128;
-// setmaxnreg per warpgroup: REG_IDLE for 0 (base taps), REG_LO for 2 (producer, MMA), REG_EPI for 1 (epilogue),
-// REG_HI for 3-4 (workers)
+// setmaxnreg per warpgroup: REG_IDLE for the base taps' (the bf16 KV cache's build), REG_LO for the producer's and the
+// MMA issuer's, REG_EPI for the epilogue's, REG_HI for the workers' (the last two)
+#if MK_KV_FP8
+// (the producer holds its state across a GEMV's stages in REG_LO; the epilogue with the base taps fits REG_EPI)
+constexpr int REG_LAUNCH = 128, REG_IDLE = 0, REG_LO = 64, REG_EPI = 112, REG_HI = 168;
+#else
 constexpr int REG_LAUNCH = 96, REG_IDLE = 32, REG_LO = 56, REG_EPI = 120, REG_HI = 136;
+#endif
 constexpr int SM_REGS = 65536;  // 32-bit registers per SM
 static_assert(NTHREADS * REG_LAUNCH <= SM_REGS, "launch registers");
 // a warpgroup's register count from the launch's (setmaxnreg: inc above it, dec below)
@@ -69,7 +86,8 @@ __device__ __forceinline__ void set_max_regs() {
   if constexpr (N > REG_LAUNCH) asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" ::"n"(N));
   else if constexpr (N < REG_LAUNCH) asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" ::"n"(N));
 }
-static_assert(WG_WARPS * 32 * (REG_IDLE + REG_LO + REG_EPI) + NWT * REG_HI <= NTHREADS * REG_LAUNCH, "register budget");
+static_assert(WG_WARPS * 32 * (NBASE_WG * REG_IDLE + REG_LO + REG_EPI) + NWT * REG_HI <= NTHREADS * REG_LAUNCH,
+              "register budget");
 constexpr int BAR_EPI = 2, BAR_WRK = 3;  // named barriers (0: __syncthreads)
 enum Role : int { R_PROD = 0, R_MMA = 1, R_SF = 2, R_EPI = 3, R_WRK = 4, NROLE = 5 };
 constexpr int MAX_INSTR = 63;  // instructions per SM the timestamps cover

@@ -14,8 +14,21 @@ constexpr int ATT_KOFF = ATT_HQ * 2 * ATT_D;           // 12288: k in the qkv pr
 constexpr int ATT_VOFF = ATT_KOFF + ATT_HKV * ATT_D;   // 13312
 constexpr int ATT_QKV = ATT_VOFF + ATT_HKV * ATT_D;    // 14336: the projection's outputs per token
 constexpr int ATT_OUT = ATT_HQ * ATT_D;                // 6144: the attention's output per token (the o_proj's K)
+#if MK_KV_FP8
+// The FP8 KV cache's build (MK_KV_FP8: vLLM's e4m3 cache at scale 1): a row of 512 bytes (k 256 | v 256 e4m3), kernel
+// blocks of 16 tokens (or 32 / 64); a page is 2 stages of 16 KB (K, V: each two SW128 boxes [64 keys][128 B], dims
+// 0..127 and 128..255), its kernel blocks' rows loaded as boxes of 16 (32 / 64) rows into the same smem image (the
+// swizzle repeats every 8 rows). Q and P in e4m3 (vLLM's query quantization at scale 1), S = Q K^T and O += P V on
+// kind::f8f6f4 (K = 32 per MMA). The softmax by .16x32bx2 TMEM accesses: a quadrant's rows live in its lanes 0..11
+// (R <= 48), so thread t takes the row of lane t % 16 and 16 of its warp's 32 keys of the page; O's rescale follows
+// the page's P (its wait for the previous P V overlaps P's computation), in one access.
+constexpr int ATT_PAGE = 64;                           // tokens per page (a ring item of 2 stages): 1, 2 or 4 kernel blocks
+constexpr uint32_t ATT_SLOTS = 2;                      // ring stages per page
+constexpr uint32_t ATT_ROWB = 512;                     // bytes per cache row (one token of one kv head: k | v)
+#else
 constexpr int ATT_PAGE = 64;                           // tokens per page (4 ring stages): 1 or 2 kernel blocks
 constexpr uint32_t ATT_SLOTS = 4;                      // ring stages per page
+#endif
 // extension stages: ATT_XS more 16 KB stages, slot e at xb + e * ATT_SLOT (the B buffers' region, the last reaching
 // into the staging buffer); one below the query rows' slots streams once the earlier MMAs are done (AB_XB), any other
 // once Q is in TMEM (AB_Q). An item's stage k is the ring's when k % (NST + ATT_XS) < NST, else an extension stage's
@@ -23,8 +36,38 @@ constexpr uint32_t ATT_XS = 5;
 constexpr uint32_t ATT_SLOT = 16384;                   // bytes per page stage: two boxes
 constexpr uint32_t ATT_BOX = 8192;                     // one TMA box: 64 keys x 128 bytes
 constexpr uint32_t ATT_PO_BLOCK = ATT_NT * 64 * 2;    // a partial block: [NT tokens][64 dims] bf16 (1 KB)
+#if MK_KV_FP8
+// TMEM columns: O [0, 256), the S / P buffers of 64 from 256, the e4m3 Q (256 dims, 64 columns) [448, 512)
+constexpr uint32_t ATT_T_O = 0, ATT_T_S = 256, ATT_T_Q = 448;
+constexpr uint32_t ATT_NB = 2;  // S / P buffers (QK of page j waits for P V of page j - ATT_NB)
+static_assert(ATT_NB <= 3, "S / P buffers: TMEM [256, 448)");
+// P = 2^(s - m + ATT_P_OFF) in e4m3 (FlashAttention-4's FP8 max offset 8): e4m3 keeps 2^-9..448, so the offset keeps
+// keys down to 2^-(9 + ATT_P_OFF) = 2^-17 of the row's max (normal down to 2^-14); the rescale threshold keeps
+// P <= 2^(ATT_P_OFF + ATT_RESCALE) = 2^8.8 < 448. l sums P as quantized (the values P V reads: numerator and denominator
+// over the same mass). O and l carry the same factor 2^ATT_P_OFF (every split's: the combine's weights cancel it).
+constexpr float ATT_RESCALE = 0.8f;                    // O is rescaled once a row's max grows by more (base 2)
+constexpr float ATT_P_OFF = 8.0f;
+static_assert(ATT_P_OFF + ATT_RESCALE <= 8.807f, "P <= 448, e4m3's largest");
+// TMA tensor-map load, 4D box {x bytes, token, head, kernel block} global -> shared with an L2 cache policy
+__device__ __forceinline__ void tma_load_4d_pol(void* smem, const void* tmap, int x, int t, int h, int kb, uint64_t* bar,
+                                                uint64_t pol) {
+  asm volatile(
+      "cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1, {%2, %3, %4, "
+      "%5}], [%6], %7;" ::"r"(smem_u32(smem)),
+      "l"(tmap), "r"(x), "r"(t), "r"(h), "r"(kb), "r"(smem_u32(bar)), "l"(pol)
+      : "memory");
+}
+// the sum of two e4m3 values (exact in f16)
+__device__ __forceinline__ float e4m3x2_sum(uint32_t e) {
+  float a, b;
+  asm("{\n .reg .b32 h;\n .reg .b16 lo, hi;\n cvt.rn.f16x2.e4m3x2 h, %2;\n mov.b32 {lo, hi}, h;\n"
+      " cvt.f32.f16 %0, lo;\n cvt.f32.f16 %1, hi;\n}" : "=f"(a), "=f"(b) : "h"((uint16_t)e));
+  return a + b;
+}
+#else
 constexpr uint32_t ATT_T_O = 0, ATT_T_S = 256, ATT_T_Q = 384;  // TMEM columns
 constexpr float ATT_RESCALE = 8.0f;                    // O is rescaled once a row's max grows by more (base 2)
+#endif
 constexpr int ATT_MAX_SPLITS = 40;                     // splits per kv head at most (schedule.py; the combine's blocks)
 constexpr int ATT_BAR_PRO = 1;                         // the prologue warps' named barrier (megakernel.cu BAR_PRO)
 // the query rows' fp32 sums, copied by cp.async (one round trip) into slots of ATT_QSLOT bytes, normed in place; the
@@ -43,6 +86,12 @@ __device__ __forceinline__ uint32_t attn_q_bytes(int T) { return 4 * attn_q_stri
 // MN-major)
 constexpr uint32_t ATT_ID_QK = (1u << 4) | (1u << 7) | (1u << 10) | ((64u >> 3) << 17) | ((128u >> 4) << 24);
 constexpr uint32_t ATT_ID_PV = (1u << 4) | (1u << 7) | (1u << 10) | (1u << 16) | ((128u >> 3) << 17) | ((128u >> 4) << 24);
+#if MK_KV_FP8
+// kind::f8f6f4 instruction descriptors (e4m3 x e4m3 -> f32, M = 128): S = Q K^T (N 64 keys, K-major), O += P V (N 256:
+// both dim boxes, V MN-major)
+constexpr uint32_t ATT_ID_QK_F8 = (1u << 4) | ((64u >> 3) << 17) | ((128u >> 4) << 24);
+constexpr uint32_t ATT_ID_PV_F8 = (1u << 4) | (1u << 16) | ((256u >> 3) << 17) | ((128u >> 4) << 24);
+#endif
 
 struct AttnDesc {  // an OpDesc's 256 bytes for OP_ATTN / OP_ATTN_COMBINE (schedule.py ATTN)
   uint64_t kv;          // the layer's bf16 KV cache [kernel blocks][kv heads][64 tokens][k 256 | v 256]
@@ -61,13 +110,32 @@ struct AttnDesc {  // an OpDesc's 256 bytes for OP_ATTN / OP_ATTN_COMBINE (sched
   uint64_t trace;       // (unused: null)
   uint64_t ml;          // the splits' m, l (fp32) [query head][split][NT][2]
   uint32_t kb_shift;    // log2 of the cache's kernel block tokens: 6 (64-token blocks) or 5 (32: two per page)
+#if MK_KV_FP8
+  uint32_t pad0;
+  // (kernel blocks of 16 tokens) TMA map over kv as [kernel blocks][4 heads][16 tokens][512 bytes], box 128 B x 16 x 1
+  // x 4: one box over a head's 4 consecutive kernel blocks of a page; 0: none
+  uint64_t tmap4;
+  uint32_t pad[30];
+#else
   uint32_t pad[33];
+#endif
 };
 static_assert(sizeof(AttnDesc) == 256, "AttnDesc layout");
 
 // The CTA's attention state in smem (namespace scope: addresses are immediates, no register is live across the roles'
 // instruction loops): the mbarriers, the producer's gate and each role's counters
 enum AttBar : int {
+#if MK_KV_FP8  // (3 slots for each kind of buffer barrier, ATT_NB of them used)
+  AB_Q = 0,    // Q in TMEM (the 8 prologue warps)
+  AB_S = 1,    // [ATT_NB] S_b complete (MMA commit)
+  AB_P = 4,    // [ATT_NB] P_b in TMEM (the 8 prologue warps)
+  AB_PV = 7,   // [ATT_NB] P_b V complete (MMA commit)
+  AB_O = 10,   // every MMA of the item complete (MMA commit)
+  AB_OT = 11,  // O read: TMEM free (the prologue's thread 0, after its barrier)
+  AB_C = 12,   // the combine's bulk copy of its partial blocks
+  AB_QS = 13,  // (unused: the query rows come by cp.async, attn_split)
+  AB_XF = 14,                    // [ATT_XS] an extension stage landed (TMA)
+#else
   AB_Q = 0,    // Q in TMEM (the 8 prologue warps)
   AB_S = 1,    // [2] S_b complete (MMA commit)
   AB_P = 3,    // [2] P_b in TMEM (the 8 prologue warps)
@@ -77,6 +145,7 @@ enum AttBar : int {
   AB_C = 9,    // the combine's bulk copy of its partial blocks
   AB_QS = 10,  // (unused: the query rows come by cp.async, attn_split)
   AB_XF = 11,                    // [ATT_XS] an extension stage landed (TMA)
+#endif
   AB_XE = AB_XF + (int)ATT_XS,   // [ATT_XS] an extension stage consumed (MMA commit)
   AB_XB = AB_XE + (int)ATT_XS,   // the B buffers' region free (a commit behind the earlier instructions' MMAs)
   AB_N = AB_XB + 1,
@@ -261,6 +330,66 @@ __device__ __forceinline__ void tc_st_x16(uint32_t taddr, const uint32_t (&r)[16
       : "memory");
 }
 __device__ __forceinline__ void tc_wait_st() { asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory"); }
+#if MK_KV_FP8  // (kind::f8f6f4 with A in TMEM: common.cuh tc_mma_f8_ts)
+__device__ __forceinline__ void tc_st_x8(uint32_t taddr, const uint32_t (&r)[8]) {
+  asm volatile("tcgen05.st.sync.aligned.32x32b.x8.b32 [%0], {%1,%2,%3,%4,%5,%6,%7,%8};" ::"r"(taddr), "r"(r[0]), "r"(r[1]),
+               "r"(r[2]), "r"(r[3]), "r"(r[4]), "r"(r[5]), "r"(r[6]), "r"(r[7])
+               : "memory");
+}
+// a warp's 128 O columns over its quadrant's lanes 0..15 in one access (.16x32bx2, half-split 64
+// columns: thread t < 16 lane t, columns c .. c + 63; thread t >= 16 lane t - 16, columns c + 64 .. c + 127)
+__device__ __forceinline__ void tc_ld_h64(uint32_t taddr, uint32_t (&r)[64]) {
+  asm volatile(
+      "tcgen05.ld.sync.aligned.16x32bx2.x64.b32 {%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16,"
+      "%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31,%32,%33,%34,%35,%36,%37,%38,%39,%40,%41,"
+      "%42,%43,%44,%45,%46,%47,%48,%49,%50,%51,%52,%53,%54,%55,%56,%57,%58,%59,%60,%61,%62,%63}, [%64], 64;"
+      : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]), "=r"(r[4]), "=r"(r[5]), "=r"(r[6]), "=r"(r[7]), "=r"(r[8]),
+      "=r"(r[9]), "=r"(r[10]), "=r"(r[11]), "=r"(r[12]), "=r"(r[13]), "=r"(r[14]), "=r"(r[15]), "=r"(r[16]),
+      "=r"(r[17]), "=r"(r[18]), "=r"(r[19]), "=r"(r[20]), "=r"(r[21]), "=r"(r[22]), "=r"(r[23]), "=r"(r[24]),
+      "=r"(r[25]), "=r"(r[26]), "=r"(r[27]), "=r"(r[28]), "=r"(r[29]), "=r"(r[30]), "=r"(r[31]), "=r"(r[32]),
+      "=r"(r[33]), "=r"(r[34]), "=r"(r[35]), "=r"(r[36]), "=r"(r[37]), "=r"(r[38]), "=r"(r[39]), "=r"(r[40]),
+      "=r"(r[41]), "=r"(r[42]), "=r"(r[43]), "=r"(r[44]), "=r"(r[45]), "=r"(r[46]), "=r"(r[47]), "=r"(r[48]),
+      "=r"(r[49]), "=r"(r[50]), "=r"(r[51]), "=r"(r[52]), "=r"(r[53]), "=r"(r[54]), "=r"(r[55]), "=r"(r[56]),
+      "=r"(r[57]), "=r"(r[58]), "=r"(r[59]), "=r"(r[60]), "=r"(r[61]), "=r"(r[62]), "=r"(r[63])
+      : "r"(taddr)
+      : "memory");
+}
+__device__ __forceinline__ void tc_st_h64(uint32_t taddr, const uint32_t (&r)[64]) {
+  asm volatile(
+      "tcgen05.st.sync.aligned.16x32bx2.x64.b32 [%0], 64, {%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,"
+      "%15,%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31,%32,%33,%34,%35,%36,%37,%38,%39,"
+      "%40,%41,%42,%43,%44,%45,%46,%47,%48,%49,%50,%51,%52,%53,%54,%55,%56,%57,%58,%59,%60,%61,%62,%63,"
+      "%64};" ::"r"(taddr),
+      "r"(r[0]), "r"(r[1]), "r"(r[2]), "r"(r[3]), "r"(r[4]), "r"(r[5]), "r"(r[6]), "r"(r[7]), "r"(r[8]), "r"(r[9]),
+      "r"(r[10]), "r"(r[11]), "r"(r[12]), "r"(r[13]), "r"(r[14]), "r"(r[15]), "r"(r[16]), "r"(r[17]), "r"(r[18]),
+      "r"(r[19]), "r"(r[20]), "r"(r[21]), "r"(r[22]), "r"(r[23]), "r"(r[24]), "r"(r[25]), "r"(r[26]), "r"(r[27]),
+      "r"(r[28]), "r"(r[29]), "r"(r[30]), "r"(r[31]), "r"(r[32]), "r"(r[33]), "r"(r[34]), "r"(r[35]), "r"(r[36]),
+      "r"(r[37]), "r"(r[38]), "r"(r[39]), "r"(r[40]), "r"(r[41]), "r"(r[42]), "r"(r[43]), "r"(r[44]), "r"(r[45]),
+      "r"(r[46]), "r"(r[47]), "r"(r[48]), "r"(r[49]), "r"(r[50]), "r"(r[51]), "r"(r[52]), "r"(r[53]), "r"(r[54]),
+      "r"(r[55]), "r"(r[56]), "r"(r[57]), "r"(r[58]), "r"(r[59]), "r"(r[60]), "r"(r[61]), "r"(r[62]), "r"(r[63])
+      : "memory");
+}
+// a warp's 32 S columns over its quadrant's lanes 0..15: thread t < 16 lane t, columns c .. c + 15;
+// t >= 16 lane t - 16, columns c + 16 .. c + 31; and their 8 P columns (4 a thread: c .. c + 3, c + 4 .. c + 7)
+__device__ __forceinline__ void tc_ld_q16(uint32_t taddr, uint32_t (&r)[16]) {
+  asm volatile(
+      "tcgen05.ld.sync.aligned.16x32bx2.x16.b32 {%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, [%16], 16;"
+      : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]), "=r"(r[4]), "=r"(r[5]), "=r"(r[6]), "=r"(r[7]), "=r"(r[8]),
+        "=r"(r[9]), "=r"(r[10]), "=r"(r[11]), "=r"(r[12]), "=r"(r[13]), "=r"(r[14]), "=r"(r[15])
+      : "r"(taddr)
+      : "memory");
+}
+__device__ __forceinline__ void tc_st_q4(uint32_t taddr, const uint32_t (&r)[4]) {
+  asm volatile("tcgen05.st.sync.aligned.16x32bx2.x4.b32 [%0], 4, {%1,%2,%3,%4};" ::"r"(taddr), "r"(r[0]), "r"(r[1]), "r"(r[2]),
+               "r"(r[3])
+               : "memory");
+}
+// the e4m3 codes of four bf16 values (two bf16x2 words; the first value in the low byte): round to nearest even,
+// saturating at +-448 (vLLM's cache write and query quantization at scale 1: __NV_SATFINITE of the value)
+__device__ __forceinline__ uint32_t bf16x4_to_e4m3x4(uint32_t w01, uint32_t w23) {
+  return f32x2_to_e4m3x2(bf16lo(w01), bf16hi(w01)) | (f32x2_to_e4m3x2(bf16lo(w23), bf16hi(w23)) << 16);
+}
+#endif
 __device__ __forceinline__ uint32_t pack_bf16x2(float lo, float hi) {
   const __nv_bfloat162 h = __floats2bfloat162_rn(lo, hi);
   return *reinterpret_cast<const uint32_t*>(&h);
@@ -338,6 +467,67 @@ __device__ __forceinline__ void produce_attn(const Instr& in, const AttnDesc& g,
   attn_range(g, rec, in.r0 % g.n_splits, pg0, pg1);
   const int32_t P = attn_step(rec).P;
   const void* tmap = reinterpret_cast<const void*>(g.tmap);
+#if MK_KV_FP8
+  const void* tmap4 = reinterpret_cast<const void*>(g.tmap4);
+  // the first rows of the page's kernel blocks (nkb = 64 >> kb_shift of them: 4 at 16-token blocks, which may lie in
+  // two manager blocks), each loaded as one box of its rows per dim half into the stage's image
+  const uint32_t kbm = g.kb_per_mb, grp = g.group, kbs = g.kb_shift;
+  const uint32_t nkb = (uint32_t)ATT_PAGE >> kbs;
+  // the rows looked up 8 pages at a time by the warp's 32 lanes (lane: page base + lane / 4, kernel block lane % 4),
+  // one batch ahead (8 pages of loads in flight: the block table's chain of loads off the page loop), read by shuffles
+  const uint32_t lane = threadIdx.x & 31;
+  auto lookup = [&](uint32_t base) -> uint32_t {
+    const uint32_t p = base + lane / 4, i = lane & 3;
+    return (p < pg1 && i < nkb) ? attn_kb_row(kbm, grp, rec, p * nkb + i, h, kbs) : 0u;
+  };
+  uint32_t rb_cur = pg0 < pg1 ? lookup(pg0) : 0u, rb_nxt = pg0 + 8 < pg1 ? lookup(pg0 + 8) : 0u;
+  for (uint32_t pg = pg0; pg < pg1; pg++) {
+    const uint32_t q8 = (pg - pg0) & 7u;
+    if (q8 == 0 && pg != pg0) {
+      rb_cur = rb_nxt;
+      rb_nxt = pg + 8 < pg1 ? lookup(pg + 8) : 0u;
+    }
+    const int r0 = (int)__shfl_sync(0xffffffffu, rb_cur, q8 * 4), r1 = (int)__shfl_sync(0xffffffffu, rb_cur, q8 * 4 + 1);
+    const int r2 = (int)__shfl_sync(0xffffffffu, rb_cur, q8 * 4 + 2), r3 = (int)__shfl_sync(0xffffffffu, rb_cur, q8 * 4 + 3);
+    if ((int32_t)((pg + 1) * ATT_PAGE) > P)
+      while (att_kvw < seq) {
+      }
+#pragma unroll 1
+    for (uint32_t part = 0; part < ATT_SLOTS; part++) {  // K (bytes 0..255 of the rows), V (256..511)
+      const uint32_t k = ATT_SLOTS * (pg - pg0) + part;
+      const AttStage a = attn_stage<NST>(cc, x0, k, stages, stage_bytes, full, empty, xb);
+      if (k - NST < ATT_XS) mbar_wait(&att_bar[(x0 + k - NST) % ATT_XS < xq ? AB_XB : AB_Q], ni & 1);
+      if (a.reuse) mbar_wait(a.empty, a.phase ^ 1);
+      if (elect_one()) {
+        mbar_expect_tx(a.full, ATT_SLOT);
+        const uint64_t pol = l2_evict_first();
+        const int x = (int)(part * 256);
+        const uint32_t step = (128u << kbs);  // one kernel block's rows in the box image
+        if (nkb == 4 && tmap4 && r1 == r0 + 64 && r2 == r0 + 128 && r3 == r0 + 192) {
+          // the page's 4 kernel blocks consecutive (rows (pkb * 4 + h) * 16, pkb .. pkb + 3): one box per dim half
+          // over [4 blocks][head h][16 tokens][128 B], the same image as the 4 boxes of 16 rows below
+          const int h4 = (r0 >> 4) & 3, kb4 = r0 >> 6;
+          tma_load_4d_pol(a.p, tmap4, x, 0, h4, kb4, a.full, pol);
+          tma_load_4d_pol(a.p + ATT_BOX, tmap4, x + 128, 0, h4, kb4, a.full, pol);
+        } else {
+          tma_load_2d_pol(a.p, tmap, x, r0, a.full, pol);
+          tma_load_2d_pol(a.p + ATT_BOX, tmap, x + 128, r0, a.full, pol);
+          if (nkb > 1) {
+            tma_load_2d_pol(a.p + step, tmap, x, r1, a.full, pol);
+            tma_load_2d_pol(a.p + ATT_BOX + step, tmap, x + 128, r1, a.full, pol);
+          }
+          if (nkb > 2) {
+            tma_load_2d_pol(a.p + 2 * step, tmap, x, r2, a.full, pol);
+            tma_load_2d_pol(a.p + ATT_BOX + 2 * step, tmap, x + 128, r2, a.full, pol);
+            tma_load_2d_pol(a.p + 3 * step, tmap, x, r3, a.full, pol);
+            tma_load_2d_pol(a.p + ATT_BOX + 3 * step, tmap, x + 128, r3, a.full, pol);
+          }
+        }
+      }
+      __syncwarp();
+    }
+  }
+#else
   // the page's first rows: of its kernel block, or (32-token blocks, kb2) of its two
   constexpr uint32_t PAGE_SHIFT = 6;  // log2(ATT_PAGE): a kernel block of the page's tokens (kb_shift)
   constexpr int STAGE_X = 256;       // a stage's bytes of a key's 1024 (its two boxes)
@@ -382,6 +572,7 @@ __device__ __forceinline__ void produce_attn(const Instr& in, const AttnDesc& g,
       __syncwarp();
     }
   }
+#endif
   const uint32_t S = ATT_SLOTS * (pg1 - pg0), nr = attn_ring_count<NST>(S);
   cc.advance(nr, NST);
   if ((threadIdx.x & 31) == 0) att_cnt[AC_PROD_XS] = x0 + (S - nr), att_cnt[AC_PROD_ITEMS] = ni + (S > 0 ? 1u : 0u);
@@ -405,6 +596,47 @@ __device__ void attn_mma(const Instr& in, const AttnDesc& g, uint8_t* stages, ui
   __syncwarp();
   mbar_wait(&att_bar[AB_Q], ni & 1);  // Q in TMEM (every earlier user of TMEM is done)
   tc_fence_after();
+#if MK_KV_FP8
+  // QK of page j issued ATT_NB - 1 pages ahead of P V: its buffer's last reader, P V of page j - ATT_NB, was issued in
+  // an earlier iteration (the MMAs run in issue order); the chain per buffer cycle covers ATT_NB pages
+#pragma unroll 1
+  for (uint32_t j = 0; j <= n + ATT_NB - 2; j++) {
+    if (j < n) {  // S = Q K^T: 8 k-steps of 32 dims (32 bytes in the atom; box kk / 4), e4m3 Q from TMEM
+      const AttStage k0 = attn_stage<NST>(cc, x0, ATT_SLOTS * j, stages, stage_bytes, full, empty, xb);
+      mbar_wait(k0.full, k0.phase);
+      tc_fence_after();
+      const uint32_t b = (np + j) % ATT_NB;
+      if (elect_one()) {
+        const uint32_t a0 = smem_u32(k0.p), d = tmem + ATT_T_S + 64 * b;
+#pragma unroll
+        for (uint32_t kk = 0; kk < 8; kk++) {
+          const uint32_t a = a0 + (kk >> 2) * ATT_BOX + (kk & 3) * 32;
+          tc_mma_f8_ts(d, tmem + ATT_T_Q + 8 * kk, attn_desc(a, 16), ATT_ID_QK_F8, kk > 0 ? 1u : 0u);
+        }
+        tc_commit(&att_bar[AB_S + b]);
+        tc_commit(k0.empty);
+      }
+      __syncwarp();
+    }
+    if (j >= ATT_NB - 1) {  // O += P V: per half page (32 keys, its e4m3 P in the 8 columns in front of its S), N 256
+      const uint32_t jj = j - (ATT_NB - 1), b = (np + jj) % ATT_NB;
+      const AttStage k1 = attn_stage<NST>(cc, x0, ATT_SLOTS * jj + 1, stages, stage_bytes, full, empty, xb);
+      mbar_wait(&att_bar[AB_P + b], ((np + jj) / ATT_NB) & 1);
+      mbar_wait(k1.full, k1.phase);
+      tc_fence_after();
+      if (elect_one()) {
+        const uint32_t v0 = smem_u32(k1.p), pa = tmem + ATT_T_S + 64 * b;
+#pragma unroll
+        for (uint32_t kg = 0; kg < 2; kg++)  // keys 32 kg..: 4 swizzle atoms of 8 keys; LBO: the dims 128..255 box
+          tc_mma_f8_ts(tmem + ATT_T_O, pa + 32 * kg, attn_desc(v0 + kg * 4096, ATT_BOX), ATT_ID_PV_F8,
+                       (jj > 0 || kg > 0) ? 1u : 0u);
+        tc_commit(&att_bar[AB_PV + b]);
+        tc_commit(k1.empty);
+      }
+      __syncwarp();
+    }
+  }
+#else
 #pragma unroll 1
   for (uint32_t j = 0; j <= n; j++) {
     if (j < n) {
@@ -451,6 +683,7 @@ __device__ void attn_mma(const Instr& in, const AttnDesc& g, uint8_t* stages, ui
       __syncwarp();
     }
   }
+#endif
   if (elect_one()) tc_commit(&att_bar[AB_O]);
   __syncwarp();
   mbar_wait(&att_bar[AB_OT], ni & 1);  // the softmax warps have read O: TMEM is the next instructions'
@@ -470,6 +703,13 @@ __device__ __forceinline__ void attn_mask(uint32_t (&sv)[32], int32_t vis) {
   for (int c = 0; c < 32; c++)
     if (c > vis) sv[c] = NEG_INF_BITS;
 }
+#if MK_KV_FP8
+__device__ __forceinline__ void attn_mask16(uint32_t (&sv)[16], int32_t vis) {  // (a thread's 16 scores)
+#pragma unroll
+  for (int c = 0; c < 16; c++)
+    if (c > vis) sv[c] = 0xff800000u;
+}
+#endif
 
 // ---- OP_ATTN: the prologue warps' part of an item (kv head h, split s) ----
 // stg: >= 33 KB of smem scratch (rope rows, norm weights, softmax exchange at ATT_*_OFF; the query rows' slots below);
@@ -478,6 +718,9 @@ template <int NST, int NPRO_T>
 __device__ void attn_split(const Instr& in, const AttnDesc& g, const float* qkv_acc, float qkv_alpha, const uint32_t* counters,
                            uint32_t dep_target, uint32_t zero_target, uint8_t* stages, uint32_t stage_bytes, uint64_t* full,
                            uint64_t* empty, uint8_t* stg, uint8_t* xb, int pt, RingPos& cc, uint32_t tmem) {
+#if MK_KV_FP8
+  asm volatile("" : "+r"(pt));  // (the values derived from pt computed here, not held across the role's loop)
+#endif
   const uint32_t seq = att_cnt[AC_PRO_INSTRS] + 1, np = att_cnt[AC_PRO_PAGES], ni = att_cnt[AC_PRO_ITEMS],
                  x0 = att_cnt[AC_PRO_XS];
   const int32_t* rec = reinterpret_cast<const int32_t*>(g.rec);
@@ -490,7 +733,9 @@ __device__ void attn_split(const Instr& in, const AttnDesc& g, const float* qkv_
   const int T = st.T, R = ATT_G * T;
   const int wp = pt >> 5, lane = pt & 31;
   constexpr int NW = NPRO_T / 32;
+#if !MK_KV_FP8
   constexpr int KV_ROW_ELEMS = 512;      // a cache row's bf16 values: k 256 | v 256
+#endif
   constexpr int QUAD_ROWS = 12;          // query rows per TMEM lane quadrant at most (ATT_ROWS / 4)
   constexpr int BAR_PAIR = 3;            // the softmax warp pair (q, q + 4)'s named barrier: BAR_PAIR + q
   constexpr int PAIR_THREADS = 64;       // its threads
@@ -498,7 +743,11 @@ __device__ void attn_split(const Instr& in, const AttnDesc& g, const float* qkv_
   // wp, wp + NW that lie in this item's pages (reshape_and_cache)
   const float eps = g.eps;
   const uint32_t kbs = g.kb_shift;
+#if MK_KV_FP8
+  uint8_t* const kvc = reinterpret_cast<uint8_t*>(g.kv);
+#else
   __nv_bfloat16* const kvc = reinterpret_cast<__nv_bfloat16*>(g.kv);
+#endif
   uint8_t* const pob = reinterpret_cast<uint8_t*>(g.po);
   float* const mlb = reinterpret_cast<float*>(g.ml);
   bool in_pages[2];
@@ -527,7 +776,16 @@ __device__ void attn_split(const Instr& in, const AttnDesc& g, const float* qkv_
   const bool has_row = lane < QUAD_ROWS && r < R;
   const uint32_t tl = tmem + ((uint32_t)(32 * q) << 16);
   float* xm = reinterpret_cast<float*>(stg + ATT_XM_OFF);  // [2 page parities][4 quadrants][2 halves][32 lanes]
+#if MK_KV_FP8
+  // the page loop by .16x32bx2 accesses: thread t holds the row of lane t % 16 (row 4 (t % 16) + q: lanes 0..11 live)
+  // and the keys 16 (t / 16) .. + 15 of its warp's half (their S columns, P's 4 columns in front of them); m_run, l_run
+  // are that row's (both of its threads hold the same values: thread t < 12 the row of lane t, as read after the loop)
+  const int ln = lane & 15, kq = lane >> 4;
+  const bool has_row16 = ln < QUAD_ROWS && 4 * ln + q < R;
+  const int32_t lim16 = st.P + (has_row16 ? (4 * ln + q) / ATT_G : 0);  // keys visible to the row: <= lim16
+#else
   const int32_t lim = st.P + (has_row ? r / ATT_G : 0);  // keys visible to the row: <= lim
+#endif
   const float sc = g.scale_log2;
   float m_run = -INFINITY, l_run = 0.f;  // (l_run: this half's keys)
   // the start's code run twice from one instance: first dry, before the dependency wait while the qkv projection
@@ -581,8 +839,14 @@ __device__ void attn_split(const Instr& in, const AttnDesc& g, const float* qkv_
             if (lane == 0) wait_counter(counters + in.aux - 1, zero_target);
             __syncwarp();
           }
+#if MK_KV_FP8
+          // e4m3 of the bf16 k (post norm and rope) / v at scale 1, as vLLM's reshape_and_cache_flash writes them
+          reinterpret_cast<uint2*>(kvc + (size_t)kvrow[m] * ATT_ROWB + (is_v ? ATT_D : 0))[lane] =
+              make_uint2(bf16x4_to_e4m3x4(o[0], o[1]), bf16x4_to_e4m3x4(o[2], o[3]));
+#else
           reinterpret_cast<uint4*>(kvc + (size_t)kvrow[m] * KV_ROW_ELEMS + (is_v ? ATT_D : 0))[lane] =
               make_uint4(o[0], o[1], o[2], o[3]);
+#endif
         }
         asm volatile("fence.proxy.async.global;" ::: "memory");  // the cache rows, for the producer's TMA loads
         cp_async_wait_all();  // (this lane's own bytes)
@@ -614,6 +878,20 @@ __device__ void attn_split(const Instr& in, const AttnDesc& g, const float* qkv_
         if (pt == 0) att_cnt[AC_PRO_INSTRS] = seq;
         return;
       }
+#if MK_KV_FP8
+      // Q into TMEM in e4m3 (the bf16 query quantized at scale 1, as vLLM's FlashInfer path does): this warp's 128 dims
+      // (32 columns, 4 dims each, the lowest in the low byte)
+      {
+        uint32_t v[32];
+        const uint4* q4 = reinterpret_cast<const uint4*>(qsl + (q * qst + min(lane, QUAD_ROWS - 1)) * ATT_QSLOT + (128 * hk) * 2);
+#pragma unroll
+        for (int i = 0; i < 16; i++) {
+          const uint4 u = has_row ? q4[i] : make_uint4(0, 0, 0, 0);
+          v[2 * i] = bf16x4_to_e4m3x4(u.x, u.y), v[2 * i + 1] = bf16x4_to_e4m3x4(u.z, u.w);
+        }
+        tc_st_x32(tl + ATT_T_Q + 32 * hk, v);
+      }
+#else
       // Q into TMEM: this warp's 128 dims (64 columns), 32 dims per store
 #pragma unroll 1
       for (int ch = 0; ch < 4; ch++) {
@@ -627,6 +905,7 @@ __device__ void attn_split(const Instr& in, const AttnDesc& g, const float* qkv_
         }
         tc_st_x16(tl + ATT_T_Q + 64 * hk + 16 * ch, v);
       }
+#endif
       tc_wait_st();
       tc_fence_before();
       __syncwarp();
@@ -634,14 +913,34 @@ __device__ void attn_split(const Instr& in, const AttnDesc& g, const float* qkv_
     }
 #pragma unroll 1
     for (uint32_t j = 0; j < (is_dry_run ? 1u : n); j++) {
+#if MK_KV_FP8
+      const uint32_t gp = np + j, b = gp % ATT_NB;
+      if (!is_dry_run) mbar_wait(&att_bar[AB_S + b], (gp / ATT_NB) & 1);
+#else
       const uint32_t gp = np + j, b = gp & 1;
       if (!is_dry_run) mbar_wait(&att_bar[AB_S + b], (gp >> 1) & 1);
+#endif
       tc_fence_after();
       const int32_t tok0 = (int32_t)((pg0 + j) * ATT_PAGE) + 32 * hk;  // this half's first key
       const bool all_visible = tok0 + 32 <= st.P;  // keys before the step's tokens: visible to every row
       const uint32_t ts = tl + ATT_T_S + 64 * b + 32 * hk;
       // pass 1: the half's max (S in base 2, the causal mask: key <= lim), the pair's max from the partner's half
       float mx = -INFINITY;
+#if MK_KV_FP8
+      uint32_t sv[16];  // (the thread's 16 scores, masked: pass 2's too)
+      {
+        tc_ld_q16(ts, sv);
+        tc_wait_ld();
+        float mx4[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};
+        if (!all_visible) attn_mask16(sv, lim16 - (tok0 + 16 * kq));
+        // the raw scores' max, scaled once (sc > 0: the same value as the scaled scores' max), then the half's from the
+        // other 16 keys' (fmaxf of the scaled maxima: the scaled max of all, the rounding being monotone)
+#pragma unroll
+        for (int c = 0; c < 16; c++) mx4[c & 3] = fmaxf(mx4[c & 3], __uint_as_float(sv[c]));
+        if (has_row16) mx = __fmul_rn(fmaxf(fmaxf(mx4[0], mx4[1]), fmaxf(mx4[2], mx4[3])), sc);
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 16));
+      }
+#else
       {
         uint32_t sv[32];
         tc_ld_x32(ts, sv);
@@ -653,6 +952,7 @@ __device__ void attn_split(const Instr& in, const AttnDesc& g, const float* qkv_
         for (int c = 0; c < 32; c++) mx4[c & 3] = fmaxf(mx4[c & 3], __uint_as_float(sv[c]));
         if (has_row) mx = __fmul_rn(fmaxf(fmaxf(mx4[0], mx4[1]), fmaxf(mx4[2], mx4[3])), sc);
       }
+#endif
       xm[((b * 4 + q) * 2 + hk) * 32 + lane] = mx;
       named_sync(BAR_PAIR + q, PAIR_THREADS);
       mx = fmaxf(mx, xm[((b * 4 + q) * 2 + (hk ^ 1)) * 32 + lane]);  // (the same in both warps of the pair)
@@ -666,6 +966,11 @@ __device__ void attn_split(const Instr& in, const AttnDesc& g, const float* qkv_
         l_run *= al;
         m_run = m_new;
       }
+#if MK_KV_FP8
+      // O's rescale after the page's P (below): P(j) goes to its own S / P buffer, which P V(j - 1) does not read, so P's
+      // computation overlaps the wait for P V(j - 1); P V(j) still follows the rescale (P's arrival)
+      const bool rescales_warp = __any_sync(0xffffffffu, rescales_o);
+#else
       // O's rows *= al (this warp's half of the dims), once the last P V completed
       if (__any_sync(0xffffffffu, rescales_o)) {
         if (j > 0) mbar_wait(&att_bar[AB_PV + ((gp - 1) & 1)], ((gp - 1) >> 1) & 1);
@@ -681,7 +986,35 @@ __device__ void attn_split(const Instr& in, const AttnDesc& g, const float* qkv_
         }
         tc_wait_st();
       }
-      // pass 2: P = 2^(s - m) of the half's keys (bf16, over its S columns), the half's sum in fp32
+#endif
+      // pass 2: P = 2^(s - m) of the half's keys (over its S columns), the half's sum in fp32
+#if MK_KV_FP8
+      {
+        // the thread's 16 keys (pass 1's scores): P in e4m3 (<= 2^8.8 under the lazy rescale; 4 keys a column, the lowest
+        // in the low byte) in its 4 columns; l over P as quantized (the values P V reads): the thread's sum, then the
+        // half's with the other 16 keys' (e4m3 values are multiples of 2^-9 and a half's 32 sum below 2^15: every sum
+        // exact). (A row with no finite max yet: 2^(x - inf) = 0; a masked key: 2^(-inf) = 0.)
+        const float mz = m_run != -INFINITY ? m_run - ATT_P_OFF : INFINITY;
+        float sum4[4] = {0.f, 0.f, 0.f, 0.f};
+        uint32_t pq[4];
+#pragma unroll
+        for (int c2 = 0; c2 < 8; c2++) {
+          const float p0 = exp2_approx(__fmul_rn(__uint_as_float(sv[2 * c2]), sc) - mz);
+          const float p1 = exp2_approx(__fmul_rn(__uint_as_float(sv[2 * c2 + 1]), sc) - mz);
+          const uint32_t e = f32x2_to_e4m3x2(p0, p1);
+          sum4[c2 & 3] += e4m3x2_sum(e);
+          if (c2 & 1) pq[c2 >> 1] |= e << 16;
+          else pq[c2 >> 1] = e;
+        }
+        float hs = (sum4[0] + sum4[1]) + (sum4[2] + sum4[3]);
+        hs += __shfl_xor_sync(0xffffffffu, hs, 16);
+        if (!is_dry_run) {
+          tc_st_q4(ts, pq);
+          l_run += hs;
+          tc_wait_st();
+        }
+      }
+#else
       {
         const bool has_max = m_run != -INFINITY;
         float sum4[4] = {0.f, 0.f, 0.f, 0.f};
@@ -704,10 +1037,21 @@ __device__ void attn_split(const Instr& in, const AttnDesc& g, const float* qkv_
           tc_wait_st();
         }
       }
+#endif
       if (is_dry_run) continue;
       if ((int32_t)((pg0 + j) * ATT_PAGE) + ATT_PAGE > st.L) {
         // the sequence's last page: its rows past L (stale bytes of a reused page could be NaN, and P V multiplies them
         // by 0) cleared in the V stages; this warp's share of their 16-byte chunks
+#if MK_KV_FP8
+        const AttStage kv = attn_stage<NST>(cc, x0, ATT_SLOTS * j + 1, stages, stage_bytes, full, empty, xb);
+        mbar_wait(kv.full, kv.phase);
+        const int r0 = st.L - (int32_t)((pg0 + j) * ATT_PAGE);
+        for (int i = pt; i < (ATT_PAGE - r0) * 16; i += NPRO_T) {
+          const int rr = r0 + i / 16, c = i % 16;  // chunk c: box c / 8 (dims 128 (c / 8)..), 16-byte chunk c % 8
+          uint8_t* bx = kv.p + (c >> 3) * ATT_BOX;
+          *reinterpret_cast<uint4*>(bx + rr * 128 + (((c & 7) ^ (rr & 7)) << 4)) = make_uint4(0, 0, 0, 0);
+        }
+#else
         const AttStage k2 = attn_stage<NST>(cc, x0, ATT_SLOTS * j + 2, stages, stage_bytes, full, empty, xb);
         const AttStage k3 = attn_stage<NST>(cc, x0, ATT_SLOTS * j + 3, stages, stage_bytes, full, empty, xb);
         mbar_wait(k2.full, k2.phase);
@@ -718,8 +1062,25 @@ __device__ void attn_split(const Instr& in, const AttnDesc& g, const float* qkv_
           uint8_t* bx = ((c >> 4) ? k3.p : k2.p) + ((c >> 3) & 1) * ATT_BOX;
           *reinterpret_cast<uint4*>(bx + rr * 128 + (((c & 7) ^ (rr & 7)) << 4)) = make_uint4(0, 0, 0, 0);
         }
+#endif
         fence_async_smem();
       }
+#if MK_KV_FP8
+      // O's rows *= al (this warp's half of the dims), once the last P V completed: one access, thread t the row of lane
+      // t % 16 (its own factor), columns 64 (t / 16) .. + 63 of the half
+      if (rescales_warp) {
+        static_assert(ATT_ROWS <= 4 * QUAD_ROWS, "a quadrant's rows in its lanes 0..15");
+        if (j > 0) mbar_wait(&att_bar[AB_PV + ((gp - 1) % ATT_NB)], ((gp - 1) / ATT_NB) & 1);
+        tc_fence_after();
+        uint32_t v[64];
+        tc_ld_h64(tl + ATT_T_O + 128 * hk, v);
+        tc_wait_ld();
+#pragma unroll
+        for (int i = 0; i < 64; i++) v[i] = __float_as_uint(__uint_as_float(v[i]) * al);
+        tc_st_h64(tl + ATT_T_O + 128 * hk, v);
+        tc_wait_st();
+      }
+#endif
       tc_fence_before();
       __syncwarp();
       if (lane == 0) mbar_arrive(&att_bar[AB_P + b]);

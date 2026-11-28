@@ -5,7 +5,8 @@ from typing import TYPE_CHECKING
 from pear.models.kernels import DeployKernels
 from pear.models.qwen3_5.deploy.blackwell.gpu_backend import (
     BlackwellBf16DeployGpuBackend,
-    BlackwellNvfp4DeployGpuBackend,
+    BlackwellNvfp4Bf16KvDeployGpuBackend,
+    BlackwellNvfp4Fp8KvDeployGpuBackend,
 )
 from pear.models.qwen3_5.deploy.gpu_backend import DeployGpuBackend
 from pear.models.qwen3_5.deploy.memory_plan import MemoryPlan
@@ -24,7 +25,12 @@ class Qwen3_5DeployKernels(DeployKernels):
     the backend of its GPU and its checkpoint."""
 
     # the backends, in priority order
-    GPU_BACKENDS = (BlackwellNvfp4DeployGpuBackend, BlackwellBf16DeployGpuBackend, RtxBlackwellNvfp4DeployGpuBackend)
+    GPU_BACKENDS = (
+        BlackwellNvfp4Bf16KvDeployGpuBackend,
+        BlackwellNvfp4Fp8KvDeployGpuBackend,
+        BlackwellBf16DeployGpuBackend,
+        RtxBlackwellNvfp4DeployGpuBackend,
+    )
 
     @classmethod
     def configure_server(cls, compilation_config: dict, max_num_seqs: int, max_num_batched_tokens: int) -> None:

@@ -16,10 +16,17 @@ from pear.models.qwen3_5.deploy.blackwell.common.gdn import (
     DeployGDNMetadataBuilder,
 )
 from pear.models.qwen3_5.deploy.blackwell.common.rope import RopeStaging
-from pear.models.qwen3_5.deploy.blackwell.nvfp4.draft.extension import BlackwellNvfp4DraftExtension
+from pear.models.qwen3_5.deploy.blackwell.nvfp4.draft.extension import (
+    BlackwellNvfp4Bf16KvDraftExtension,
+    BlackwellNvfp4Fp8KvDraftExtension,
+)
 from pear.models.qwen3_5.deploy.blackwell.nvfp4.draft.speculator import ProposalLaunch as Nvfp4ProposalLaunch
+from pear.models.qwen3_5.deploy.blackwell.nvfp4.extension import (
+    BlackwellNvfp4Bf16KvExtension,
+    BlackwellNvfp4Fp8KvExtension,
+)
 from pear.models.qwen3_5.deploy.blackwell.nvfp4.runner import DecodeLaunch as Nvfp4DecodeLaunch
-from pear.models.qwen3_5.deploy.gpu_backend import DeployGpuBackend, Nvfp4CheckpointMixin
+from pear.models.qwen3_5.deploy.gpu_backend import DeployGpuBackend, Fp8KvCacheMixin, Nvfp4CheckpointMixin
 from pear.models.qwen3_5.gpu_generation import GpuGeneration
 
 if TYPE_CHECKING:  # annotations only
@@ -40,7 +47,8 @@ class BlackwellDeployGpuBackend(DeployGpuBackend):
 
     @classmethod
     def install(cls, vllm_config: VllmConfig) -> None:
-        # the megakernel's library is loaded by the runner, once it has a draft its verify step runs
+        # the megakernel's library: the NVFP4 backends load their build first, the bf16 one's runner once it has a
+        # draft its verify step runs
         cls.draft_extension.load()
 
         # through vLLM's extension points: the GDN layer and its metadata builder
@@ -55,11 +63,32 @@ class BlackwellDeployGpuBackend(DeployGpuBackend):
 
 
 class BlackwellNvfp4DeployGpuBackend(Nvfp4CheckpointMixin, BlackwellDeployGpuBackend):
-    """The megakernel of ModelOpt's NVFP4 / FP8 export (blackwell/nvfp4/)."""
+    """The megakernel of ModelOpt's NVFP4 / FP8 export (blackwell/nvfp4/): a subclass per KV cache dtype, each with its
+    builds of the megakernel and of the draft's kernel."""
 
-    draft_extension = BlackwellNvfp4DraftExtension
     decode_launch = Nvfp4DecodeLaunch
     proposal_launch = Nvfp4ProposalLaunch
+    extension: ClassVar[type[CudaExtension]]  # the megakernel's build, which the runner's verify steps launch
+
+    @classmethod
+    def install(cls, vllm_config: VllmConfig) -> None:
+        cls.extension.load()
+        super().install(vllm_config)
+
+
+class BlackwellNvfp4Bf16KvDeployGpuBackend(BlackwellNvfp4DeployGpuBackend):
+    """The megakernel on a bf16 KV cache, the dtype vLLM gives a bf16 model."""
+
+    extension = BlackwellNvfp4Bf16KvExtension
+    draft_extension = BlackwellNvfp4Bf16KvDraftExtension
+    KV_CACHE_DTYPES = ("bfloat16",)
+
+
+class BlackwellNvfp4Fp8KvDeployGpuBackend(Fp8KvCacheMixin, BlackwellNvfp4DeployGpuBackend):
+    """The megakernel on an FP8 KV cache."""
+
+    extension = BlackwellNvfp4Fp8KvExtension
+    draft_extension = BlackwellNvfp4Fp8KvDraftExtension
 
 
 class BlackwellBf16DeployGpuBackend(BlackwellDeployGpuBackend):

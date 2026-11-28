@@ -48,6 +48,7 @@ PEAR deploys with:
 
 ## News
 
+- [2026/11] The model server on one GB300 can now keep the NVFP4 model's KV cache in [FP8](examples/models/qwen3_8_27b_pear/deploy/README.md#hardware): with the DFlash2 checkpoint it decodes at **960 tokens/s**, against 921 tokens/s on a bf16 KV cache.
 - [2026/11] PEAR now trains with [MTP speculative decoding](examples/models/qwen3_8_27b_pear/train/README.md#variables) by default, which makes **end-to-end training ~40% faster**.
 - [2026/11] We released a [DFlash2 checkpoint](https://huggingface.co/mit-han-lab/Qwen3.8-27B-PEAR-DFlash2) for Qwen3.8-27B-PEAR. With it, the NVFP4 model decodes at **921 tokens/s** on one GB300 and **262 tokens/s** on one RTX 5090.
 - [2026/11] The robot station can now serve the model through [Claude Code](examples/models/qwen3_8_27b_pear/deploy/README.md#serve-through-claude-code), which compacts a task's conversation whenever the context fills, supporting tasks of unlimited length!

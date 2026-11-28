@@ -6,6 +6,24 @@
 
 namespace dk {
 
+#if MK_KV_FP8
+// The FP8 KV cache's build (MK_KV_FP8: vLLM's e4m3 cache at scale 1): a key's row is 256 bytes (k 128 | v 128 e4m3), as
+// in smem; the query rows in e4m3 (vLLM quantizes the draft's query for FlashAttention's FP8 path at scale 1); S = Q K^T
+// and O += P V on mma.sync m16n8k32 e4m3 -> fp32, P = 2^(s - m + ATT_P_OFF) in e4m3 (FlashAttention-4's FP8 max offset:
+// e4m3 keeps 2^-9..448, the exact running max keeps P <= 2^8), the keys of a 32-key chunk in P's register order.
+constexpr int ATT_ROWS = GQA * QB;               // 32 query rows per KV head: row = g * QB + t
+constexpr int ATT_KC = 32;                       // keys per chunk (four mma n-tiles, one k32 step of P V)
+constexpr int ATT_KG = 2;                        // key groups: warp w the chunks c % 2 == (w / 2) % 2
+constexpr int ATT_DH = 2;                        // dim halves: warp w the output dims of half w / 4
+constexpr int ATT_MAXK = 112;                    // keys per item at most (the window and the block over the splits)
+constexpr int ATT_MAX_SPLITS = 32;               // items per KV head at most
+constexpr int ATT_KROW = 2 * HDIM;               // a key's K | V bytes in smem (e4m3; 16-byte pieces swizzled by the key)
+constexpr int ATT_QROW = HDIM;                   // a query row's bytes in smem (e4m3, swizzled likewise)
+constexpr int ATT_PIECES = ATT_KROW / 16;        // 16-byte pieces of a key's K | V
+constexpr int ATT_KEYS_SMEM = (ATT_MAXK + ATT_KC - 1) / ATT_KC * ATT_KC;  // an item's keys padded to whole chunks
+constexpr int ATT_Q_OFF = ATT_KEYS_SMEM * ATT_KROW;  // the query rows after every key of the item
+constexpr float ATT_P_OFF = 8.0f;
+#else
 constexpr int ATT_ROWS = GQA * QB;               // 32 query rows per KV head: row = g * QB + t
 constexpr int ATT_KC = 16;                       // keys per chunk (two mma n-tiles)
 constexpr int ATT_KG = 2;                        // key groups: warp w the chunks c % 2 == (w / 2) % 2
@@ -16,6 +34,7 @@ constexpr int ATT_KROW = 2 * HDIM * 2;           // a key's K | V bytes in smem 
 constexpr int ATT_QROW = HDIM * 2;               // a query row's bytes in smem (swizzled likewise)
 constexpr int ATT_PIECES = ATT_KROW / 16;        // 16-byte pieces of a key's K | V
 constexpr int ATT_Q_OFF = ATT_MAXK * ATT_KROW;   // the query rows after every key of the item
+#endif
 constexpr int ATT_SMEM = ATT_Q_OFF + ATT_ROWS * ATT_QROW;
 constexpr int ATT_NT = HDIM / ATT_DH / 8;        // output n-tiles of a warp (its half of the dims)
 constexpr int ATT_XW = ATT_NT * 4 + 4;           // a lane's exchange words in the key groups' combine: O, then m, l
@@ -46,6 +65,27 @@ __device__ __forceinline__ float ex2_approx(float x) {
   asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
   return y;
 }
+#if MK_KV_FP8
+// D = A (16x32 e4m3, row) x B (32x8 e4m3, col) + D (fp32)
+__device__ __forceinline__ void mma16832_e4m3(float (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
+                                              uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+      "{%0, %1, %2, %3};"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+// the e4m3 codes of 16 values rounded to bf16 first (the attention's bf16 q / k / v), the first in the low byte:
+// vLLM's cache write and query quantization at scale 1 (__NV_SATFINITE, round to nearest even)
+__device__ __forceinline__ uint4 e4m3x16_of_bf16(const float* x) {
+  uint32_t w[4];
+#pragma unroll
+  for (int i = 0; i < 4; i++)
+    w[i] = f32x2_to_e4m3x2(bf16_round(x[4 * i]), bf16_round(x[4 * i + 1])) |
+           (f32x2_to_e4m3x2(bf16_round(x[4 * i + 2]), bf16_round(x[4 * i + 3])) << 16);
+  return make_uint4(w[0], w[1], w[2], w[3]);
+}
+#endif
 
 // the attended keys of the step: [lo, L] from the cache, then the block's 8 (key index j); keys below old_end: written
 // before this step (the rest: the step's committed tokens and the block, by the qkv op)
@@ -64,6 +104,16 @@ __device__ __forceinline__ AttnKeys attn_keys(const DkArgs& a, const StepState& 
   return k;
 }
 
+#if MK_KV_FP8
+// a 4 x 4 byte transpose: byte k of t[i] is byte i of r_k
+__device__ __forceinline__ void bytes_t4(uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3, uint32_t (&t)[4]) {
+  const uint32_t a0 = __byte_perm(r0, r1, 0x5140), a1 = __byte_perm(r0, r1, 0x7362);
+  const uint32_t a2 = __byte_perm(r2, r3, 0x5140), a3 = __byte_perm(r2, r3, 0x7362);
+  t[0] = __byte_perm(a0, a2, 0x5410), t[1] = __byte_perm(a0, a2, 0x7632);
+  t[2] = __byte_perm(a1, a3, 0x5410), t[3] = __byte_perm(a1, a3, 0x7632);
+}
+#endif
+
 // 16-byte piece p of row j (a key's K | V, or a query row) in shared memory: pieces XOR-swizzled by j % 8 within each
 // 128 bytes (ldmatrix reads 8 consecutive rows' same piece: conflict-free)
 __device__ __forceinline__ uint32_t att_piece(uint32_t j, uint32_t p, uint32_t row_bytes) {
@@ -78,6 +128,9 @@ static_assert((ATT_ROWS + 2 * NB) * 4 == NWT, "four threads per row");
 static_assert(QKV_SLOTS == 2, "attn_inputs: two slots of the qkv sums");
 __device__ void attn_inputs(const AttnDesc& g, const DkArgs& a, const StepState& s, const AttnKeys& ks, uint32_t h,
                             uint32_t sp, uint32_t k0, uint32_t k1, uint8_t* kv, uint8_t* qs, int pt, uint32_t epoch) {
+#if MK_KV_FP8
+  pt = fresh(pt);  // (dk_common.cuh: the FP8 KV cache's build)
+#endif
   // four threads per row, each the 16 dims of a quarter of the first half and their rope partners
   const int r = pt >> 2, qd = pt & 3, d0 = qd * ATT_IN_DIMS;
   constexpr int ROW_Q = 0;  // the row's kind: q
@@ -139,6 +192,45 @@ __device__ void attn_inputs(const AttnDesc& g, const DkArgs& a, const StepState&
       x[1][i] = __fmaf_rn(xn_hi, cv[i], __fmul_rn(xn_lo, sv[i]));
     }
   }
+#if MK_KV_FP8
+  // e4m3 of the bf16 values: the query rows (as vLLM quantizes the draft's query), the keys' rows (as the cache holds
+  // them: the item's keys and the committed tokens' cache rows); 16 dims per half, one 16-byte piece each
+  uint4 o8[2];
+#pragma unroll
+  for (int half = 0; half < 2; half++) o8[half] = e4m3x16_of_bf16(&x[half][0]);
+  // byte d0 + 64 half of the q row, of the k (v: + 128) row
+  const uint32_t vb = kind == ROW_V ? (uint32_t)HDIM : 0u;
+  if (kind == ROW_Q) {
+#pragma unroll
+    for (int half = 0; half < 2; half++) sts128(qs + att_piece(r, half * 4 + qd, ATT_QROW), o8[half]);
+  } else if (is_item_key) {
+#pragma unroll
+    for (int half = 0; half < 2; half++) sts128(kv + att_piece(j - k0, vb / 16 + half * 4 + qd, ATT_KROW), o8[half]);
+    if (is_ctx_row) {  // the committed token's k / v into the draft KV cache (its block; the null block takes none)
+      const uint32_t kvb = a.tab.kv_block;
+      const int32_t blk = __ldcg(a.step.block_table + pos / kvb);
+      if (blk != 0) {
+        const size_t crow = ((size_t)blk * NKVH + h) * kvb + (size_t)(pos % kvb);
+        uint8_t* row = reinterpret_cast<uint8_t*>(g.cache) + crow * ATT_KROW;
+#pragma unroll
+        for (int half = 0; half < 2; half++) *reinterpret_cast<uint4*>(row + vb + half * 64 + d0) = o8[half];
+      }
+    }
+  }
+  if (sp == 0 && !is_ctx_row) {  // the block's q (bf16, before its quantization) and k | v rows (e4m3, the cache's)
+    if (kind == ROW_Q) {
+      uint4* dst = reinterpret_cast<uint4*>(reinterpret_cast<__nv_bfloat16*>(g.q) + ((size_t)t * NQH + tile) * HDIM);
+#pragma unroll
+      for (int half = 0; half < 2; half++)
+#pragma unroll
+        for (int i = 0; i < ATT_IN_DIMS / 8; i++) dst[half * 8 + d0 / 8 + i] = pack_bf16x8(&x[half][i * 8]);
+    } else {
+      uint8_t* dst = reinterpret_cast<uint8_t*>(g.kvq) + ((size_t)t * NKVH + h) * ATT_KROW + vb;
+#pragma unroll
+      for (int half = 0; half < 2; half++) *reinterpret_cast<uint4*>(dst + half * 64 + d0) = o8[half];
+    }
+  }
+#else
   uint4 o[2][ATT_IN_DIMS / 8];
 #pragma unroll
   for (int half = 0; half < 2; half++)
@@ -178,6 +270,7 @@ __device__ void attn_inputs(const AttnDesc& g, const DkArgs& a, const StepState&
 #pragma unroll
       for (int i = 0; i < ATT_IN_DIMS / 8; i++) dst[half * 8 + p0 + i] = o[half][i];
   }
+#endif
 }
 
 // the head's merge, distributed over its items once all are stored: item sp merges rows [32 sp / n, 32 (sp + 1) / n),
@@ -246,6 +339,9 @@ __device__ void attn_item(const Instr& in, const AttnDesc& g_ref, const DkArgs& 
   constexpr int TS_KEYS = 3;     // the keys done
   constexpr int TS_STORED = 4;   // the partial stored
   constexpr int TS_HEAD = 5;     // every item of the head stored
+#if MK_KV_FP8
+  pt = fresh(pt);  // (dk_common.cuh: the FP8 KV cache's build)
+#endif
   const AttnDesc g = g_ref;  // (registers: read through the global reference, a field is re-read after every store)
   const StepState s = step_state(a);
   const AttnKeys ks = attn_keys(a, s);
@@ -262,7 +358,11 @@ __device__ void attn_item(const Instr& in, const AttnDesc& g_ref, const DkArgs& 
     const int64_t pos = ks.lo + j;
     const int32_t blk = __ldcg(a.step.block_table + pos / a.tab.kv_block);
     const size_t row = ((size_t)blk * NKVH + h) * a.tab.kv_block + (size_t)(pos % a.tab.kv_block);
+#if MK_KV_FP8
+    as.rows[j - k0] = reinterpret_cast<const uint8_t*>(g.cache) + row * ATT_KROW;
+#else
     as.rows[j - k0] = reinterpret_cast<const uint8_t*>(g.cache) + row * (4 * HDIM);
+#endif
   }
   if (pt == 0) wait_ring_drained(sm, cc);
   named_sync(BAR_WRK, NWT);
@@ -292,6 +392,92 @@ __device__ void attn_item(const Instr& in, const AttnDesc& g_ref, const DkArgs& 
   cp_async_wait<0>();
   named_sync(BAR_WRK, NWT);
   if (pt == 0) tr.stamp(TS_INPUTS);
+#if MK_KV_FP8
+  // the query rows' fragments (e4m3, 4 k-steps of 32 dims) re-read from smem per chunk and k-step (one ldmatrix each):
+  // held across the chunks they would take 16 registers the draft phase's budget does not have
+  const int q4 = lane % 4;
+  for (uint32_t j0 = kg * ATT_KC; j0 < nk; j0 += ATT_KG * ATT_KC) {
+    float sc[ATT_KC / 8][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
+#pragma unroll 2  // (all four k-steps unrolled would put every fragment in flight: past the workers' registers)
+    for (int kk = 0; kk < HDIM / 32; kk++) {
+      uint32_t qa[4];
+      ldsm_x4(qs + att_piece(mt * 16 + (lane % 16), kk * 2 + lane / 16, ATT_QROW), qa[0], qa[1], qa[2], qa[3]);
+#pragma unroll
+      for (int np = 0; np < ATT_KC / 16; np++) {  // two n-tiles (16 keys) per load: (keys 0.., dims k), (0.., k + 16),
+        uint32_t b0, b1, b2, b3;                  // (8.., k), (8.., k + 16)
+        ldsm_x4(kv + att_piece(j0 + 16 * np + (lane % 8) + (lane / 16) * 8, kk * 2 + (lane / 8) % 2, ATT_KROW), b0, b1, b2, b3);
+        mma16832_e4m3(sc[2 * np], qa[0], qa[1], qa[2], qa[3], b0, b1);
+        mma16832_e4m3(sc[2 * np + 1], qa[0], qa[1], qa[2], qa[3], b2, b3);
+      }
+    }
+    float cmax_lo = -INFINITY, cmax_hi = -INFINITY;
+#pragma unroll
+    for (int nt = 0; nt < ATT_KC / 8; nt++) {
+#pragma unroll
+      for (int e = 0; e < 2; e++) {
+        const uint32_t j = j0 + nt * 8 + (lane % 4) * 2 + e;  // the key (item index)
+        const uint32_t kj = k0 + j;
+        const int64_t pos = kj < ks.nc ? ks.lo + kj : ks.L + 1 + (kj - ks.nc);
+        const bool in_item = j < nk;
+        if (!in_item || pos < win_lo) sc[nt][e] = -INFINITY;
+        if (!in_item || pos < win_hi) sc[nt][2 + e] = -INFINITY;
+        cmax_lo = fmaxf(cmax_lo, sc[nt][e]);
+        cmax_hi = fmaxf(cmax_hi, sc[nt][2 + e]);
+      }
+    }
+#pragma unroll
+    for (int o2 = 1; o2 < 4; o2 <<= 1) {
+      cmax_lo = fmaxf(cmax_lo, __shfl_xor_sync(0xffffffffu, cmax_lo, o2));
+      cmax_hi = fmaxf(cmax_hi, __shfl_xor_sync(0xffffffffu, cmax_hi, o2));
+    }
+    const float mn_lo = fmaxf(m_lo, cmax_lo), mn_hi = fmaxf(m_hi, cmax_hi);
+    const float ms_lo = mn_lo == -INFINITY ? 0.f : mn_lo, ms_hi = mn_hi == -INFINITY ? 0.f : mn_hi;
+    const float al_lo = ex2_approx((m_lo == -INFINITY ? ms_lo : m_lo) * sl2 - ms_lo * sl2);
+    const float al_hi = ex2_approx((m_hi == -INFINITY ? ms_hi : m_hi) * sl2 - ms_hi * sl2);
+    m_lo = mn_lo, m_hi = mn_hi;
+    l_lo *= al_lo, l_hi *= al_hi;
+#pragma unroll
+    for (int i = 0; i < ATT_NT; i++) {
+      o[i][0] *= al_lo, o[i][1] *= al_lo;
+      o[i][2] *= al_hi, o[i][3] *= al_hi;
+    }
+    // P = 2^(s sl2 - m sl2 + ATT_P_OFF): row sums from fp32 P, the P V product from e4m3 P. P V's k slots in this
+    // thread's register order: slots 4 q4 + 0..3 = keys 2 q4, 2 q4 + 1, 8 + 2 q4, 9 + 2 q4 (n-tiles 0, 1), slots
+    // 16 + 4 q4 + 0..3 the same of n-tiles 2, 3 (the V fragments below gather the same keys)
+    uint32_t pa[4];
+    const float b_lo = ATT_P_OFF - ms_lo * sl2, b_hi = ATT_P_OFF - ms_hi * sl2;
+#pragma unroll
+    for (int h2 = 0; h2 < 2; h2++) {
+      float p[2][4];
+#pragma unroll
+      for (int u = 0; u < 2; u++) {
+        const int nt = 2 * h2 + u;
+        p[u][0] = ex2_approx(fmaf(sc[nt][0], sl2, b_lo)), p[u][1] = ex2_approx(fmaf(sc[nt][1], sl2, b_lo));
+        p[u][2] = ex2_approx(fmaf(sc[nt][2], sl2, b_hi)), p[u][3] = ex2_approx(fmaf(sc[nt][3], sl2, b_hi));
+        l_lo += p[u][0] + p[u][1], l_hi += p[u][2] + p[u][3];
+      }
+      pa[2 * h2] = f32x2_to_e4m3x2(p[0][0], p[0][1]) | (f32x2_to_e4m3x2(p[1][0], p[1][1]) << 16);      // row lo
+      pa[2 * h2 + 1] = f32x2_to_e4m3x2(p[0][2], p[0][3]) | (f32x2_to_e4m3x2(p[1][2], p[1][3]) << 16);  // row hi
+    }
+    // O += P (16 x 32 keys) V (32 keys x 8 dims) per n-tile, column n of n-tile nt being dim dh 64 + 8 n + nt: this
+    // thread's B column (n = lane / 4) is the same 8 consecutive dims in every n-tile, one 8-byte load from each key row
+    // of its k slots; a 4 x 4 byte transpose per 4 rows and 4 n-tiles makes the fragments
+    static_assert(ATT_NT == 8, "a thread's B column: 8 consecutive dims, one per n-tile");
+    const uint32_t kr0 = j0 + 2 * q4, kr[8] = {kr0, kr0 + 1, kr0 + 8, kr0 + 9, kr0 + 16, kr0 + 17, kr0 + 24, kr0 + 25};
+    const uint32_t vc = HDIM + dh * (HDIM / ATT_DH) + (lane / 4) * ATT_NT;  // the column's first V byte in a key row
+    uint2 vr[8];
+#pragma unroll
+    for (int u = 0; u < 8; u++) vr[u] = lds64(kv + att_piece(kr[u], vc / 16, ATT_KROW) + vc % 16);
+#pragma unroll
+    for (int hv = 0; hv < 2; hv++) {  // n-tiles 4 hv .. 4 hv + 3: word hv of each row
+      uint32_t b0[4], b1[4];
+      bytes_t4(hv ? vr[0].y : vr[0].x, hv ? vr[1].y : vr[1].x, hv ? vr[2].y : vr[2].x, hv ? vr[3].y : vr[3].x, b0);
+      bytes_t4(hv ? vr[4].y : vr[4].x, hv ? vr[5].y : vr[5].x, hv ? vr[6].y : vr[6].x, hv ? vr[7].y : vr[7].x, b1);
+#pragma unroll
+      for (int i = 0; i < 4; i++) mma16832_e4m3(o[4 * hv + i], pa[0], pa[1], pa[2], pa[3], b0[i], b1[i]);
+    }
+  }
+#else
   for (uint32_t j0 = kg * ATT_KC; j0 < nk; j0 += ATT_KG * ATT_KC) {
     float sc[ATT_KC / 8][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
 #pragma unroll
@@ -355,6 +541,7 @@ __device__ void attn_item(const Instr& in, const AttnDesc& g_ref, const DkArgs& 
       mma16816(o[nt + 1], pa[0][0], pa[0][1], pa[1][0], pa[1][1], b2, b3);
     }
   }
+#endif
 #pragma unroll
   for (int o2 = 1; o2 < 4; o2 <<= 1) {
     l_lo += __shfl_xor_sync(0xffffffffu, l_lo, o2);
@@ -393,12 +580,27 @@ __device__ void attn_item(const Instr& in, const AttnDesc& g_ref, const DkArgs& 
   // the item's partial (key group 0 of each m-tile and dim half): O over its dims, (m, l) per row
   if (kg == 0) {
     float* po = reinterpret_cast<float*>(g.part_o) + (((size_t)sp * NKVH + h) * ATT_ROWS) * HDIM;
+#if MK_KV_FP8
+    // (column n of n-tile nt: dim dh 64 + 8 n + nt) this thread's columns 2 (lane % 4) + e: 8 consecutive dims each
+#pragma unroll
+    for (int e = 0; e < 2; e++) {
+      const int dim = dh * (HDIM / ATT_DH) + ((lane % 4) * 2 + e) * ATT_NT;
+#pragma unroll
+      for (int q = 0; q < ATT_NT; q += 4) {
+        __stcg(reinterpret_cast<float4*>(po + (size_t)r_lo * HDIM + dim + q),
+               make_float4(o[q][e], o[q + 1][e], o[q + 2][e], o[q + 3][e]));
+        __stcg(reinterpret_cast<float4*>(po + (size_t)r_hi * HDIM + dim + q),
+               make_float4(o[q][2 + e], o[q + 1][2 + e], o[q + 2][2 + e], o[q + 3][2 + e]));
+      }
+    }
+#else
 #pragma unroll
     for (int nt = 0; nt < ATT_NT; nt++) {
       const int dim = dh * (HDIM / ATT_DH) + nt * 8 + (lane % 4) * 2;
       __stcg(reinterpret_cast<float2*>(po + (size_t)r_lo * HDIM + dim), make_float2(o[nt][0], o[nt][1]));
       __stcg(reinterpret_cast<float2*>(po + (size_t)r_hi * HDIM + dim), make_float2(o[nt][2], o[nt][3]));
     }
+#endif
     if (dh == 0 && (lane % 4) == 0) {
       float* pm = reinterpret_cast<float*>(g.part_ml) + (((size_t)sp * NKVH + h) * ATT_ROWS) * 2;
       __stcg(reinterpret_cast<float2*>(pm + r_lo * 2), make_float2(m_lo * sl2, l_lo));

@@ -38,7 +38,12 @@ static_assert(4 * 32 * REG_LO + 4 * 32 * REG_EPI + NPRO * REG_HI <= NTHREADS * R
 // the draft's phase after the step (DREG_*): the prologue warps give registers back (setmaxnreg.dec), then the
 // epilogue's finishers take DREG_EPI from the pool (setmaxnreg.inc waits for it); warpgroup 1 keeps REG_LO (an .inc
 // there hangs the launch: its idle warps reach it at the start); the step keeps a split of its own
+#if MK_KV_FP8
+// the FP8 KV cache's build: the prologue warps keep REG_HI, which the draft's FP8 attention needs to run without spills
+constexpr int DREG_EPI = 120, DREG_HI = 168;
+#else
 constexpr int DREG_EPI = 120, DREG_HI = 160;
+#endif
 static_assert(4 * 32 * REG_LO + 4 * 32 * DREG_EPI + NPRO * DREG_HI <= NTHREADS * REG_LAUNCH, "the draft's budget");
 static_assert(DREG_HI <= REG_HI && DREG_EPI >= REG_EPI && NPRO * (REG_HI - DREG_HI) >= 4 * 32 * (DREG_EPI - REG_EPI),
               "the transition: the prologue warps' release covers the epilogue's increase");
@@ -76,10 +81,37 @@ constexpr uint32_t AUX_ZNEXT = 1u << 23;
 // writes (its twin), which also arms its xfull, pacing count, prologue count and zero_next_acc once both are complete;
 // the prologue warps skip it (in_proj_z: so that the GDN core, next on them, starts sooner)
 constexpr uint32_t AUX_TWIN = 1u << 3;
+// The FP8 KV cache's build (MK_KV_FP8) starts a step without OP_EMBED: layer 0's NORM_IN prologues read the embedding
+// table's rows by token id (OpDesc::res_in, the table; lane t of every warp holds row t's id; warp 0 prefetches the
+// rows into L2; out of line, z_emb_tok), in_proj_qkv's writes its slice of the rows into x0 (OpDesc::r_out, the residual
+// of layer 0, released by its prologue's count as the other layers' r_out slices), and in_proj_qkvz's takes the rows'
+// ids by OP_BOOK's own formula from its sources (OpDesc::rec: a copy of OP_BOOK's descriptor; book_id), so that it does
+// not wait for OP_BOOK's counter; in_proj_ba's keeps that wait, the acquire every SM's later ops are ordered by. Without
+// res_in, the rows of in0.
+// MK_PAD_HERE (the FP8 KV cache's build): 117 lines (8 NANOSLEEPs, 128 bytes, each) of never-executed code at the start
+// of prologue()'s PRO_NORM_IN branch, behind a branch on %smid == 0xffff: the code after it moved, not changed, to the
+// offset from the code before it (modulo the sets of the SM's instruction cache) the build is laid out for
+#if MK_KV_FP8
+#define MK_PAD_LINE "nanosleep.u32 1;\n" "nanosleep.u32 1;\n" "nanosleep.u32 1;\n" "nanosleep.u32 1;\n" \
+                    "nanosleep.u32 1;\n" "nanosleep.u32 1;\n" "nanosleep.u32 1;\n" "nanosleep.u32 1;\n"
+#define MK_PAD_LINES4 MK_PAD_LINE MK_PAD_LINE MK_PAD_LINE MK_PAD_LINE
+#define MK_PAD_LINES16 MK_PAD_LINES4 MK_PAD_LINES4 MK_PAD_LINES4 MK_PAD_LINES4
+#define MK_PAD_LINES32 MK_PAD_LINES16 MK_PAD_LINES16
+#define MK_PAD_LINES64 MK_PAD_LINES32 MK_PAD_LINES32
+#define MK_PAD_HERE()                                                                                          \
+  asm volatile("{\n.reg .pred p;\n.reg .u32 r;\nmov.u32 r, %%smid;\nsetp.ne.u32 p, r, 65535;\n@p bra MKPADE;\n" \
+               MK_PAD_LINE MK_PAD_LINES4 MK_PAD_LINES16 MK_PAD_LINES32 MK_PAD_LINES64 "MKPADE:\n}" ::"n"(0) : "memory")
+#else
+#define MK_PAD_HERE()
+#endif
 // Instr::aux bit 6 (schedule.py mark_fastact) of an out_proj GEMV instruction after the GDN core on its SM (validated,
 // AUX_ZNEXT, no dependency): its prologue warps' path of its own (fast_act: the descriptor, the B slot, stage_val, B
 // complete, the counts), out of line
 constexpr uint32_t AUX_FASTACT = 1u << 6;
+// Instr::aux bit 7 (schedule.py mark_fastpub; the FP8 KV cache's build) of a PRO_ACT GEMV instruction (not
+// AUX_FASTACT, no CTA pair): its prologue warps' path of its own (fast_pub), the generic path's steps for that kind only
+// and in its order, shared by every layer's PRO_ACT consumers, so that each runs the code its predecessor just ran
+constexpr uint32_t AUX_FASTPUB = 1u << 7;
 // Instr::aux bit 4 (schedule.py mark_fastact, FAPRE) on an OP_GDNT instruction and its AUX_FASTACT out_proj: the
 // core's idle warps also copy out_proj's descriptor into the prologue's shared copy (with AUX_ZNEXT's block, before the
 // release's barrier); fast_act skips its copy and its barrier
@@ -824,6 +856,16 @@ __device__ __forceinline__ void shared_b_ba_part(const SharedBExt& e, uint32_t x
     *reinterpret_cast<float2*>(pr + (16 * m + g + 8) * NT + 2 * j) = make_float2(fix(d[2]), fix(d[3]));
   }
 }
+#if MK_KV_FP8
+// a byte store under a predicate, with no branch around it: a branch taken by half a warp's lanes would split the
+// finisher's path into two instruction streams and a reconvergence
+__device__ __forceinline__ void sts_u8_if(uint32_t a, uint32_t v, bool p) {
+  asm volatile("{\n\t.reg .pred q;\n\tsetp.ne.b32 q, %2, 0;\n\t@q st.shared.u8 [%0], %1;\n\t}" ::"r"(a), "r"(v), "r"((uint32_t)p) : "memory");
+}
+__device__ __forceinline__ void stg_u8_if(uint8_t* a, uint32_t v, bool p) {
+  asm volatile("{\n\t.reg .pred q;\n\tsetp.ne.b32 q, %2, 0;\n\t@q st.global.u8 [%0], %1;\n\t}" ::"l"(a), "r"(v), "r"((uint32_t)p) : "memory");
+}
+#endif
 // (shared B, SharedBExt::erstd) the finisher's tail, the rstd left to the consumer's epilogue: x = bf16(o) + residual,
 // v = (x * (1 + w)) * c_t, quantized as the consumer's prologue does; the B words and bf16(v) first (the consumer's
 // path), then x's copies, the aux rows and the tile's ssq slot (read after the consumer's first accumulator)
@@ -854,6 +896,22 @@ __device__ __forceinline__ void shared_b_tail_kind(const Smem& sm, uint32_t mt, 
     }
   };
   read_res();
+#if MK_KV_FP8
+  // validated copies: the values still at the sentinel re-polled, out of line; the check is one predicate, the re-poll's
+  // block the call alone, and the rows are read again unconditionally (unchanged unless re-polled): no taken branch over
+  // a cold block before the B words
+  {
+    const uint32_t low_half = RB16 ? 0xffffu : 0u;  // (bf16: rb = h << 16, so (rb | 0xffff) == ~0u iff h == 0xffff)
+    bool has_stale = false;
+#pragma unroll
+    for (int t = 0; t < NT; t++) has_stale |= (t < (int)T) & ((rb[t] | low_half) == ~0u);
+    if (__builtin_expect(has_stale && e.rin != 0, 0)) {
+      const uint32_t bpv = RB16 ? 2u : 4u;
+      xs_repoll(wsm, reinterpret_cast<const uint8_t*>(e.rin) + ((size_t)par * NT * K + c) * bpv, K * bpv, T, RB16, lane);
+    }
+    read_res();
+  }
+#else
   if (e.rin) {  // (validated copies: the values still at the sentinel re-polled, out of line)
     bool has_stale = false;
 #pragma unroll
@@ -864,6 +922,7 @@ __device__ __forceinline__ void shared_b_tail_kind(const Smem& sm, uint32_t mt, 
       read_res();
     }
   }
+#endif
   float x[NT];
 #pragma unroll
   for (int t = 0; t < NT; t++) x[t] = t < (int)T ? __fadd_rn(__uint_as_float(ob[t] << 16), __uint_as_float(rb[t])) : 0.f;
@@ -912,20 +971,34 @@ __device__ __forceinline__ void shared_b_tail_kind(const Smem& sm, uint32_t mt, 
     const __nv_fp8_e4m3 qs(gs * (am * r6));
     const float sfq = float(qs);
     const float om = sfq != 0.f ? rcp_approx_ftz(sfq * rgs) : 0.f;
+#if MK_KV_FP8
+    {  // (the even lanes store, predicated)
+      const uint32_t sv = *reinterpret_cast<const uint8_t*>(&qs);
+      stg_u8_if(bp + (size_t)(K / 256) * CHUNK_B + sfb_pos(kc, blk, tr), sv == 0xffu ? 0x7fu : sv, !(lane & 1) && tr < (int)T);
+    }
+#else
     if (!(lane & 1) && tr < (int)T) {
       const uint32_t sv = *reinterpret_cast<const uint8_t*>(&qs);
       bp[(size_t)(K / 256) * CHUNK_B + sfb_pos(kc, blk, tr)] = (uint8_t)(sv == 0xffu ? 0x7fu : sv);
     }
+#endif
 #pragma unroll
     for (int t = 0; t < NT; t++) {
       if (t < (int)T) {
         const float vo = __fmul_rn(vb[t], __shfl_sync(0xffffffffu, om, (lane & 16) | (2 * t)));
         const float vn = __shfl_xor_sync(0xffffffffu, vo, 1);
+#if MK_KV_FP8
+        // (every lane converts, the even lanes store)
+        uint32_t cb = f32x2_to_e2m1x2(vo, vn) & 0xffu;
+        cb ^= cb & ~((cb & 0x77u) + 0x77u) & 0x88u;  // (-0 as +0: the nibble 0x8 is the sentinel)
+        sts_u8_if(wsm + t * 16 + (lane >> 1), cb, !(lane & 1));
+#else
         if (!(lane & 1)) {
           uint32_t cb = f32x2_to_e2m1x2(vo, vn) & 0xffu;
           cb ^= cb & ~((cb & 0x77u) + 0x77u) & 0x88u;  // (-0 as +0: the nibble 0x8 is the sentinel)
           sts_u8(wsm + t * 16 + (lane >> 1), cb);
         }
+#endif
       }
     }
     __syncwarp();
@@ -1598,6 +1671,59 @@ __device__ __forceinline__ void stage_pub(const Instr& in, const OpDesc& d, int 
   stage_pub(reinterpret_cast<const uint8_t*>(d.in0) + (epoch & 1) * d.act_stride, d.kind == KIND_NVFP4, d.K, cr.nck,
             cr.kc0, cr.n1, xb, sfb, pt, T, is_dry);
 }
+#if MK_KV_FP8
+// (fast_pub) an FP8 shared-B consumer's words and its twin's (in_proj_z's chunks of the same published B) in one batch:
+// both ranges' loads in flight together, one L2 round trip for both. Word j < nw1 is the instruction's (into xb), the
+// others the twin's (into xb2); nw1 is whole chunks, so a thread keeps its row (one row per thread, as shared_b_words)
+__device__ __noinline__ void stage_pub2(const uint8_t* act, uint32_t nck, uint32_t kc0, uint32_t n1, uint32_t nck2, uint32_t kc02,
+                                        uint32_t n12, uint8_t* xb, uint8_t* xb2, int pt, uint32_t T, bool is_dry) {
+  constexpr uint32_t WPC = 8 * NT, CB = CHUNK_B;  // words per chunk, chunk bytes
+  if ((uint32_t)pt % NT >= T) return;
+  const uint32_t nw1 = nck * WPC, nw = nw1 + nck2 * WPC;
+  auto word = [&](uint32_t j) -> const uint32_t* {
+    const bool is_twin = j >= nw1;
+    const uint32_t l = (is_twin ? j - nw1 : j) / WPC, c0 = is_twin ? kc02 : kc0, c1 = is_twin ? n12 : n1;
+    return reinterpret_cast<const uint32_t*>(act + (l < c1 ? c0 + l : l - c1) * CB + (j % WPC) * 16);
+  };
+#pragma unroll 1
+  for (uint32_t j0 = pt; j0 < nw; j0 += SHARED_B_LOADS * NPRO) {
+    uint4 v[SHARED_B_LOADS];
+#pragma unroll
+    for (int k = 0; k < SHARED_B_LOADS; k++) {
+      const uint32_t j = j0 + k * NPRO;
+      v[k] = make_uint4(0u, 0u, 0u, 0u);
+      if (j < nw) v[k] = ld_relaxed_v4(word(j));
+    }
+    uint32_t sm_ = 0u;  // (bit k: word k stale)
+    if (!is_dry) {
+#pragma unroll
+      for (int k = 0; k < SHARED_B_LOADS; k++)
+        if (j0 + k * NPRO < nw && shared_b_stale<false>(v[k])) sm_ |= 1u << k;
+    }
+#pragma unroll 1
+    while (__builtin_expect(sm_ != 0u, 0)) {
+      __nanosleep(SHARED_B_REPOLL_NS);
+#pragma unroll
+      for (int k = 0; k < SHARED_B_LOADS; k++)
+        if (sm_ & (1u << k)) v[k] = ld_relaxed_v4(word(j0 + k * NPRO));
+#pragma unroll
+      for (int k = 0; k < SHARED_B_LOADS; k++)
+        if ((sm_ & (1u << k)) && !shared_b_stale<false>(v[k])) sm_ &= ~(1u << k);
+    }
+#pragma unroll
+    for (int k = 0; k < SHARED_B_LOADS; k++) {
+      const uint32_t j = j0 + k * NPRO;
+      if (j < nw) *reinterpret_cast<uint4*>(j < nw1 ? xb + j * 16 : xb2 + (j - nw1) * 16) = v[k];
+    }
+  }
+}
+__device__ __forceinline__ void stage_pub2(const Instr& in, const Instr& nx, const OpDesc& d, int pt, uint8_t* xb,
+                                           uint8_t* xb2, uint32_t epoch, uint32_t T, bool is_dry = false) {
+  const ChunkRange cr = chunk_range(in, d), cr2 = chunk_range(nx, d);
+  stage_pub2(reinterpret_cast<const uint8_t*>(d.in0) + (epoch & 1) * d.act_stride, cr.nck, cr.kc0, cr.n1, cr2.nck, cr2.kc0,
+             cr2.n1, xb, xb2, pt, T, is_dry);
+}
+#endif
 // AUX_FASTACT: a validated FP8 PRO_ACT operand (no scales, no dependency): stage_inputs' copy and re-poll
 __device__ __forceinline__ void stage_val(const Instr& in, const OpDesc& d, const Smem& sm, int pt, uint32_t& phase,
                                           uint8_t* xb, uint32_t epoch, uint32_t T) {
@@ -1739,10 +1865,35 @@ struct PeerB {
   uint32_t xb, bar;
   ChunkRange cr;
 };
+#if MK_KV_FP8
+// (the FP8 KV cache's build) row lane's input id as OP_BOOK writes it into vLLM's input ids (step.cuh book_inputs): row 0 the previous
+// launched step's last sampled token from its ring slot (PREV_POST and a count), else the request's last sampled one;
+// row t its draft t - 1. From the sources, which the previous launches and the host wrote: in this launch OP_BOOK's
+// post_update stores the request's last sampled token only when row 0 comes from the ring slot (not read then), and
+// OP_PREV writes none of them. Every lane of the warp (a shuffle; d, the record: warp-uniform); lanes >= T: 0
+__device__ __forceinline__ int32_t book_id(const BookDesc& d, uint32_t lane, uint32_t T) {
+  const int req = rec_i32(nullptr, SR_BK + BK_REQ);
+  const uint32_t w = (uint32_t)rec_i32(nullptr, SR_BK + BK_PREV);
+  const bool post = (w & PREV_POST) != 0u;
+  const int64_t r = (w >> PREV_SLOT_SHIFT) & PREV_SLOT_MASK, Tp = (w >> PREV_T_SHIFT) & PREV_T_MASK;
+  auto ld64 = [](const uint64_t& f) { return (uint64_t)__ldg(reinterpret_cast<const unsigned long long*>(&f)); };
+  const uint64_t sp = ld64(d.sampled), np = ld64(d.num_sampled), lp = ld64(d.last_sampled), dp = ld64(d.draft_tokens);
+  const uint32_t ds = __ldg(&d.draft_stride), nt = __ldg(&d.nt);
+  // (every load at once: the slot's count, its rows' tokens, the request's token and drafts)
+  const int32_t ns = post ? __ldcg(reinterpret_cast<const int32_t*>(np) + r) : 0;
+  const int64_t mine = post && (int64_t)lane < Tp ? __ldcg(reinterpret_cast<const int64_t*>(sp) + r * nt + lane) : 0;
+  const int64_t held = lane == 0 ? __ldcg(reinterpret_cast<const int64_t*>(lp) + req) : 0;
+  const int64_t dr = lane >= 1u && lane < T ? __ldcg(reinterpret_cast<const int64_t*>(dp) + (int64_t)req * ds + lane - 1) : 0;
+  const int32_t lr = ns > 0 ? ns - 1 : 0;  // (OP_BOOK's last_row: the thread whose token goes to row 0)
+  const int64_t m = __shfl_sync(0xffffffffu, mine, lr & 31);
+  return lane == 0u ? (int32_t)(ns > 0 ? ((int64_t)lr < Tp ? m : 0) : held) : lane < T ? (int32_t)dr : 0;
+}
+#endif
 // RESID: x = bf16(the producing op's validated ACC_CNT output) + the residual (fp32, or bf16 when BF16IN); else x = the
 // bf16 input rows. Per token row t < T: its values (loaded a row ahead), the sum of squares, the B rows (xb2: also the
-// twin's chunks); this instruction's slice of x (fp32) and of bf16(x) to x_out / r_out
-template <int KIND, bool RESID, bool BF16IN, bool BA, bool SPLIT>
+// twin's chunks; TOK: the rows of the embedding table by token id, z_emb_tok); this instruction's slice of x (fp32)
+// and of bf16(x) to x_out / r_out
+template <int KIND, bool RESID, bool BF16IN, bool BA, bool SPLIT, bool TOK = false>
 __device__ __forceinline__ void pro_norm_rows(const Instr& in, const OpDesc& d, const Smem& sm, int pt,
                                               const uint2 (&wv)[NG5], const SrcAcc& src, uint8_t* xb, uint8_t* sfb,
                                               const ChunkRange& cr2, uint8_t* xb2, const uint2* bw, uint32_t T,
@@ -1777,8 +1928,32 @@ __device__ __forceinline__ void pro_norm_rows(const Instr& in, const OpDesc& d, 
   // row for each load)
   const uint8_t* vb = (RESID ? src.acc : reinterpret_cast<const uint8_t*>(d.in0)) + (uint32_t)pt * 8u;
   uint32_t vs = RESID ? src.rs * 2 : K * 2;
+  // (TOK: z_emb_tok) NORM_IN on the table (res_in): row t's id in lane t of every warp (the dry run:
+  // the table's row 0), and warp 0's lanes t < T prefetch row t into L2 (no OP_EMBED has read it); x0 (r_out): this
+  // instruction's slice of each row, the loaded bf16 words as they are (the embedding's bytes)
+  [[maybe_unused]] int32_t tokl = 0;
+  [[maybe_unused]] uint64_t xo0 = 0;
+  if constexpr (TOK) {
+    vb = reinterpret_cast<const uint8_t*>(d.res_in) + (uint32_t)pt * 8u;
+#if MK_KV_FP8
+    // (OpDesc::rec, OP_BOOK's descriptor, when OP_BOOK writes the step's inputs: no dependency on it)
+    if (!is_dry && d.rec && rec_i32(nullptr, SR_BK + BK_ON))
+      tokl = book_id(*reinterpret_cast<const BookDesc*>(d.rec), (uint32_t)(pt & 31), T);
+    else
+#endif
+    tokl = !is_dry && (uint32_t)(pt & 31) < T ? rec_token(nullptr, (uint32_t)(pt & 31)) : 0;
+    if (!is_dry && (uint32_t)pt < T)
+      asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;"
+                   ::"l"(d.res_in + (uint64_t)(uint32_t)tokl * (K * 2)), "r"(K * 2) : "memory");
+    xo0 = is_dry ? 0 : d.r_out;
+  }
   asm volatile("" : "+l"(vb), "+r"(vs));
-  auto row_in = [&](uint32_t t) { return reinterpret_cast<const uint2*>(vb + (size_t)t * vs); };
+  auto row_in = [&](uint32_t t) {
+    if constexpr (TOK)  // (lane t's id)
+      return reinterpret_cast<const uint2*>(vb + (size_t)(uint32_t)__shfl_sync(0xffffffffu, tokl, (int)t) * vs);
+    else
+      return reinterpret_cast<const uint2*>(vb + (size_t)t * vs);
+  };
   auto load = [&](uint32_t t) {
     const uint2* gp = row_in(t);
 #pragma unroll
@@ -1877,6 +2052,10 @@ __device__ __forceinline__ void pro_norm_rows(const Instr& in, const OpDesc& d, 
         x[i][2] = bf16lo_add(ov[i].y, r.z), x[i][3] = bf16hi_add(ov[i].y, r.w);
       } else {
         x[i][0] = bf16lo(ov[i].x), x[i][1] = bf16hi(ov[i].x), x[i][2] = bf16lo(ov[i].y), x[i][3] = bf16hi(ov[i].y);
+        if constexpr (TOK) {  // (x0's slice)
+          const uint32_t q = pt + i * NPRO;
+          if (xo0 && q - s0 < s1 - s0) reinterpret_cast<uint2*>(xo0 + (size_t)t * K * 2)[q] = ov[i];
+        }
       }
     }
     if (RESID && !ROWS_RESIDENT) fence_async_smem();  // (the staging buffer's reads before the next row's copy into it)
@@ -2009,6 +2188,35 @@ __device__ __forceinline__ void pro_norm_rows(const Instr& in, const OpDesc& d, 
     }
   }
 }
+
+#if MK_KV_FP8
+// (the FP8 KV cache's build, OpDesc::res_in set) layer 0's NORM_IN prologue on the embedding table by token id, out of
+// line, so that mk_main's per-layer code keeps its place. Its own norm weights (the caller's, loaded before the
+// dependency, stay there: a reference would put them in local memory; these loads overlap the ids' round trip) and its B
+// slot (xb, sfb), the reductions' area (red); in_proj_qkvz (FP8) or in_proj_ba (BF16); no twin, no AUX_SPLIT
+// (schedule.py). (Its name sorts last: ptxas lays a kernel's out-of-line functions out after its body in the order of
+// their mangled names, length first)
+__device__ __noinline__ void z_emb_tok(const OpDesc& d, uint32_t tile, uint32_t r0, uint32_t r1, int pt, uint8_t* xb,
+                                             uint8_t* sfb, float* red, uint32_t T, bool dry) {
+  Instr in{};
+  in.r0 = r0, in.r1 = r1, in.tile = tile;
+  Smem sm{};
+  sm.red = red;
+  uint2 wv[NG5];
+#pragma unroll
+  for (int i = 0; i < NG5; i++) wv[i] = __ldg(reinterpret_cast<const uint2*>(d.nw) + pt + i * NPRO);
+  const SrcAcc src{nullptr, 0.f, 0u};
+  const PeerB pb{0u, 0u, ChunkRange{1u, 0u, 0u, 0u}};
+  const ChunkRange cr2{1u, 0u, 0u, 0u};
+  uint32_t stg_phase = 0;
+  if (d.kind == KIND_FP8)
+    pro_norm_rows<KIND_FP8, false, true, false, false, true>(in, d, sm, pt, wv, src, xb, sfb, cr2, nullptr, nullptr, T,
+                                                             stg_phase, dry, pb, 0u, 0u);
+  else
+    pro_norm_rows<KIND_BF16, false, true, false, false, true>(in, d, sm, pt, wv, src, xb, sfb, cr2, nullptr, nullptr, T,
+                                                              stg_phase, dry, pb, 0u, 0u);
+}
+#endif
 
 // in_proj_qkv's b / a of this SM's item (head hv) from the producer's partials (shared_xn's bit 0; [2][40][96][NT]
 // fp32, sentinel ~0u): threads pt < 160 one 16-byte word each (4 token rows of b or a of a tile, re-polled) into scr
@@ -2281,6 +2489,11 @@ __device__ __forceinline__ void prologue(const Instr& in, const OpDesc& d, const
                                                            is_dry, pb, t0, t1);
     }
   } else if (d.pro == PRO_NORM_IN) {
+    MK_PAD_HERE();
+#if MK_KV_FP8
+    if (d.res_in) z_emb_tok(d, in.tile, in.r0, in.r1, pt, xb, sfb, sm.red, T, is_dry);  // (out of line)
+    else
+#endif
     if (d.kind == KIND_FP8)
       pro_norm_rows<KIND_FP8, false, true, false, false>(in, d, sm, pt, wv, src, xb, sfb, cr2, xb2, bw, T, stg_phase,
                                                          is_dry, pb, t0, t1);
@@ -2335,7 +2548,13 @@ constexpr int BAR_DRAFT = 15;                         // (the role warps: 6 and 
 constexpr int DRAFT_SYNC_THREADS = NTHREADS - 2 * 32;
 constexpr uint32_t DRAFT_SH_OFF = (dk::BBUF_BYTES + 15) / 16 * 16;
 constexpr uint32_t DRAFT_ARGS_OFF = (DRAFT_SH_OFF + (uint32_t)sizeof(dk::DraftShared) + 15) / 16 * 16;
+#if MK_KV_FP8
+// (the draft kernel's own launch gives its producer more than REG_LO: there it holds its state across a GEMV's
+// stages; this kernel's producer loop needs no more than REG_LO, which the SASS check's no-local-memory rule shows)
+static_assert(DREG_EPI >= dk::REG_EPI && DREG_HI >= dk::REG_HI, "the draft's registers");
+#else
 static_assert(DREG_EPI >= dk::REG_EPI && DREG_HI >= dk::REG_HI && REG_LO >= dk::REG_LO, "the draft's registers");
+#endif
 static_assert(DRAFT_ARGS_OFF + sizeof(dk::DkArgs) <= 2 * B_SLOT_BYTES + STG_BYTES && B_SLOT_BYTES % 1024 == 0,
               "the draft's shared memory over the B buffers and the staging buffer");
 static_assert(dk::NSTAGE == NSTAGE && dk::STAGE_STRIDE == STAGE_BYTES && dk::STAGE_BYTES <= STAGE_BYTES, "one ring");
@@ -2815,12 +3034,43 @@ __global__ void __cluster_dims__(2, 1, 1) __launch_bounds__(NTHREADS, 1) mk_main
       if (in.op == OP_EMBED) {  // the input tokens' rows of the embedding table (w, K values) into in0 [NT][K] (bf16)
         const OpDesc d = a.descs[in.desc];
         MK_ROWS;
+#if MK_KV_FP8
+        // (the FP8 KV cache's build) every token's id first, then EB_ROWS rows' pieces loaded before their stores
+        constexpr uint32_t EB_ROWS = 4, EB_PR = (K_NORM / 8 + NPRO - 1) / NPRO;  // (a thread's pieces of a row)
+        if (d.K <= K_NORM) {
+          int32_t tok[NT];
+#pragma unroll
+          for (uint32_t t = 0; t < (uint32_t)NT; t++)
+            tok[t] = t < T ? rec_token(reinterpret_cast<const int32_t*>(d.rec), t) : 0;
+#pragma unroll
+          for (uint32_t t0 = 0; t0 < (uint32_t)NT; t0 += EB_ROWS) {
+            uint4 x[EB_ROWS][EB_PR];
+#pragma unroll
+            for (uint32_t t = 0; t < EB_ROWS; t++)
+#pragma unroll
+              for (uint32_t r = 0; r < EB_PR; r++) {
+                const uint32_t i = pt + r * NPRO;
+                x[t][r] = t0 + t < T && i < d.K / 8 ? __ldg(reinterpret_cast<const uint4*>(d.w + (size_t)tok[t0 + t] * d.K * 2) + i)
+                                                    : make_uint4(0u, 0u, 0u, 0u);
+              }
+#pragma unroll
+            for (uint32_t t = 0; t < EB_ROWS; t++)
+#pragma unroll
+              for (uint32_t r = 0; r < EB_PR; r++) {
+                const uint32_t i = pt + r * NPRO;
+                if (t0 + t < T && i < d.K / 8) reinterpret_cast<uint4*>(d.in0 + (size_t)(t0 + t) * d.K * 2)[i] = x[t][r];
+              }
+          }
+        } else
+#endif
+        {
 #pragma unroll 1
         for (uint32_t t = 0; t < T; t++) {
           const int32_t tok = rec_token(reinterpret_cast<const int32_t*>(d.rec), t);
           const uint4* row = reinterpret_cast<const uint4*>(d.w + (size_t)tok * d.K * 2);
           uint4* out = reinterpret_cast<uint4*>(d.in0 + (size_t)t * d.K * 2);
           for (uint32_t i = pt; i < d.K / 8; i += NPRO) out[i] = __ldg(row + i);
+        }
         }
         release(in);
         continue;
@@ -2913,6 +3163,9 @@ __global__ void __cluster_dims__(2, 1, 1) __launch_bounds__(NTHREADS, 1) mk_main
         continue;
       }
       if (__builtin_expect((in.aux & AUX_FASTACT) != 0, 0)) goto fast_act;
+#if MK_KV_FP8
+      if (__builtin_expect((in.aux & AUX_FASTPUB) != 0, 0)) goto fast_pub;
+#endif
       {  // (the generic path in a block of its own, so that fast_act's path can follow it out of line)
       // the op's descriptor from a shared-memory copy (its fields read where used: a register copy would keep them live
       // across the whole prologue, at the region's register limit)
@@ -3133,9 +3386,116 @@ __global__ void __cluster_dims__(2, 1, 1) __launch_bounds__(NTHREADS, 1) mk_main
         xg.next(2);
         cc.advance(in.r1 - in.r0, NSTAGE);
       }
+#if MK_KV_FP8
+      continue;
+    fast_pub:
+      // AUX_FASTPUB: the descriptor, the B slot, the next parity's accumulator, in_proj_ba's rows (in_proj_qkv), the
+      // warm-up's dry staging, the dependency (shared B: no wait, its B validated; else the producer's count), the
+      // staging (shared B: its words and its twin's; else stage_inputs), B complete, then in_proj_qkv's b / a products
+      // and its twin's counts
+      {
+        if (pt < (int)(sizeof(OpDesc) / 16))
+          reinterpret_cast<uint4*>(&pdesc_sh)[pt] = reinterpret_cast<const uint4*>(a.descs + in.desc)[pt];
+        named_sync(BAR_PRO, NPRO);
+        const OpDesc& d = pdesc_sh;
+        MK_ROWS;
+        if (xg.n >= 2) mbar_wait(&sm.xempty[xg.slot], xg.phase ^ 1);
+        if (!(in.aux & AUX_ZNEXT)) zero_next_acc(in, d, pt, epoch);
+        uint8_t* const xb = sm.xb + xg.slot * B_SLOT_BYTES;
+        uint8_t* const sfb = sm.sfb + xg.slot * B_SLOT_BYTES;
+        const bool is_shared_b = d.nw != 0;  // (else a PRO_ACT consumer of its producer's count: stage_inputs)
+        // in_proj_qkv: its twin (in_proj_z) and in_proj_ba's products from the published bf16(x_n) (shared_xn)
+        const uint64_t shared_xn = is_shared_b && d.xn ? shared_xn_of(a.descs[d.src]) : 0;
+        const bool has_twin = d.twin != 0;
+        const uint2* const bw = reinterpret_cast<const uint2*>(sm.stg + BA_OFF);
+        if (shared_xn && pt == 0) {
+          if (shared_xn & 1u) {
+            mbar_arrive(sm.stg2_full);  // (b / a partials: no rows; the barrier's phase as with the copy)
+          } else {
+            const GdnDesc& g = reinterpret_cast<const GdnDesc&>(a.descs[d.xn - 1]);
+            const uint32_t hv = min(in.tile, (uint32_t)GDN_ITEMS - 1) / 3;
+            const uint8_t* rw = reinterpret_cast<const uint8_t*>(g.ba_w);
+            mbar_expect_tx(sm.stg2_full, 2 * K_NORM * 2);
+            bulk_g2s(sm.stg + BA_OFF, rw + (size_t)hv * K_NORM * 2, K_NORM * 2, sm.stg2_full);
+            bulk_g2s(sm.stg + BA_OFF + K_NORM * 2, rw + (size_t)(GDN_HV + hv) * K_NORM * 2, K_NORM * 2, sm.stg2_full);
+          }
+        }
+        if (is_shared_b && (in.aux & AUX_WARM)) {  // the dry run
+          // (in_proj_qkv: its twin's words into this slot too, whose other slot the previous instruction's MMAs may
+          // still read)
+          if (has_twin && d.kind == KIND_FP8) stage_pub2(in, a.instrs[ii + 1], d, pt, xb, xb, epoch, 1u, true);
+          else stage_pub(in, d, pt, xb, sfb, epoch, 1u, true);
+          if (shared_xn) pro_ba_pub(shared_xn, sm.red, sm.ba, pt, bw, ba_t(in, 1u), epoch, true, 0u, 0u, 0u);
+        }
+        if (has_twin && xg.n >= 1) mbar_wait(&sm.xempty[xg.slot ^ 1], ((xg.n - 1) >> 1) & 1);
+        if (in.dep != NO_CTR) {
+          if (!is_shared_b && pt == 0) wait_counter(a.counters + in.dep, (epoch + 1) * a.ctr_count[in.dep]);
+          named_sync(BAR_PRO, NPRO);
+        }
+        if (shared_xn) {  // (landed long before)
+          mbar_wait(sm.stg2_full, stg2_phase);
+          stg2_phase ^= 1;
+        }
+        if (is_shared_b) {
+          if (pt == 0) stg_count = ii - i0 + 1;
+          // (in_proj_qkv: its twin's (in_proj_z's) chunks of the same B in one batch, into the twin's slot: its xempty
+          // waited above)
+          const bool is_batched = has_twin && d.kind == KIND_FP8;
+          if (is_batched) stage_pub2(in, a.instrs[ii + 1], d, pt, xb, sm.xb + (xg.slot ^ 1) * B_SLOT_BYTES, epoch, T);
+          else stage_pub(in, d, pt, xb, sfb, epoch, T);
+          if (has_twin && !is_batched) {  // the twin's chunks of the same B, into its slot
+            const Instr nx = a.instrs[ii + 1];
+            stage_pub(nx, d, pt, sm.xb + (xg.slot ^ 1) * B_SLOT_BYTES, nullptr, epoch, T);
+          }
+        } else {
+          stage_inputs(in, d, sm, pt, stg_phase, xb, sfb, epoch, T);
+        }
+        if (pt == 0) stg_count = ii - i0 + 1;
+        fence_async_smem();
+        named_sync(BAR_PRO, NPRO);  // B operand and activation scales complete
+        if (pt == 0) {
+          mbar_arrive(&sm.xfull[xg.slot]);
+          // (B ready: the epilogue's f_t)
+          if (is_shared_b && d.shared_b_ext) shared_b_set_tag(shared_b_ready_slot(sm, ii), shared_b_tag(ii, epoch));
+          if (in.done != NO_CTR) {
+            if (in.done & DONE_RELAXED) red_relaxed_add(a.counters + (in.done & ~DONE_RELAXED), 1);
+            else {
+              pro_n++;
+              asm volatile("st.release.cta.shared.u32 [%0], %1;" ::"r"(smem_u32(&pro_cnt)), "r"(pro_n) : "memory");
+            }
+          }
+        }
+        if (shared_xn) {  // (shared B: for the GDN core only, after B-ready)
+          // (ftag: epilogue warp 0's factors)
+          const uint32_t ftag = d.shared_b_ext && shared_b_erstd(d.shared_b_ext) ? shared_b_tag(ii, epoch) : 0u;
+          pro_ba_pub(shared_xn, sm.red, sm.ba, pt, bw, ba_t(in, T), epoch, false, shared_b_factors_slot(sm, ii), ftag, smem_u32(shared_b_sm(sm)) + SHARED_B_SM_BYTES);
+        }
+        if (has_twin) {  // AUX_TWIN: the twin's B is complete with this one (the barrier above): its prologue's work here
+          const Instr nx = a.instrs[ii + 1];
+          if (nx.aux & AUX_TWIN) {
+            zero_next_acc(nx, a.descs[nx.desc], pt, epoch);
+            if (pt == 0) {
+              mbar_arrive(&sm.xfull[xg.slot ^ 1]);
+              stg_count = ii + 1 - i0 + 1;
+              if (nx.done != NO_CTR) {  // (warp 7's walk counts the twin as its next GEMV instruction)
+                if (nx.done & DONE_RELAXED) red_relaxed_add(a.counters + (nx.done & ~DONE_RELAXED), 1);
+                else {
+                  pro_n++;
+                  asm volatile("st.release.cta.shared.u32 [%0], %1;" ::"r"(smem_u32(&pro_cnt)), "r"(pro_n) : "memory");
+                }
+              }
+            }
+          }
+        }
+        xg.next(2);
+        cc.advance(in.r1 - in.r0, NSTAGE);
+      }
+#endif
     }
     if (a_param.draft) {  // the draft's phase: the workers' registers, the rest back to the pool (before any wait)
+#if !MK_KV_FP8  // (the FP8 KV cache's build: the prologue warps keep REG_HI, nothing to give back)
       asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" ::"n"(DREG_HI));
+#endif
       draft_sync();
       draft_sync();
       const DraftCtx dc = draft_ctx(smem_raw, bars, tmem_slot, &epi_count);
@@ -3244,6 +3604,34 @@ torch::Tensor mk_make_tmap(torch::Tensor w, int64_t rows, int64_t row_bytes, int
   return out;
 }
 
+#if MK_KV_FP8
+// TMA descriptor over an FP8 KV cache [kernel blocks][4 heads][kbt tokens][row_bytes] as 4 dims {bytes, token, head,
+// kernel block}: box {128, kbt, 1, 4}, 128-byte swizzle, one box per half of the head dim over a head's 4 consecutive
+// kernel blocks; returned as a CPU uint8 tensor [128] to be copied into device memory.
+torch::Tensor mk_make_tmap4(torch::Tensor w, int64_t nkb, int64_t kbt, int64_t row_bytes) {
+  static PFN_cuTensorMapEncodeTiled_v12000 enc = nullptr;
+  if (!enc) {
+    cudaDriverEntryPointQueryResult q;
+    TORCH_CHECK(cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", reinterpret_cast<void**>(&enc), cudaEnableDefault, &q) ==
+                        cudaSuccess &&
+                    q == cudaDriverEntryPointSuccess,
+                "cuTensorMapEncodeTiled unavailable");
+  }
+  TORCH_CHECK(row_bytes % 128 == 0 && reinterpret_cast<uintptr_t>(w.data_ptr()) % 16 == 0, "shape/alignment");
+  auto out = torch::zeros({128}, torch::kUInt8);
+  CUtensorMap m;
+  cuuint64_t gdim[4] = {(cuuint64_t)row_bytes, (cuuint64_t)kbt, 4, (cuuint64_t)nkb};
+  cuuint64_t gstride[3] = {(cuuint64_t)row_bytes, (cuuint64_t)(kbt * row_bytes), (cuuint64_t)(4 * kbt * row_bytes)};
+  cuuint32_t box[4] = {128, (cuuint32_t)kbt, 1, 4};
+  cuuint32_t estride[4] = {1, 1, 1, 1};
+  CUresult r = enc(&m, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, w.data_ptr(), gdim, gstride, box, estride, CU_TENSOR_MAP_INTERLEAVE_NONE,
+                   CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  TORCH_CHECK(r == CUDA_SUCCESS, "cuTensorMapEncodeTiled (4D) failed: ", (int)r);
+  memcpy(out.data_ptr<uint8_t>(), &m, 128);
+  return out;
+}
+#endif
+
 // (host) Waits until flags[slot] (pinned host memory, a host ring slot's flag OP_PREV writes once the slot is written)
 // equals seq, by acquire loads (the slot's data read after it is the device's); false after timeout_us
 bool mk_wait_flag(torch::Tensor flags, int64_t slot, int64_t seq, int64_t timeout_us) {
@@ -3261,7 +3649,15 @@ bool mk_wait_flag(torch::Tensor flags, int64_t slot, int64_t seq, int64_t timeou
   }
 }
 
-TORCH_LIBRARY(pear_deploy_blackwell_nvfp4, m) {
+#if MK_KV_FP8  // the FP8 KV cache's build: an op namespace of its own (extension.py BlackwellNvfp4Fp8KvExtension)
+#define MK_OP_NAMESPACE pear_deploy_blackwell_nvfp4_fp8_kv
+#else
+#define MK_OP_NAMESPACE pear_deploy_blackwell_nvfp4
+#endif
+// (macros of their own: they expand MK_OP_NAMESPACE before TORCH_LIBRARY pastes it into its names)
+#define MK_LIBRARY(ns, m) TORCH_LIBRARY(ns, m)
+#define MK_LIBRARY_IMPL(ns, k, m) TORCH_LIBRARY_IMPL(ns, k, m)
+MK_LIBRARY(MK_OP_NAMESPACE, m) {
   m.def("run(Tensor instrs, Tensor sm_off, Tensor descs, Tensor(a!) counters, Tensor ctr_count, Tensor(b!) epoch, int nsm, "
         "Tensor rec, int trace=0, int strace=0, Tensor? rec_hdr=None, int draft=0, int sm_draft=0, int draft_sampler=0, "
         "int draft_aux=0) -> ()");
@@ -3269,12 +3665,18 @@ TORCH_LIBRARY(pear_deploy_blackwell_nvfp4, m) {
   m.def("topk_logprobs(Tensor logits, Tensor sampled, Tensor(a!) part, Tensor(b!) row_done, int chunks, Tensor(c!) ids, "
         "Tensor(d!) logprobs, Tensor(e!) ranks) -> ()");
   m.def("wait_flag(Tensor flags, int slot, int seq, int timeout_us) -> bool");
+#if MK_KV_FP8
+  m.def("make_tmap4(Tensor w, int nkb, int kbt, int row_bytes) -> Tensor");
+#endif
 }
-TORCH_LIBRARY_IMPL(pear_deploy_blackwell_nvfp4, CUDA, m) {
+MK_LIBRARY_IMPL(MK_OP_NAMESPACE, CUDA, m) {
   m.impl("run", &mk_run);
   m.impl("topk_logprobs", &mk_topk_logprobs);
 }
-TORCH_LIBRARY_IMPL(pear_deploy_blackwell_nvfp4, CompositeExplicitAutograd, m) {
+MK_LIBRARY_IMPL(MK_OP_NAMESPACE, CompositeExplicitAutograd, m) {
   m.impl("make_tmap", &mk_make_tmap);
   m.impl("wait_flag", &mk_wait_flag);
+#if MK_KV_FP8
+  m.impl("make_tmap4", &mk_make_tmap4);
+#endif
 }
