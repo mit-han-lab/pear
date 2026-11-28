@@ -47,7 +47,6 @@ class RoboDojoApps:
 
     def __init__(self, context: ServerContext) -> None:
         self.context = context
-        self.python = os.environ.get("ROBODOJO_PYTHON", str(self.EXEC_ISAAC_PYTHON_PATH))
 
         self.robodojo_root = Path(os.environ["ROBODOJO_ROOT"])  # the official RoboDojo checkout
         # Kit extensions the image lacks
@@ -142,7 +141,7 @@ class RoboDojoApps:
         process = SimulatorProcess(
             f"{self.host}-warm-up",
             RoboDojoEnv,
-            self.python,
+            str(self.EXEC_ISAAC_PYTHON_PATH),
             self.context_args(gpu, template),
             self.variables(gpu, template, None),
             self.robodojo_root,
@@ -182,7 +181,7 @@ class RoboDojoApps:
                     SimulatorProcess(
                         name,
                         RoboDojoEnv,
-                        self.python,
+                        str(self.EXEC_ISAAC_PYTHON_PATH),
                         self.context_args(gpu, app_dir),
                         self.variables(gpu, app_dir, mps_daemon),
                         self.robodojo_root,
