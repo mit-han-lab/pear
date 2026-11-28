@@ -29,11 +29,18 @@ class EnvironmentTool(BaseTool):
     SYSTEM_PROMPT_TEMPLATE = Path(__file__).with_name("system_prompt.md").read_text()
     # repeated every turn: without it the model drops the json block
     REMINDER = "The current camera frames follow. End your response with one json block containing the next action."
+    FINISH_INSTRUCTION = (
+        'End your response with one fenced json block containing the next action or {"finish": true} '
+        "if you have completed the task."
+    )
 
     def __init__(self, config: dict, tool_schema: OpenAIFunctionToolSchema | None = None) -> None:
         # one instance per agent-loop process (PEAR's trainer config keeps verl's dataset from building the tools on
         # the driver); the loop's episodes run on its client
         self.env_class: type[BaseEnv] = pkgutil.resolve_name(config["env_class"])  # the family's facts and simulator
+        self.policy_finish = config.get("policy_finish", False)
+        if self.policy_finish and self.env_class.POLICY_FINISH_ENVIRONMENT_PROMPT is None:
+            raise ValueError(f"policy_finish is not supported by {config['env_class']}")
         self.client = pkgutil.resolve_name(self.env_class.CLIENT_CLASS_PATH)(self.env_class)  # its kind's client
         self.log_path = Path(str(config["log_dir"])) / f"actions_{os.getpid()}.jsonl"
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -63,22 +70,25 @@ class EnvironmentTool(BaseTool):
     async def open(self, episode: Episode) -> tuple[list[dict[str, Any]] | None, EnvResult]:
         """Opens ``episode`` and returns the first user turn's content with the result of its initial observation."""
         steps_before, start_time = len(episode.actions), time.monotonic()
-        result = await self.client.open(episode.uid, episode.env_args)
+        env_args = {**episode.env_args, "policy_finish": True} if self.policy_finish else episode.env_args
+        result = await self.client.open(episode.uid, env_args)
         self._log_call(episode, steps_before, None, result, time.monotonic() - start_time)
 
         return self._observation(result), result
 
     def system_prompt(self, result: EnvResult) -> str:
         """Returns the episode's system prompt, from the result of its initial observation."""
-        return JsonBlockProtocol.system_prompt(
-            self.SYSTEM_PROMPT_TEMPLATE, self.env_class.environment_prompt(result), result["instruction"]
-        )
+        environment = self.env_class.environment_prompt(result)
+        if self.policy_finish:
+            environment = f"{self.env_class.POLICY_FINISH_ENVIRONMENT_PROMPT}\n- {self.FINISH_INSTRUCTION}"
+        return JsonBlockProtocol.system_prompt(self.SYSTEM_PROMPT_TEMPLATE, environment, result["instruction"])
 
     async def step(self, episode: Episode, action: Any) -> tuple[list[dict[str, Any]] | None, EnvResult]:
         """Carries out the answer's ``action`` in ``episode`` and returns the next user turn's content (None once the
         episode ended) with the result; raises InvalidAction for a json block that is no action."""
         steps_before, start_time = len(episode.actions), time.monotonic()
-        JsonBlockProtocol.check_action(action, self.env_class.SCHEMA)
+        if not (self.policy_finish and JsonBlockProtocol.is_finish(action)):
+            JsonBlockProtocol.check_action(action, self.env_class.SCHEMA)
         result = await self.client.step(episode.uid, action)
         self._log_call(episode, steps_before, action, result, time.monotonic() - start_time)
 
@@ -117,7 +127,10 @@ class EnvironmentTool(BaseTool):
         if result["images"] is None:
             return None
 
-        text = JsonBlockProtocol.turn_text(result["state"], self.REMINDER)
+        reminder = (
+            f"The current camera frames follow. {self.FINISH_INSTRUCTION}" if self.policy_finish else self.REMINDER
+        )
+        text = JsonBlockProtocol.turn_text(result["state"], reminder)
         blocks: list[dict[str, Any]] = [{"type": "text", "text": text}]
 
         for name, image in zip(self.env_class.CAMERAS, result["images"]):
