@@ -117,6 +117,7 @@ esac
         self.work_dir = self.sandbox / "work"
         self.local_dir = self.sandbox / "local"
         self.model = self.sandbox / "model"
+        self.checkpoint = self.sandbox / "ckpt" / "global_step_1"  # what a training that continues one starts from
         self.verl_env = self.sandbox / "env"
         self.stand_ins = self.sandbox / "bin"
 
@@ -153,6 +154,7 @@ esac
             "LOCAL_DIR": str(self.local_dir),
             "RUN": str(self.sandbox / "runs" / name),
             "MODEL": str(self.model),
+            "CKPT": str(self.checkpoint),
             "GPU": gpu,
             "EVAL_STEP": self.EVAL_STEP,
             **cluster,

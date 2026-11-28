@@ -1,0 +1,623 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pear <pear@localhost>
+Date: Mon, 17 Sep 2001 00:00:00 +0000
+Subject: [PATCH] [trainer] feat: grpo_length_penalty, GRPO on rewards that
+ reinforce the shorter of two successes more
+
+The estimator grpo_length_penalty shapes a success's reward, an exact reward of one, into max(1, L / L_min) ** -coeff:
+L its generated tokens, L_min those of its group's shortest success and coeff algorithm.length_penalty_coeff, which
+the estimator requires. A group with a failure is normalized as in GRPO; a group of successes, which differs by length
+alone, is only centred on its mean. The v1 trainer computes it from each session's final output, as it does GRPO, and
+DAPO keeps a group of successes whose generated tokens still set their advantages apart; it reads the response masks
+of such groups alone.
+---
+ .../trainer/ppo/test_length_penalty_on_cpu.py | 98 ++++++++++++++++++
+ .../ppo/v1/test_replay_buffer_on_cpu.py       | 39 ++++++++
+ .../ppo/v1/test_trainer_base_on_cpu.py        | 26 +++++
+ ...est_multi_trajectories_advantage_on_cpu.py | 23 +++++
+ verl/trainer/config/algorithm.py              |  3 +
+ verl/trainer/ppo/core_algos.py                | 99 +++++++++++++++++++
+ verl/trainer/ppo/v1/replay_buffer.py          | 62 +++++++++++-
+ verl/trainer/ppo/v1/trainer_base.py           | 13 ++-
+ verl/trainer/ppo/v1/utils.py                  |  8 +-
+ 9 files changed, 361 insertions(+), 10 deletions(-)
+ create mode 100644 tests/trainer/ppo/test_length_penalty_on_cpu.py
+
+diff --git a/tests/trainer/ppo/test_length_penalty_on_cpu.py b/tests/trainer/ppo/test_length_penalty_on_cpu.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bff535316d2ac638abf5688660366b79cde88ba2
+--- /dev/null
++++ b/tests/trainer/ppo/test_length_penalty_on_cpu.py
+@@ -0,0 +1,98 @@
++import math
++
++import numpy as np
++import pytest
++import torch
++from omegaconf import OmegaConf
++
++from verl.trainer.ppo.core_algos import (
++    AdvantageEstimator,
++    apply_length_penalty,
++    compute_grpo_outcome_advantage,
++    get_adv_estimator_fn,
++    get_length_penalty_coeff,
++)
++
++
++def _responses(rewards: list[float], lengths: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
++    """token_level_rewards and response_mask of responses with these rewards and generated tokens, each reward on its
++    response's last generated token."""
++    token_level_rewards = torch.zeros(len(lengths), max(lengths))
++    response_mask = torch.zeros(len(lengths), max(lengths))
++    for row, (reward, length) in enumerate(zip(rewards, lengths, strict=True)):
++        token_level_rewards[row, length - 1] = reward
++        response_mask[row, :length] = 1
++
++    return token_level_rewards, response_mask
++
++
++def _advantages(rewards: list[float], lengths: list[int], groups: list[str], **config) -> list[float]:
++    """Each response's advantage under the registered estimator, which gives the same value to all its tokens."""
++    token_level_rewards, response_mask = _responses(rewards, lengths)
++
++    advantages, returns = get_adv_estimator_fn(AdvantageEstimator.GRPO_LENGTH_PENALTY)(
++        token_level_rewards=token_level_rewards,
++        response_mask=response_mask,
++        index=np.array(groups, dtype=object),
++        config=OmegaConf.create(config),
++    )
++
++    assert torch.equal(returns, advantages)
++    assert torch.equal(advantages, advantages[:, :1] * response_mask)
++    return advantages[:, 0].tolist()
++
++
++def test_a_success_s_reward_falls_with_its_length_over_the_group_s_shortest_success():
++    shaped = apply_length_penalty(torch.tensor([1.0, 1.0, 1.0, 0.0]), torch.tensor([100, 200, 150, 50]), 1.0)
++
++    # the failure, though the shortest, keeps its reward and is no reference
++    assert shaped.tolist() == pytest.approx([1.0, 0.5, 2 / 3, 0.0])
++
++
++def test_a_group_without_a_success_keeps_its_rewards():
++    rewards = torch.tensor([0.0, 0.5])
++
++    assert torch.equal(apply_length_penalty(rewards, torch.tensor([10, 20]), 1.0), rewards)
++
++
++def test_without_a_penalty_the_advantages_are_grpo_s():
++    rewards, lengths = [1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0], [10, 30, 20, 40, 50, 60, 70]
++    groups = ["mixed"] * 3 + ["solved"] * 2 + ["unsolved"] * 2
++    token_level_rewards, response_mask = _responses(rewards, lengths)
++
++    grpo, _ = compute_grpo_outcome_advantage(token_level_rewards, response_mask, np.array(groups, dtype=object))
++
++    assert _advantages(rewards, lengths, groups, length_penalty_coeff=0.0) == pytest.approx(grpo[:, 0].tolist())
++
++
++def test_a_group_with_a_failure_is_divided_by_its_std_and_a_group_of_successes_only_centered():
++    advantages = _advantages(
++        [1.0, 1.0, 0.0, 1.0, 1.0], [100, 200, 100, 100, 200], ["mixed"] * 3 + ["solved"] * 2, length_penalty_coeff=1.0
++    )
++
++    # mixed: shaped 1, 0.5 and 0, mean 0.5, std 0.5; solved: shaped 1 and 0.5, mean 0.75
++    assert advantages == pytest.approx([1.0, 0.0, -1.0, 0.25, -0.25], abs=1e-5)
++
++
++def test_without_the_std_every_group_is_only_centered():
++    advantages = _advantages(
++        [1.0, 1.0, 0.0], [100, 200, 100], ["mixed"] * 3, length_penalty_coeff=1.0, norm_adv_by_std_in_grpo=False
++    )
++
++    assert advantages == pytest.approx([0.5, 0.0, -0.5])
++
++
++def test_a_group_of_one_keeps_its_reward():
++    assert _advantages([1.0], [100], ["alone"], length_penalty_coeff=1.0) == [1.0]
++
++
++@pytest.mark.parametrize("config", [{}, {"length_penalty_coeff": None}, {"length_penalty_coeff": -0.1}])
++def test_the_estimator_refuses_a_missing_or_negative_coefficient(config):
++    with pytest.raises(ValueError, match="length_penalty_coeff"):
++        _advantages([1.0, 0.0], [10, 20], ["a", "a"], **config)
++
++
++@pytest.mark.parametrize("coeff", [math.inf, math.nan])
++def test_a_coefficient_that_is_not_finite_is_refused(coeff):
++    with pytest.raises(ValueError, match="length_penalty_coeff"):
++        get_length_penalty_coeff(OmegaConf.create({"length_penalty_coeff": coeff}))
+diff --git a/tests/trainer/ppo/v1/test_replay_buffer_on_cpu.py b/tests/trainer/ppo/v1/test_replay_buffer_on_cpu.py
+index 83c2cc8ba4b2ade01306de4a376978dadf766ecd..39d643773d627bdb50c07bcad6a947883ed4d1c7 100644
+--- a/tests/trainer/ppo/v1/test_replay_buffer_on_cpu.py
++++ b/tests/trainer/ppo/v1/test_replay_buffer_on_cpu.py
+@@ -19,6 +19,7 @@ versions as ``global_steps - prompt_global_steps + 1``; ``drop`` and ``wait`` ap
+ trainers.
+ """
+ 
++import functools
+ import threading
+ import time
+ import uuid
+@@ -28,8 +29,10 @@ import pytest
+ import ray
+ import torch
+ import transfer_queue as tq
++from omegaconf import OmegaConf
+ from transfer_queue import KVBatchMeta
+ 
++from verl.trainer.ppo.core_algos import get_adv_estimator_fn
+ from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer, ReplayBufferAsync
+ 
+ # Small poll interval so the blocking consumer reacts to producer writes quickly.
+@@ -61,6 +64,7 @@ def _make_rb(
+     refill_fn=None,
+     trainer_mode: str = "sync",
+     filter_groups_metric: str | None = None,
++    filter_groups_advantage_fn=None,
+     train_batch_size: int = 2,
+     gen_batch_size: int = 1,
+     max_inflight_gen_batches: int = 1,
+@@ -77,6 +81,7 @@ def _make_rb(
+         poll_interval=poll_interval,
+         refill_fn=refill_fn,
+         filter_groups_metric=filter_groups_metric,
++        filter_groups_advantage_fn=filter_groups_advantage_fn,
+         train_batch_size=train_batch_size,
+         gen_batch_size=gen_batch_size,
+         max_inflight_gen_batches=max_inflight_gen_batches,
+@@ -152,6 +157,7 @@ class PromptSpec:
+     global_steps: int = 0
+     rewards: list[float] | None = None
+     canonical_rewards: list[float | list[float]] | None = None
++    generated_tokens: list[int] | None = None  # each session's, the ones of its response mask
+     trajectory_keys: list[str] = field(default_factory=list)
+ 
+ 
+@@ -178,6 +184,8 @@ class RolloutProducer(threading.Thread):
+                         fields["rm_scores"] = torch.tensor(
+                             reward if isinstance(reward, list) else [reward], dtype=torch.float32
+                         )
++                    if spec.generated_tokens is not None:
++                        fields["response_mask"] = torch.ones(spec.generated_tokens[session_id], dtype=torch.int64)
+                     tq.kv_put(
+                         key=key,
+                         partition_id=self.partition_id,
+@@ -976,6 +984,37 @@ def test_dapo_reward_metric_uses_canonical_rm_scores(tq_init, partition_id):
+         _clear_partition(partition_id)
+ 
+ 
++def test_dapo_keeps_a_group_of_equal_rewards_whose_advantages_the_length_penalty_sets_apart(tq_init, partition_id):
++    groups = {
++        "lengths_differ": ([1.0, 1.0], [100, 200]),
++        "lengths_equal": ([1.0, 1.0], [100, 100]),
++        "unsolved": ([0.0, 0.0], [100, 200]),
++    }
++    specs = {
++        name: PromptSpec(uid=_uid(), status="finished", sessions=2, canonical_rewards=rewards, generated_tokens=lengths)
++        for name, (rewards, lengths) in groups.items()
++    }
++    _produce(partition_id, list(specs.values())).join_and_check()
++    uids = {spec.uid for spec in specs.values()}
++
++    length_penalty = functools.partial(
++        get_adv_estimator_fn("grpo_length_penalty"), config=OmegaConf.create({"length_penalty_coeff": 0.5})
++    )
++
++    try:
++        # with no estimator to ask every group is filtered; the length penalty keeps successes of different lengths
++        for advantage_fn, kept_uids in ((None, set()), (length_penalty, {specs["lengths_differ"].uid})):
++            rb = _make_rb(
++                filter_groups_metric="reward", refill_fn=lambda _n: None, filter_groups_advantage_fn=advantage_fn
++            )
++            rb._sync_metadata_from_transfer_queue()
++            filtered_uids, _ = rb._dapo_filtered_keys(partition_id)
++
++            assert uids - filtered_uids == kept_uids
++    finally:
++        _clear_partition(partition_id)
++
++
+ def test_terminal_eviction_reasons_has_no_cross_call_hidden_state(tq_init, partition_id):
+     """An interleaved validation lookup must not overwrite a pending training breakdown."""
+     all_zero = PromptSpec(uid=_uid(), status="finished", sessions=2, rewards=[0.0, 0.0])
+diff --git a/tests/trainer/ppo/v1/test_trainer_base_on_cpu.py b/tests/trainer/ppo/v1/test_trainer_base_on_cpu.py
+index 250c56fd2a2af446d4392bb72952d25b6e62be02..18cb6de1e23bf0ef4a83a20ca6b176d84c27a32e 100644
+--- a/tests/trainer/ppo/v1/test_trainer_base_on_cpu.py
++++ b/tests/trainer/ppo/v1/test_trainer_base_on_cpu.py
+@@ -15,7 +15,9 @@
+ from types import SimpleNamespace
+ from unittest.mock import MagicMock, patch
+ 
++import numpy as np
+ import pytest
++import torch
+ from omegaconf import OmegaConf
+ 
+ from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer, ReplayBufferAsync
+@@ -131,6 +133,30 @@ def test_builtin_filter_groups_uses_default_inflight_limit():
+     assert sampler.max_inflight_gen_batches == 1
+ 
+ 
++def test_the_builtin_filter_asks_the_length_penalty_about_a_group_of_equal_rewards():
++    penalized = _trainer_with_filter_groups({"enable": True, "metric": "acc"}, trainer_mode="separate_async")
++    penalized.config.algorithm.adv_estimator = "grpo_length_penalty"
++    penalized.config.algorithm.length_penalty_coeff = 0.5
++    plain = _trainer_with_filter_groups({"enable": True, "metric": "acc"}, trainer_mode="separate_async")
++
++    # two successes of 4 and 2 generated tokens
++    advantages, _ = penalized._build_replay_buffer().filter_groups_advantage_fn(
++        token_level_rewards=torch.tensor([[1.0], [1.0]]),
++        response_mask=torch.tensor([[1, 1, 1, 1], [1, 1, 0, 0]]),
++        index=np.array(["group", "group"]),
++    )
++    assert advantages.ne(0).any()
++    assert plain._build_replay_buffer().filter_groups_advantage_fn is None
++
++
++def test_the_length_penalty_without_its_coefficient_is_refused_when_the_buffer_is_built():
++    trainer = _trainer_with_filter_groups({"enable": True, "metric": "acc"}, trainer_mode="separate_async")
++    trainer.config.algorithm.adv_estimator = "grpo_length_penalty"
++
++    with pytest.raises(ValueError, match="length_penalty_coeff"):
++        trainer._build_replay_buffer()
++
++
+ def test_builtin_filter_groups_forwards_configured_inflight_limit():
+     trainer = _trainer_with_filter_groups({"enable": True, "metric": "acc", "max_inflight_gen_batches": 3})
+ 
+diff --git a/tests/trainer/test_multi_trajectories_advantage_on_cpu.py b/tests/trainer/test_multi_trajectories_advantage_on_cpu.py
+index 1c303c9db19068db459ca290a5b6aaeff6f0c242..3f874604588967aa8af6761a991b8cfd3d04efce 100644
+--- a/tests/trainer/test_multi_trajectories_advantage_on_cpu.py
++++ b/tests/trainer/test_multi_trajectories_advantage_on_cpu.py
+@@ -14,6 +14,7 @@
+ import numpy as np
+ import pytest
+ import torch
++from omegaconf import OmegaConf
+ 
+ from verl.protocol import DataProto
+ from verl.trainer.ppo.core_algos import AdvantageEstimator
+@@ -84,3 +85,25 @@ def test_compute_advantage_for_multi_trajectories(batch_data: DataProto):
+     )
+     assert torch.equal(result.batch["advantages"], adv_expected)
+     assert torch.equal(result.batch["returns"], adv_expected)
++
++
++def test_the_length_penalty_takes_each_session_s_final_output_as_grpo_does():
++    # two sessions of one prompt: the first in two outputs, the final one a success of 3 tokens, the second a success
++    # of 1 token in one output. Only final outputs are compared, and every output gets its session's advantage
++    data = DataProto.from_dict(
++        tensors={
++            "token_level_rewards": torch.tensor([[0, 0, 0], [0, 0, 1], [1, 0, 0]], dtype=torch.float32),
++            "response_mask": torch.tensor([[1, 1, 1], [1, 1, 1], [1, 0, 0]], dtype=torch.long),
++        },
++        non_tensors={"uid": np.array(["prompt_a"] * 3, dtype=object)},
++    )
++
++    result = compute_advantage_for_multi_trajectories(
++        data=data,
++        batch_keys=["prompt_a_0_0", "prompt_a_0_1", "prompt_a_1_0"],
++        adv_estimator=AdvantageEstimator.GRPO_LENGTH_PENALTY,
++        config=OmegaConf.create({"length_penalty_coeff": 1.0}),
++    )
++
++    # the final outputs shaped 1/3 and 1, a group of successes centered on its mean 2/3
++    assert result.batch["advantages"][:, 0].tolist() == pytest.approx([-1 / 3, -1 / 3, 1 / 3])
+diff --git a/verl/trainer/config/algorithm.py b/verl/trainer/config/algorithm.py
+index 88f0a7a9d4940b9aaa23e49b3d130ae1780e28cf..ab20b7721e1c0c48e92876a44367480c17a2c24c 100644
+--- a/verl/trainer/config/algorithm.py
++++ b/verl/trainer/config/algorithm.py
+@@ -748,3 +748,6 @@ class AlgoConfig(BaseConfig):
+     # gdpo_reward_weights: per-dimension weights for aggregation (default: equal weights).
+     gdpo_reward_keys: Optional[list[str]] = None
+     gdpo_reward_weights: Optional[list[float]] = None
++    # grpo_length_penalty settings: the exponent of a success's generated tokens over those of its group's shortest
++    # success (a success r times as long keeps r ** -length_penalty_coeff of its reward), required by that estimator.
++    length_penalty_coeff: Optional[float] = None
+diff --git a/verl/trainer/ppo/core_algos.py b/verl/trainer/ppo/core_algos.py
+index a2724d4f9936e75a09ddb700c69f725fb0b799ec..c0b83be036f15aa52c8cae01d1cb34a038d9d97f 100644
+--- a/verl/trainer/ppo/core_algos.py
++++ b/verl/trainer/ppo/core_algos.py
+@@ -20,6 +20,7 @@ implement PPO-like algorithms.
+ 
+ __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
+ 
++import math
+ from collections import defaultdict
+ from enum import Enum
+ from typing import Any, Callable, Optional
+@@ -108,6 +109,7 @@ class AdvantageEstimator(str, Enum):
+     OPTIMAL_TOKEN_BASELINE = "optimal_token_baseline"
+     TIR_OPTIMAL_TOKEN_BASELINE = "tir_optimal_token_baseline"
+     GDPO = "gdpo"
++    GRPO_LENGTH_PENALTY = "grpo_length_penalty"
+ 
+ 
+ ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
+@@ -468,6 +470,103 @@ def compute_gdpo_outcome_advantage(
+     return advantages, advantages
+ 
+ 
++def get_length_penalty_coeff(config: Optional[AlgoConfig]) -> float:
++    """
++    Read ``algorithm.length_penalty_coeff``, which grpo_length_penalty requires finite and non-negative.
++
++    Args:
++        config: (AlgoConfig) algorithm settings
++
++    Returns:
++        coeff: the exponent of a success's generated tokens over those of its group's shortest success
++    """
++    coeff = None if config is None else config.get("length_penalty_coeff", None)
++    if coeff is None or not (math.isfinite(coeff) and coeff >= 0):
++        raise ValueError(
++            f"grpo_length_penalty needs algorithm.length_penalty_coeff, finite and non-negative, not {coeff}"
++        )
++    return float(coeff)
++
++
++def apply_length_penalty(rewards: torch.Tensor, lengths: torch.Tensor, coeff: float) -> torch.Tensor:
++    """
++    Shape the rewards of one group by the length penalty: a success's reward (exactly 1.0) becomes
++    max(1, L / L_min) ** -coeff, L the tokens it generated and L_min those of the group's shortest success; the other
++    rewards stay as they are.
++
++    Args:
++        rewards: (group_size,) outcome rewards
++        lengths: (group_size,) generated tokens of each response
++        coeff: the penalty's exponent; 0 leaves the rewards as they are
++
++    Returns:
++        shaped rewards: (group_size,)
++    """
++    successes = rewards == 1.0
++    if not successes.any():
++        return rewards
++
++    lengths = lengths.to(rewards.dtype)
++    shortest = lengths[successes].min()
++    return torch.where(successes, (lengths / shortest).clamp(min=1.0) ** -coeff, rewards)
++
++
++@register_adv_est(AdvantageEstimator.GRPO_LENGTH_PENALTY)  # or simply: @register_adv_est("grpo_length_penalty")
++def compute_grpo_length_penalty_outcome_advantage(
++    token_level_rewards: torch.Tensor,
++    response_mask: torch.Tensor,
++    index: np.ndarray,
++    epsilon: float = 1e-6,
++    config: Optional[AlgoConfig] = None,
++    **kwargs,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """
++    Compute GRPO advantages on outcome rewards shaped by the length penalty (``apply_length_penalty``), so that of
++    two successes of a group the shorter one is reinforced more.
++
++    A group with a failure is normalized as in GRPO. A group whose responses all succeeded differs by length alone
++    and is only centered on its mean: divided by its std, a small length difference would weigh as much as a success
++    against a failure. A group of one keeps its reward, as in GRPO.
++
++    Args:
++        token_level_rewards: (bs, response_length)
++        response_mask: (bs, response_length), the generated tokens
++        index: (bs,) → group ID per sample
++        epsilon: float for numerical stability
++        config: (AlgoConfig) algorithm settings, which contains "length_penalty_coeff" and "norm_adv_by_std_in_grpo"
++
++    Returns:
++        advantages: (bs, response_length)
++        returns: (bs, response_length)
++    """
++    coeff = get_length_penalty_coeff(config)
++    norm_adv_by_std_in_grpo = config.get("norm_adv_by_std_in_grpo", True)
++    rewards = token_level_rewards.sum(dim=-1)
++    lengths = response_mask.sum(dim=-1)
++    scores = torch.zeros_like(rewards)
++
++    id2rows = defaultdict(list)
++
++    with torch.no_grad():
++        bsz = rewards.shape[0]
++        for i in range(bsz):
++            id2rows[index[i]].append(i)
++        for idx in id2rows:
++            rows = torch.tensor(id2rows[idx], device=rewards.device)
++            shaped = apply_length_penalty(rewards[rows], lengths[rows], coeff)
++            if len(rows) == 1:
++                scores[rows] = shaped
++                continue
++
++            centered = shaped - shaped.mean()
++            if norm_adv_by_std_in_grpo and not bool((rewards[rows] == 1.0).all()):
++                centered = centered / (shaped.std() + epsilon)
++            scores[rows] = centered
++        scores = scores.unsqueeze(-1) * response_mask
++
++    return scores, scores
++
++
+ @register_adv_est(AdvantageEstimator.GRPO_PASSK)  # or simply: @register_adv_est("grpo_passk")
+ def compute_grpo_passk_outcome_advantage(
+     token_level_rewards: torch.Tensor,
+diff --git a/verl/trainer/ppo/v1/replay_buffer.py b/verl/trainer/ppo/v1/replay_buffer.py
+index 3ac70b5c5d257d5143b70559c92ecab7fe8e26e4..238ec31da2f93f9f2206e7d2f56a5bbf61e191f3 100644
+--- a/verl/trainer/ppo/v1/replay_buffer.py
++++ b/verl/trainer/ppo/v1/replay_buffer.py
+@@ -17,6 +17,7 @@ import time
+ from collections import Counter, defaultdict
+ 
+ import numpy as np
++import torch
+ import transfer_queue as tq
+ from omegaconf import DictConfig
+ from transfer_queue import KVBatchMeta
+@@ -128,6 +129,10 @@ class ReplayBuffer:
+         filter_groups_metric (str, optional): DAPO group-filtering metric. ``"reward"`` reads the canonical
+             pre-KL reward from ``rm_scores``; other names read each trajectory's
+             ``extra_fields.reward_extra_info``. ``None`` disables DAPO filtering.
++        filter_groups_advantage_fn (callable, optional): The advantage estimator (``token_level_rewards``,
++            ``response_mask``, ``index``) DAPO asks about a group whose metric is all equal: the group is kept when its
++            advantages are not all zero, as grpo_length_penalty makes them for successes of different lengths.
++            ``None`` filters every such group.
+         train_batch_size (int, optional): Prompt count represented by one Sync DAPO in-flight batch.
+         gen_batch_size (int, optional): Dataloader fetch granularity for refill dispatches.
+         max_inflight_gen_batches (int): Maximum Sync DAPO prompt batches concurrently pending or running.
+@@ -144,6 +149,7 @@ class ReplayBuffer:
+         poll_interval: float = 2.0,
+         refill_fn=None,
+         filter_groups_metric: str | None = None,
++        filter_groups_advantage_fn=None,
+         train_batch_size: int | None = None,
+         gen_batch_size: int | None = None,
+         max_inflight_gen_batches: int = 1,
+@@ -157,6 +163,7 @@ class ReplayBuffer:
+         self.poll_interval = poll_interval
+         self.refill_fn = refill_fn
+         self.filter_groups_metric = filter_groups_metric
++        self.filter_groups_advantage_fn = filter_groups_advantage_fn
+         self.train_batch_size = train_batch_size
+         self.gen_batch_size = gen_batch_size
+         self.max_inflight_gen_batches = max_inflight_gen_batches
+@@ -263,7 +270,8 @@ class ReplayBuffer:
+             self._dapo_classification_cache[partition_id].pop(uid, None)
+ 
+     def _dapo_filtered_keys(self, partition_id: str) -> tuple[set[str], Counter]:
+-        """Finished groups whose configured DAPO metric is identical across all trajectories.
++        """Finished groups whose configured DAPO metric is identical across all trajectories, except those whose
++        advantages ``filter_groups_advantage_fn`` still sets apart.
+ 
+         Returns the filtered uids and a ``{shared_metric_value: group_count}`` breakdown built in the
+         same scope, so the diagnostic (which reward level the no-signal groups collapse to) travels
+@@ -311,14 +319,60 @@ class ReplayBuffer:
+                 f"{sorted(missing_metric_uids)[:5]}"
+             )
+ 
++        signal_free_uids = {
++            uid
++            for uid in new_finished_uids
++            if len(metrics_by_uid[uid]) > 1 and float(np.std(metrics_by_uid[uid])) == 0.0
++        }
++        # a group of equal rewards still has a signal when its advantages are not all zero, which
++        # grpo_length_penalty makes them for successes of different lengths
++        if self.filter_groups_advantage_fn is not None:
++            outputs = self._final_outputs(partition_id, trajectory_keys, signal_free_uids)
++            for uid, (rewards, response_mask) in outputs.items():
++                advantages, _ = self.filter_groups_advantage_fn(
++                    token_level_rewards=rewards.unsqueeze(-1),
++                    response_mask=response_mask,
++                    index=np.array([uid] * len(rewards)),
++                )
++                if bool(advantages.ne(0).any()):
++                    signal_free_uids.discard(uid)
++
+         for uid in new_finished_uids:
+             values = metrics_by_uid[uid]
+-            classification_cache[uid] = float(values[0]) if len(values) > 1 and float(np.std(values)) == 0.0 else None
++            classification_cache[uid] = float(values[0]) if uid in signal_free_uids else None
+             self._on_group_judged(partition_id, uid, values)
+ 
+         filtered_rewards = {uid: reward for uid, reward in classification_cache.items() if reward is not None}
+         return set(filtered_rewards), Counter(filtered_rewards.values())
+ 
++    @staticmethod
++    def _final_outputs(
++        partition_id: str, trajectory_keys: list[str], uids: set[str]
++    ) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
++        """The outcome rewards and padded response masks of the final output of each session of the groups ``uids``,
++        by uid: what the trainer computes their advantages from (``compute_advantage_for_multi_trajectories``)."""
++        final_keys: dict[str, tuple[int, str]] = {}  # {uid}_{session_id} => (output index, key) of its last output
++        for key in trajectory_keys:
++            uid, session_id, index = key.rsplit("_", 2)
++            session_key = f"{uid}_{session_id}"
++            if uid in uids and (session_key not in final_keys or final_keys[session_key][0] < int(index)):
++                final_keys[session_key] = (int(index), key)
++        if not final_keys:
++            return {}
++
++        keys = [key for _, key in final_keys.values()]
++        data = tq.kv_batch_get(keys=keys, partition_id=partition_id, select_fields=["rm_scores", "response_mask"])
++        rows_by_uid: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = defaultdict(list)
++        for key, scores, mask in zip(keys, data["rm_scores"], data["response_mask"], strict=True):
++            rows_by_uid[key.split("_")[0]].append((scores.sum(), mask))
++        return {
++            uid: (
++                torch.stack([reward for reward, _ in rows]).float(),
++                torch.nn.utils.rnn.pad_sequence([mask for _, mask in rows], batch_first=True),
++            )
++            for uid, rows in rows_by_uid.items()
++        }
++
+     def _on_group_judged(self, partition_id: str, uid: str, values: list[float]) -> None:
+         """Hook called once per newly finished group with its sessions' DAPO metric values. Does nothing by default."""
+ 
+@@ -538,9 +592,7 @@ class ReplayBufferAsync(ReplayBuffer):
+             return set()
+         prompt_global_steps = self.prompt_global_steps[partition_id]
+         terminal_keys = self.finished_keys[partition_id]
+-        return {
+-            uid for uid in terminal_keys if self.is_stale(global_steps, prompt_global_steps.get(uid, global_steps))
+-        }
++        return {uid for uid in terminal_keys if self.is_stale(global_steps, prompt_global_steps.get(uid, global_steps))}
+ 
+     def _terminal_eviction_reasons(
+         self, global_steps: int, partition_id: str
+diff --git a/verl/trainer/ppo/v1/trainer_base.py b/verl/trainer/ppo/v1/trainer_base.py
+index 46cfaee7043a43d29bbc5675673e6fa8ea3d4877..bb9d60e78ab21f9be4a960dfacfc151088a050df 100644
+--- a/verl/trainer/ppo/v1/trainer_base.py
++++ b/verl/trainer/ppo/v1/trainer_base.py
+@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
+ from contextlib import contextmanager
+ from functools import partial
+ from pprint import pprint
+-from typing import Any, Optional
++from typing import Any, Callable, Optional
+ 
+ import numpy as np
+ import ray
+@@ -184,6 +184,7 @@ class PPOTrainer(ABC):
+             sync_refill_failed_groups = bool(sampler_config.get("sync_refill_failed_groups", False))
+             replay_buffer_kwargs.update(
+                 filter_groups_metric=filter_groups_metric,
++                filter_groups_advantage_fn=self._resolve_filter_groups_advantage_fn(),
+                 sync_refill_failed_groups=sync_refill_failed_groups,
+             )
+             if sampler_cls is ReplayBuffer:
+@@ -236,6 +237,16 @@ class PPOTrainer(ABC):
+             )
+         return str(filter_metric)
+ 
++    def _resolve_filter_groups_advantage_fn(self) -> Optional[Callable]:
++        """Resolve the advantage estimator DAPO asks about a group whose rewards are all equal: grpo_length_penalty's,
++        which sets apart the advantages of successes of different lengths; None for the others, under which such a
++        group has no signal."""
++        adv_estimator = self.config.algorithm.get("adv_estimator")
++        if adv_estimator == core_algos.AdvantageEstimator.GRPO_LENGTH_PENALTY:
++            core_algos.get_length_penalty_coeff(self.config.algorithm)  # a missing coefficient is refused at start
++            return partial(core_algos.get_adv_estimator_fn(adv_estimator), config=self.config.algorithm)
++        return None
++
+     def init(self):
+         """Initialize all components of the trainer.
+ 
+diff --git a/verl/trainer/ppo/v1/utils.py b/verl/trainer/ppo/v1/utils.py
+index e9dec3134a3c70b945e6abd03cd5b6e5924fce2e..cd5d4447f94dcb3af9f7fa532a2858170845aff9 100644
+--- a/verl/trainer/ppo/v1/utils.py
++++ b/verl/trainer/ppo/v1/utils.py
+@@ -158,13 +158,13 @@ def compute_advantage_for_multi_trajectories(
+     """Compute GRPO advantages from each session's final output. For non-GRPO
+     estimators, such as GAE, are delegated to the original compute_advantage() unchanged.
+ 
+-    For GRPO, only the final output in each ``{uid}_{session_id}`` group participates
+-    in advantage computation, and the result is broadcast to the other outputs in
+-    the same session. Sessions whose AgentLoop returns ``None`` simply do not appear
++    For GRPO and grpo_length_penalty, only the final output in each ``{uid}_{session_id}``
++    group participates in advantage computation, and the result is broadcast to the other
++    outputs in the same session. Sessions whose AgentLoop returns ``None`` simply do not appear
+     in ``batch_keys``. Non-GRPO estimators, such as GAE, are delegated to the
+     original ``compute_advantage()`` unchanged.
+     """
+-    if adv_estimator != core_algos.AdvantageEstimator.GRPO:
++    if adv_estimator not in (core_algos.AdvantageEstimator.GRPO, core_algos.AdvantageEstimator.GRPO_LENGTH_PENALTY):
+         return compute_advantage(
+             data,
+             adv_estimator=adv_estimator,
