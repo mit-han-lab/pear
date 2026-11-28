@@ -5,21 +5,22 @@ Subject: [PATCH] [ckpt] fix: max_ckpt_to_keep covers the checkpoints saved
  before a resume
 
 The checkpoint manager's list of saved checkpoints starts empty in every process, so a resumed run never
-pruned the checkpoints an earlier process saved. FSDPCheckpointManager.load_checkpoint now registers the
-global_step_<k> siblings of the checkpoint it loads, up to the loaded step.
+pruned the checkpoints an earlier process saved. FSDPCheckpointManager.save_checkpoint now registers, at the
+process's first save, the global_step_<k> siblings of the checkpoint it saves, below the saved step: those of
+the run's own directory, never those of another run whose checkpoint the run started from.
 ---
- ...heckpoint_retention_after_resume_on_cpu.py | 37 +++++++++++++++++++
- verl/utils/checkpoint/checkpoint_manager.py   | 17 +++++++++
- .../checkpoint/fsdp_checkpoint_manager.py     |  1 +
- 3 files changed, 55 insertions(+)
+ ...heckpoint_retention_after_resume_on_cpu.py | 43 +++++++++++++++++++
+ verl/utils/checkpoint/checkpoint_manager.py   | 17 ++++++++
+ .../checkpoint/fsdp_checkpoint_manager.py     |  2 +
+ 3 files changed, 62 insertions(+)
  create mode 100644 tests/trainer/ppo/v1/test_checkpoint_retention_after_resume_on_cpu.py
 
 diff --git a/tests/trainer/ppo/v1/test_checkpoint_retention_after_resume_on_cpu.py b/tests/trainer/ppo/v1/test_checkpoint_retention_after_resume_on_cpu.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..3efb62087cd2bf21b2bdcbce31c0d0ee8edfba47
+index 0000000000000000000000000000000000000000..7bc5d60000fb381865498f6012ea3b118ca30a25
 --- /dev/null
 +++ b/tests/trainer/ppo/v1/test_checkpoint_retention_after_resume_on_cpu.py
-@@ -0,0 +1,37 @@
+@@ -0,0 +1,43 @@
 +import os
 +
 +import pytest
@@ -45,20 +46,26 @@ index 0000000000000000000000000000000000000000..3efb62087cd2bf21b2bdcbce31c0d0ee
 +    return make
 +
 +
-+def test_resume_registers_the_older_siblings_in_order(tmp_path, manager, make_step):
++def test_the_first_save_registers_the_earlier_checkpoints_of_its_directory_in_order(tmp_path, manager, make_step):
 +    for step in (3, 1, 2, 5):
 +        make_step(step)
-+    manager.register_existing_checkpoints(os.path.join(tmp_path, "global_step_3", "actor"))
++    manager.register_existing_checkpoints(os.path.join(tmp_path, "global_step_4", "actor"))
 +    assert manager.previous_saved_paths == [
 +        os.path.join(tmp_path, f"global_step_{step}", "actor") for step in (1, 2, 3)
 +    ]
++
++
++def test_a_run_started_from_another_run_s_checkpoint_registers_none_of_that_run_s(tmp_path, manager):
++    os.makedirs(os.path.join(tmp_path, "other_run", "global_step_3", "actor"))
++    manager.register_existing_checkpoints(os.path.join(tmp_path, "own_run", "global_step_4", "actor"))
++    assert manager.previous_saved_paths == []
 +
 +
 +def test_resume_ignores_paths_outside_the_step_layout(tmp_path, manager):
 +    manager.register_existing_checkpoints(os.path.join(tmp_path, "somewhere", "actor"))
 +    assert manager.previous_saved_paths == []
 diff --git a/verl/utils/checkpoint/checkpoint_manager.py b/verl/utils/checkpoint/checkpoint_manager.py
-index f3f6219306e65749abde988d62217c793ad20467..bb3266173ea11e1e5498ef6dfed249abf52e6ca7 100644
+index f3f6219306e65749abde988d62217c793ad20467..1a5ba38311ac84532492b733865d809c2595ba0f 100644
 --- a/verl/utils/checkpoint/checkpoint_manager.py
 +++ b/verl/utils/checkpoint/checkpoint_manager.py
 @@ -148,6 +148,23 @@ class BaseCheckpointManager:
@@ -66,34 +73,35 @@ index f3f6219306e65749abde988d62217c793ad20467..bb3266173ea11e1e5498ef6dfed249ab
          raise NotImplementedError
  
 +    def register_existing_checkpoints(self, local_path: str) -> None:
-+        """On resume: track the checkpoints an earlier process saved, so the next save applies max_ckpt_to_keep to
-+        them too."""
++        """Before a process's first save to local_path: track the checkpoints an earlier process saved before it in
++        the same directory, so that this save applies max_ckpt_to_keep to them too."""
 +        step_dir, name = os.path.split(os.path.normpath(local_path))  # <root>/global_step_<k>/<name>
 +        root, step_name = os.path.split(step_dir)
-+        if not step_name.startswith("global_step_"):
++        if not step_name.startswith("global_step_") or not os.path.isdir(root):
 +            return
-+        loaded_step = int(step_name.rsplit("_", 1)[1])
++        saving_step = int(step_name.rsplit("_", 1)[1])
 +        steps = [
 +            int(d.rsplit("_", 1)[1])
 +            for d in os.listdir(root)
 +            if d.startswith("global_step_") and os.path.isdir(os.path.join(root, d, name))
 +        ]
 +        self.previous_saved_paths = [
-+            os.path.join(root, f"global_step_{s}", name) for s in sorted(steps) if s <= loaded_step
++            os.path.join(root, f"global_step_{s}", name) for s in sorted(steps) if s < saving_step
 +        ]
 +
      @staticmethod
      def checkpath(local_path: str, hdfs_path: str):
          assert local_path is not None or hdfs_path is not None, "local_path and hdfs_path cannot be both None"
 diff --git a/verl/utils/checkpoint/fsdp_checkpoint_manager.py b/verl/utils/checkpoint/fsdp_checkpoint_manager.py
-index 4ebe81973602d0a24b160823a94b57fc840705fa..102dd27695e07840b256ed064e2c30f0d5d35cee 100644
+index 4ebe81973602d0a24b160823a94b57fc840705fa..5ca527e69fe9eb03f88a9cdf96d84a64d05b6397 100644
 --- a/verl/utils/checkpoint/fsdp_checkpoint_manager.py
 +++ b/verl/utils/checkpoint/fsdp_checkpoint_manager.py
-@@ -188,6 +188,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
-         """
-         if local_path is None:
-             return
-+        self.register_existing_checkpoints(local_path)
+@@ -294,6 +294,8 @@ class FSDPCheckpointManager(BaseCheckpointManager):
+         self.previous_global_step = global_step
  
-         # check if the checkpoint_load_contents is valid
-         if self.should_load_model:
+         if self.rank == 0:
++            if not self.previous_saved_paths:  # this process's first save
++                self.register_existing_checkpoints(local_path)
+             self.ensure_checkpoint_capacity(max_ckpt_to_keep)
+ 
+         local_path = local_mkdir_safe(local_path)
