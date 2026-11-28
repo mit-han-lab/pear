@@ -68,6 +68,22 @@ per node x `ROBODOJO_APPS_PER_GPU` Apps for `ROLLOUT_NNODES` x 2 x `SESSIONS_PER
 
 Extra arguments are Hydra overrides.
 
+## Length penalty
+
+An optional run after stage 3 shortens the model's thinking. `run_length_penalty.sh` continues stage 3's training
+from one of its checkpoints:
+
+```bash
+# on H100: the table above has stage 3's sizes on GB300
+TRAINER_NNODES=8 ROLLOUT_NNODES=16 SIM_NNODES=8 CKPT=<run 3>/ckpt/global_step_<step> \
+  RUN=<run> bash examples/models/qwen3_8_27b_pear/train/run_length_penalty.sh
+```
+
+A new `RUN` starts from `CKPT`, which stays in stage 3's run; an existing one resumes from its own last checkpoint.
+Within a group, a success's reward becomes `max(1, L / L_min) ** -coeff`, where `L` is the tokens it generated and
+`L_min` those of the group's shortest success, so that of two successes the shorter one is reinforced more. A group
+whose rollouts all succeed is then trained on its lengths alone.
+
 ## Evaluate
 
 [Evaluation](../../../eval/README.md) has one recipe per benchmark, for a model directory exported from a checkpoint.

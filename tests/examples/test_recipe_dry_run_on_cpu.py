@@ -13,6 +13,7 @@ from omegaconf import OmegaConf
 
 from recipe_dry_run import RecipeDryRun, RecipeDump, RecipeLaunch
 from repository import REPO
+from verl.trainer.ppo.core_algos import AdvantageEstimator
 from verl.utils.dataset.rl_dataset import get_dataset_class
 from verl.workers.rollout.vllm_rollout.utils import build_cli_args_from_config
 
@@ -55,11 +56,16 @@ TRAINING_SIZES = {
     "run_stage2.h100": (64, 32, 128),
     "run_stage3.gb300": (64, 32, 128),
     "run_stage3.h100": (64, 32, 128),
+    "run_length_penalty.gb300": (64, 32, 128),
+    "run_length_penalty.h100": (64, 32, 128),
 }
 EVALUATION_SIZES = {"gb300": (64, 64, 256), "h100": (64, 64, 256)}
+# the trainings under the length penalty; the others train on verl's GRPO
+LENGTH_PENALTY_RECIPES = ("examples/models/qwen3_8_27b_pear/train/run_length_penalty.sh",)
 # the recipes whose user may give the Apps of a simulator server: the variable, and the tool config's own number
 APPS_VARIABLES = {
     "examples/models/qwen3_8_27b_pear/train/run_stage3.sh": ("ROBODOJO_APPS_PER_GPU", "8"),
+    "examples/models/qwen3_8_27b_pear/train/run_length_penalty.sh": ("ROBODOJO_APPS_PER_GPU", "8"),
     "examples/eval/eval_robodojo.sh": ("ROBODOJO_APPS_PER_GPU", "8"),
     "examples/eval/eval_robolab.sh": ("ROBOLAB_APPS_PER_GPU", "10"),
 }
@@ -240,6 +246,36 @@ def test_a_training_s_replicas_draft_with_the_drafter_the_recipe_was_given(tmp_p
     assert mtp["enable_rollout"] and not mtp["enable"]
     assert (mtp["method"], mtp["num_speculative_tokens"]) == ("pear_mtp", 3)
     assert composed.value("actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config") == {"model": "/draft"}
+
+
+@pytest.mark.parametrize("recipe", TRAINING_RECIPES, ids=lambda recipe: Path(recipe).stem)
+def test_a_training_is_under_the_length_penalty_only_when_its_recipe_turns_it_on(tmp_path, recipe):
+    launch = RecipeDryRun(REPO, tmp_path).run(recipe, RecipeDryRun.GPUS[0], {"LENGTH_PENALTY_COEFF": "0.3"})
+
+    # the penalty and its coefficient are the recipe's alone: PEAR's config has neither
+    algorithm = ComposedConfig(launch.composed_config).value("algorithm")
+    if recipe in LENGTH_PENALTY_RECIPES:
+        assert (algorithm["adv_estimator"], algorithm["length_penalty_coeff"]) == (
+            AdvantageEstimator.GRPO_LENGTH_PENALTY,
+            0.3,
+        )
+    else:
+        assert (algorithm["adv_estimator"], "length_penalty_coeff" in algorithm) == ("grpo", False)
+
+
+@pytest.mark.parametrize("has_own_checkpoint", [False, True])
+def test_the_length_penalty_s_run_starts_from_stage_3_s_checkpoint_until_it_has_its_own(tmp_path, has_own_checkpoint):
+    dry_run = RecipeDryRun(REPO, tmp_path)
+    run = tmp_path / "run"
+    if has_own_checkpoint:
+        (run / "ckpt").mkdir(parents=True)
+        (run / "ckpt" / "latest_checkpointed_iteration.txt").write_text("3")
+
+    launch = dry_run.run(LENGTH_PENALTY_RECIPES[0], RecipeDryRun.GPUS[0], {"RUN": str(run)})
+
+    trainer = ComposedConfig(launch.composed_config).value("trainer")
+    resumed_from = ("auto", None) if has_own_checkpoint else ("resume_path", str(dry_run.checkpoint))
+    assert (trainer["resume_mode"], trainer["resume_from_path"]) == resumed_from
 
 
 def test_two_dumps_of_a_recipe_are_the_same_files(tmp_path):
