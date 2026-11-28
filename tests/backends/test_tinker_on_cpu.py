@@ -440,7 +440,8 @@ async def test_native_loss_keeps_provenance_images_and_global_token_weighting(se
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("checkpoint_form", ["compact", "diagnostic", "legacy"])
-async def test_native_resume_recollects_session_bound_rollouts(setup, monkeypatch, checkpoint_form):
+@pytest.mark.parametrize("failure_stage", ["restore", "sampler", "rollout"])
+async def test_native_resume_recollects_session_bound_rollouts(setup, monkeypatch, checkpoint_form, failure_stage):
     config, session, task, runtime = setup
     config = replace(
         config,
@@ -479,6 +480,31 @@ async def test_native_resume_recollects_session_bound_rollouts(setup, monkeypatc
                 pickle.dump(state, file)
     old_episodes = set(session.client.closed)
     monkeypatch.setattr(TestTrainingClient, "forward_backward", original)
+
+    def failed_start(*args, **kwargs):
+        raise RuntimeError("resume failed")
+
+    async def failed_request(*args, **kwargs):
+        failed_start()
+
+    checkpoint = checkpoints.root / "step_00000000.pkl"
+    saved = checkpoint.read_bytes()
+    with monkeypatch.context() as retry:
+        if failure_stage == "restore":
+            retry.setattr(service, "create_training_client_from_state_with_optimizer", failed_request)
+        elif failure_stage == "sampler":
+            retry.setattr(TestTrainingClient, "save_weights_and_get_sampling_client", failed_request)
+        else:
+            retry.setattr("pear.backends.tinker.train.EpisodeRollout", failed_start)
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="resume failed"):
+                await train(config, runtime, SimpleNamespace(tasks=[task]), TestRenderer(), service)
+            assert checkpoint.read_bytes() == saved
+            usage = Usage(config.run_dir)
+            assert usage.totals["resume_discarded_episodes"] == (discarded if failure_stage == "rollout" else 0)
+            assert usage.totals["resume_discarded_generated_tokens"] == (
+                discarded_tokens if failure_stage == "rollout" else 0
+            )
     result = await train(
         replace(config, dump_training_batch=False), runtime, SimpleNamespace(tasks=[task]), TestRenderer(), service
     )
@@ -508,12 +534,14 @@ async def test_checkpoints_keep_payloads_only_for_replayable_objectives(setup, o
     saved, model_path = checkpoints.load()
     assert model_path == path
     assert saved.counters.get("pending_episodes", 0) == int(native)
+    previous_id = checkpoints.loaded_id
     checkpoints.save_pending(state, [pending])
     saved, model_path = checkpoints.load()
     assert model_path == path
     assert (saved.step, saved.epoch, saved.cursor, saved.next_group) == (3, 2, 1, 8)
     assert [(g.uid, g.task_index, g.dispatch_step) for g in saved.groups] == [("pending", 0, 2), ("queued", 1, 1)]
     if native:
+        assert checkpoints.loaded_id != previous_id
         assert all(t is None for g in saved.groups for t in g.trajectories)
         assert saved.counters["pending_episodes"] == 3 and saved.counters["pending_generated_tokens"] == 21
     else:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pickle
@@ -55,6 +56,7 @@ class Checkpoints:
         self.config = config
         self.root = Path(config.run_dir) / "checkpoints"
         self.root.mkdir(parents=True, exist_ok=True)
+        self.loaded_id: str | None = None
 
     def load(self) -> tuple[RunState, str] | None:
         meta = self.reference()
@@ -68,6 +70,9 @@ class Checkpoints:
         path = self.root / f"step_{int(meta['step']):08d}.pkl"
         with path.open("rb") as file:
             state = pickle.load(file)
+            if self.config.objective == "stable_reinforce":
+                file.seek(0)
+                self.loaded_id = f"{meta['model_path']}:{hashlib.file_digest(file, 'sha256').hexdigest()}"
         if not isinstance(state, RunState) or state.step != meta["step"]:
             raise ValueError("checkpoint state and manifest disagree")
         return state, meta["model_path"]

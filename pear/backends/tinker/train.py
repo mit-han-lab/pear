@@ -82,24 +82,6 @@ async def train(config, runtime, dataset, renderer, service, usage=None) -> dict
     if restored and state.step >= config.steps:
         return {"step": state.step, "model_path": model_path}
     record_stability = config.objective == "stable_reinforce"
-    if restored and record_stability:
-        # Stability records belong to the old ServiceClient session. Retain tasks and optimizer state,
-        # but collect every member again so a resumed group never mixes valid and expired provenance.
-        # Older checkpoints still contain trajectories; new native checkpoints keep only these counts.
-        discarded = state.counters.pop("pending_episodes", 0) + sum(
-            t is not None for group in state.groups for t in group.trajectories
-        )
-        discarded_tokens = state.counters.pop("pending_generated_tokens", 0) + sum(
-            t.generated_tokens for group in state.groups for t in group.trajectories if t is not None
-        )
-        usage.record(
-            "resume_discarded",
-            {"resume_discarded_episodes": discarded, "resume_discarded_generated_tokens": discarded_tokens},
-        )
-        for group in state.groups:
-            group.trajectories = [None] * config.group_size
-            group.dispatch_step = state.step
-        state.counters["session_discarded_episodes"] = state.counters.get("session_discarded_episodes", 0) + discarded
     if restored:
         client = await service.create_training_client_from_state_with_optimizer(
             model_path, base_model=config.base_model
@@ -123,6 +105,25 @@ async def train(config, runtime, dataset, renderer, service, usage=None) -> dict
     sampler = await client.save_weights_and_get_sampling_client(
         kind=config.sampler_kind, record_stability_info=record_stability
     )
+    if restored and record_stability:
+        # Stability records belong to the old ServiceClient session. Retain tasks and optimizer state,
+        # but collect every member again so a resumed group never mixes valid and expired provenance.
+        # Older checkpoints still contain trajectories; new native checkpoints keep only these counts.
+        discarded = state.counters.pop("pending_episodes", 0) + sum(
+            t is not None for group in state.groups for t in group.trajectories
+        )
+        discarded_tokens = state.counters.pop("pending_generated_tokens", 0) + sum(
+            t.generated_tokens for group in state.groups for t in group.trajectories if t is not None
+        )
+        usage.record(
+            "resume_discarded",
+            {"resume_discarded_episodes": discarded, "resume_discarded_generated_tokens": discarded_tokens},
+            event_id=checkpoints.loaded_id,
+        )
+        for group in state.groups:
+            group.trajectories = [None] * config.group_size
+            group.dispatch_step = state.step
+        state.counters["session_discarded_episodes"] = state.counters.get("session_discarded_episodes", 0) + discarded
     print(json.dumps({"event": "training_started", "step": state.step, "resumed": bool(restored)}), flush=True)
     rollout = EpisodeRollout(config, renderer, runtime.sessions, usage)
     pool = RolloutPool(config, dataset.tasks, rollout, sampler, runtime.caps, state)

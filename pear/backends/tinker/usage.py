@@ -20,16 +20,24 @@ class Usage:
         self.path = self.root / "usage.jsonl"
         self.totals = Counter()
         self.pending = set()
+        self.event_ids = set()
         if self.path.exists():
             with self.path.open() as stream:
                 for line in stream:
-                    self.totals.update(json.loads(line).get("counts", {}))
+                    record = json.loads(line)
+                    self.totals.update(record.get("counts", {}))
+                    if record.get("event_id") is not None:
+                        self.event_ids.add((record["event"], record["event_id"]))
         identity = self.root / "usage_identity.json"
         if not identity.exists():
             write_report(identity, {"run_id": uuid.uuid4().hex, "created_at": datetime.now(UTC).isoformat()})
         self.identity = json.loads(identity.read_text())
 
     def record(self, event, counts=None, **details):
+        """An event_id makes accounting idempotent across process restarts."""
+        key = (event, details.get("event_id"))
+        if key[1] is not None and key in self.event_ids:
+            return
         counts = counts or {}
         append_line(
             self.path,
@@ -44,6 +52,8 @@ class Usage:
             ),
         )
         self.totals.update(counts)
+        if key[1] is not None:
+            self.event_ids.add(key)
 
     def watch(self, awaitable, completed, failed):
         # Completion accounting survives cancellation of the episode waiting for this request.
