@@ -110,7 +110,7 @@ index 0000000000000000000000000000000000000000..828230e01945dcce8df95b86e9f71be6
 +    for rank in range(WORLD_SIZE):
 +        assert (results_dir / f"{rank}.txt").read_text() == "True True"
 diff --git a/verl/utils/checkpoint/fsdp_checkpoint_manager.py b/verl/utils/checkpoint/fsdp_checkpoint_manager.py
-index 102dd27695e07840b256ed064e2c30f0d5d35cee..757fabec238789be62a81199f4ab58b7d5c47de3 100644
+index 5ca527e69fe9eb03f88a9cdf96d84a64d05b6397..9fb86367225027363db75781f2b782c7af85d054 100644
 --- a/verl/utils/checkpoint/fsdp_checkpoint_manager.py
 +++ b/verl/utils/checkpoint/fsdp_checkpoint_manager.py
 @@ -25,6 +25,7 @@ from accelerate import init_empty_weights
@@ -121,7 +121,7 @@ index 102dd27695e07840b256ed064e2c30f0d5d35cee..757fabec238789be62a81199f4ab58b7
  from transformers import GenerationConfig, PreTrainedTokenizer, ProcessorMixin
  from transformers.dynamic_module_utils import custom_object_save
  
-@@ -209,9 +210,10 @@ class FSDPCheckpointManager(BaseCheckpointManager):
+@@ -208,9 +209,10 @@ class FSDPCheckpointManager(BaseCheckpointManager):
              if self.should_load_optimizer
              else None
          )
@@ -133,7 +133,7 @@ index 102dd27695e07840b256ed064e2c30f0d5d35cee..757fabec238789be62a81199f4ab58b7
                  local_model_path = copy_to_local(remote_model_path)
                  model_state_dict = torch.load(local_model_path, weights_only=False)
                  if self.is_lora_only_state_dict(model_state_dict):
-@@ -231,7 +233,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
+@@ -230,7 +232,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                      log_with_rank(f"Loaded model from {remote_model_path}", rank=self.rank, logger=logger)
  
              if self.should_load_optimizer:
@@ -142,7 +142,7 @@ index 102dd27695e07840b256ed064e2c30f0d5d35cee..757fabec238789be62a81199f4ab58b7
                  local_optim_path = copy_to_local(remote_optim_path)
                  optimizer_state_dict = torch.load(local_optim_path, weights_only=False)
                  optimizer_state_dict = self._backfill_optimizer_state(optimizer_state_dict)
-@@ -270,6 +272,16 @@ class FSDPCheckpointManager(BaseCheckpointManager):
+@@ -269,6 +271,16 @@ class FSDPCheckpointManager(BaseCheckpointManager):
          # wait for everyone to load checkpoints
          torch.distributed.barrier()
  
@@ -159,7 +159,7 @@ index 102dd27695e07840b256ed064e2c30f0d5d35cee..757fabec238789be62a81199f4ab58b7
      def save_checkpoint(self, local_path: str, hdfs_path: str = None, global_step: int = 0, max_ckpt_to_keep=None):
          """
          Save an FSDP checkpoint for this rank.
-@@ -308,7 +320,9 @@ class FSDPCheckpointManager(BaseCheckpointManager):
+@@ -309,7 +321,9 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                  "optimizer must be provided when checkpoint_contents.save includes ['optimizer']"
              )
  
@@ -170,7 +170,7 @@ index 102dd27695e07840b256ed064e2c30f0d5d35cee..757fabec238789be62a81199f4ab58b7
          state_dict_cfg = ShardedStateDictConfig(offload_to_cpu=True if is_cuda_available else False)
          optim_cfg = ShardedOptimStateDictConfig(offload_to_cpu=True if is_cuda_available else False)
          with warnings.catch_warnings():
-@@ -318,7 +332,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
+@@ -319,7 +333,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                  optim_path = os.path.join(local_path, f"optim_world_size_{self.world_size}_rank_{self.rank}.pt")
                  extra_path = os.path.join(local_path, f"extra_state_world_size_{self.world_size}_rank_{self.rank}.pt")
  
@@ -179,7 +179,7 @@ index 102dd27695e07840b256ed064e2c30f0d5d35cee..757fabec238789be62a81199f4ab58b7
                      model_state_dict = self.model.state_dict()
                      if self.should_save_lora_only and self._has_lora():
                          n_total = len(model_state_dict)
-@@ -348,7 +362,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
+@@ -349,7 +363,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                      torch.save(model_state_dict, model_path)
                      log_with_rank(f"Saved model to {os.path.abspath(model_path)}", rank=self.rank, logger=logger)
  

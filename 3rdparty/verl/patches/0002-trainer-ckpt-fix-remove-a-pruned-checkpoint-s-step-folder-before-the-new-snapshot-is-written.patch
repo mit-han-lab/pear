@@ -13,7 +13,7 @@ writes the new step's data.pt and snapshot, so a pruned step's snapshot never si
  2 files changed, 75 insertions(+)
 
 diff --git a/tests/trainer/ppo/v1/test_checkpoint_retention_after_resume_on_cpu.py b/tests/trainer/ppo/v1/test_checkpoint_retention_after_resume_on_cpu.py
-index 3efb62087cd2bf21b2bdcbce31c0d0ee8edfba47..302164454c90786838e84e51ee1d788390c25ccd 100644
+index 7bc5d60000fb381865498f6012ea3b118ca30a25..1167d0ebb2052dbc8c0f05ce5d6079279e8d4a95 100644
 --- a/tests/trainer/ppo/v1/test_checkpoint_retention_after_resume_on_cpu.py
 +++ b/tests/trainer/ppo/v1/test_checkpoint_retention_after_resume_on_cpu.py
 @@ -1,7 +1,12 @@
@@ -29,7 +29,7 @@ index 3efb62087cd2bf21b2bdcbce31c0d0ee8edfba47..302164454c90786838e84e51ee1d7883
  from verl.utils.checkpoint.checkpoint_manager import BaseCheckpointManager
  
  
-@@ -35,3 +40,57 @@ def test_resume_registers_the_older_siblings_in_order(tmp_path, manager, make_st
+@@ -41,3 +46,57 @@ def test_a_run_started_from_another_run_s_checkpoint_registers_none_of_that_run_
  def test_resume_ignores_paths_outside_the_step_layout(tmp_path, manager):
      manager.register_existing_checkpoints(os.path.join(tmp_path, "somewhere", "actor"))
      assert manager.previous_saved_paths == []
